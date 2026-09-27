@@ -82,6 +82,16 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
+## Review workflow
+
+Use `/subagent review <scope and requirements>` to run independent correctness and combined
+code-quality/simplicity reviewers in parallel. The review orchestrator
+collects and deduplicates their findings, then asks a verifier to validate
+candidates before returning one report. Review does not apply fixes or run tests; it may read existing test code and results.
+
+The four definitions are bundled in `agents/`; no global agent links are needed.
+See [review workflow](docs/review-workflow.md) for usage, configuration, and sources.
+
 ## Custom agents
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
@@ -129,18 +139,77 @@ You are a specialized agent that does X...
 
 Set `cli: claude` or `cli: codex` to run the subagent as an external coding-agent CLI in its own pane instead of a pi child process. The CLI's own auth/config apply; pi tools, `tools:` allowlists, and `subagent_agents` are ignored.
 
+Both backends run their **native interactive TUI** in a tmux pane. Use the same
+`subagent`, `subagent_message`, and `subagents_list` tools as for pi agents:
+
+```json
+{ "agent": "codex-cli", "name": "implement", "task": "Implement and verify the change" }
+```
+
+Send `subagent_message({ name: "implement", message: "Also handle empty input" })`
+to paste one message into the running TUI, or resume its native conversation when
+it has finished. Names and native session IDs persist across parent restarts.
+The bundled `claude-cli` profile works the same way and uses Claude's default model.
+
 | | `cli: claude` | `cli: codex` |
 | --- | --- | --- |
-| Binary | `claude` on PATH | `codex` resolved from PATH / ChatGPT.app bundle / `PI_CODEX_BIN` |
-| Autonomy | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
-| Identity (`system-prompt: append`) | `--append-system-prompt` | `-c instructions="…"` |
-| `thinking` | — | `-c model_reasoning_effort` |
-| Completion | sentinel written by the bundled Stop hook | exit-code sentinel written by the launch shell; `-o` captures the final message |
-| Transcript | copied to `~/.pi/agent/sessions/claude-code/` | rollout copied next to the pi session file (`.codex/rollout.jsonl`) |
-| Mid-run messaging | TUI accepts keys, so `subagent_message` steers it | non-interactive: steering is refused; spawn a follow-up instead |
-| `session-mode: fork` | rejected for both CLI paths (a CLI agent cannot read pi conversation context) | same |
+| Binary | PATH, `~/.local/bin`, or `PI_CLAUDE_BIN` | PATH, ChatGPT.app, or `PI_CODEX_BIN` |
+| Identity append | `--append-system-prompt` | `developer_instructions` |
+| Identity replace | `--system-prompt` | `model_instructions_file` |
+| Thinking | `--effort` (use a level supported by Claude) | `model_reasoning_effort` |
+| Completion | invocation-local SessionStart / Stop / StopFailure hooks | invocation-local `notify` callback |
+| Resume | `claude --resume <session-id>` | `codex resume <thread-id>` |
 
-`codex exec` runs one-shot: it takes the task, finishes, and exits. `subagent_message` cannot steer it while running; use the result message and spawn a new subagent for follow-ups. Both CLI paths are async: completion still arrives as a steer message with the final assistant message as the summary.
+`auto-exit: true` returns the final response and closes the pane after the turn
+and all submitted follow-ups have completed. With `auto-exit: false`, the native UI stays open; its latest response is
+returned when the user exits. If the pane is forcibly closed, the last completed
+response is retained alongside the interruption and any pending-input notice. Follow-ups to finished sessions run autonomously.
+Multiple-line messages use tmux bracketed paste, preserving them as one prompt.
+CLI panes have no surrounding shell that could execute leftover input.
+
+The parent-facing pi transcript records submitted tasks and final responses;
+`<session>.cli.json` stores the backend, exact native ID, cwd, model and identity.
+Full native history remains in the CLI's own storage. Each invocation's prompt,
+launch script, hook settings, submitted prompts, notification events and structured result live under the parent's
+`artifacts/<session-id>/cli-runs/`. No global CLI configuration is rewritten.
+
+CLI profiles use the CLI's own credentials and native tools. Claude reads its
+normal settings, including cc-switch's `env` (base URL, authentication, and
+Opus/Sonnet/Haiku model aliases). The bundled `claude-cli` profile does not set
+`model`, so cc-switch remains in control; an explicit profile `model` is passed
+to Claude as an intentional override. The bridge never substitutes Anthropic
+credentials or routes the request through pi's model provider. The same unrestricted
+execution flags as the previous integration are used. Pi-specific tool allowlists,
+skills and `subagent_agents` do not configure native CLI tools. Run the CLI once
+to complete login/onboarding before using it as a subagent. `session-mode: fork`
+remains unsupported: native CLIs cannot load pi's conversation format. Use
+`lineage-only` or `standalone` and include relevant context in the task.
+Native progress currently uses an elapsed-time status, rather than pi tool activity.
+
+Codex's internal title-generation threads also emit `notify` callbacks. The bridge
+binds the native thread only after a notification matches the submitted task,
+then accepts only that thread's results. Internal title responses cannot complete
+or close the worker. Submitted follow-ups are tracked across completed turns:
+with `auto-exit: true`, the pane stays open until every submitted prompt has been
+processed, including prompts queued for the next turn. Submitting a message and
+publishing completion are serialized to avoid losing a message at the turn
+boundary. Exiting with pending prompts reports a failure.
+Directory trust is passed as an invocation-local TOML table. Each task, follow-up
+and resume prompt sent to Codex carries a unique receipt in an HTML comment;
+pi's session records retain the original task text. Completion matches outstanding
+receipts directly, so repeated messages work with both cumulative and turn-local
+notifications, without guessing the format or storing native history snapshots.
+Old receipts cannot acknowledge new requests. Claude completion checks only the
+transcript path supplied by its hook: user messages and human `queued_command`
+attachments before the final
+assistant entry count as processed; queue enqueue records do not. SessionStart
+records a baseline so previous conversation inputs cannot satisfy new requests.
+
+### Verification
+
+`npm test` runs the regression and native hook tests without model requests.
+`npm run test:cli-integration` exercises the actual extension tools in an isolated
+tmux session with deterministic stand-in CLIs (no credentials or model calls).
 
 ### auto-exit
 

@@ -225,7 +225,7 @@ function readEntries(sessionFile: string): SessionEntry[] {
  * Return the id of the last entry in the session file (current branch point / leaf).
  */
 export function getLeafId(sessionFile: string): string | null {
-  const entries = readEntries(sessionFile);
+  const entries = readEntries(sessionFile).filter(entry => entry.type !== "session");
   return entries.length > 0 ? entries[entries.length - 1].id : null;
 }
 

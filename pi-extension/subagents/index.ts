@@ -8,11 +8,9 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
-  realpathSync,
-  statSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -25,13 +23,19 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
-  readScreen,
+  startSurfaceProcess,
+  pasteMessage,
 } from "./tmux.ts";
+
+import { randomUUID } from "node:crypto";
+import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
+import { buildExternalCommand, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
 
 import {
   countSessionEntryLines,
   findLastAssistantMessage,
   getNewEntries,
+  getLeafId,
   getSessionId,
   readNameRegistry,
   readSubagentLoadout,
@@ -117,9 +121,6 @@ const SubagentParams = Type.Object({
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-/** External coding-agent CLIs a subagent can run in its own pane. */
-type CliKind = "claude" | "codex";
 
 /**
  * Slugify a display name for use in artifact and script filenames.
@@ -413,7 +414,7 @@ function resolveLaunchBehavior(
  * Returns null for pi agents. Throws for unknown values so a typo
  * (`cli: codexx`) fails loudly instead of silently running a pi child.
  */
-function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): CliKind | null {
+function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): ExternalCliKind | null {
   const raw = agentDefs?.cli;
   if (!raw) return null;
   if (raw === "claude" || raw === "codex") return raw;
@@ -429,7 +430,7 @@ function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): Cl
  * into a context-free run. Fail fast instead of pretending it worked.
  */
 function assertCliSessionModeSupported(
-  cliKind: CliKind | null,
+  cliKind: ExternalCliKind | null,
   sessionMode: SubagentSessionMode,
   agentName?: string,
 ): void {
@@ -645,7 +646,6 @@ interface SubagentResult {
   sessionFile?: string;
   /** Canonical session header id, used for follow-ups via subagent_message. */
   sessionId?: string;
-  claudeSessionId?: string;
   exitCode: number;
   elapsed: number;
   error?: string;
@@ -653,6 +653,41 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+}
+
+function publishSubagentResult(pi: ExtensionAPI, result: SubagentResult, agent?: string): void {
+  updateWidget();
+  pi.sendMessage({
+    customType: "subagent_result",
+    content: resolveResultPresentation(result, result.name),
+    display: true,
+    details: {
+      name: result.name, task: result.task, exitCode: result.exitCode,
+      elapsed: result.elapsed, sessionFile: result.sessionFile,
+      ...(agent ? { agent } : {}),
+      ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.stats ? { stats: result.stats } : {}),
+    },
+  }, { triggerTurn: true, deliverAs: "steer" });
+}
+
+function publishSubagentError(pi: ExtensionAPI, name: string, error: any, task?: string): void {
+  updateWidget();
+  pi.sendMessage({
+    customType: "subagent_result", display: true,
+    content: task === undefined ? `Resume error: ${error?.message ?? String(error)}`
+      : `Sub-agent "${name}" error: ${error?.message ?? String(error)}`,
+    details: { name, ...(task === undefined ? {} : { task }), error: error?.message },
+  }, { triggerTurn: true, deliverAs: "steer" });
+}
+
+function appendUserMessage(sessionFile: string, text: string): void {
+  appendFileSync(sessionFile, JSON.stringify({
+    type: "message", id: randomUUID(), parentId: getLeafId(sessionFile),
+    timestamp: new Date().toISOString(),
+    message: { role: "user", content: [{ type: "text", text }] },
+  }) + "\n");
 }
 
 /**
@@ -676,16 +711,9 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   /** External CLI backing this run; absent for pi children. */
-  cli?: CliKind;
-  /**
-   * claude: summary written by the Stop hook; codex: exit code written by the
-   * launch shell after codex exits. Both double as the poll sentinel.
-   */
+  cli?: ExternalCliKind;
+  /** Structured result written by the native completion hook or launch shell. */
   sentinelFile?: string;
-  /** codex only: file codex writes the final assistant message to (`-o`). */
-  outputFile?: string;
-  /** codex only: working directory the run was started in. */
-  cwd?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -815,10 +843,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
-
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
+    if (latestCtx?.hasUI) latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -827,6 +853,7 @@ function updateWidget() {
     return;
   }
 
+  if (!latestCtx?.hasUI) return;
   latestCtx.ui.setWidget(
     "subagent-status",
     (_tui: any, _theme: any) => {
@@ -1056,25 +1083,32 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Type a follow-up message into a running subagent's live pane. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
+ * Type a follow-up into the live pane. Native CLIs receive bracketed multiline
+ * paste; pi messages retain the existing flattened input path.
  */
-function steerSubagent(
+async function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
-): { ok: true } | { error: string } {
-  // `codex exec` runs non-interactively: it never reads stdin after the task
-  // argument, so typed keystrokes would sit in the pane's input buffer and be
-  // interpreted by the shell once codex exits. Refuse rather than risk that.
-  if (running.cli === "codex") {
-    return {
-      error:
-        `Subagent "${running.name}" runs the codex CLI non-interactively and cannot ` +
-        `receive mid-run messages. Wait for it to finish, then spawn a follow-up ` +
-        `subagent with the result as context.`,
-    };
+): Promise<{ ok: true } | { error: string }> {
+  if (running.cli) {
+    try {
+      return await withCliRunLockAsync(running.sentinelFile!, () => {
+        if (existsSync(running.sentinelFile!)) {
+          return { error: `Subagent "${running.name}" has just completed; retry subagent_message to resume it.` };
+        }
+        // The hook cannot finish this run between checking and registering input.
+        const prompt = prepareExternalPrompt(running.cli!, message);
+        pasteMessage(running.surface, prompt);
+        const inputsFile = `${running.sentinelFile}.inputs.json`;
+        const inputs = JSON.parse(readFileSync(inputsFile, "utf8")) as string[];
+        writeFileSync(inputsFile, JSON.stringify([...inputs, prompt]), { mode: 0o600 });
+        appendUserMessage(running.sessionFile, message);
+        return { ok: true as const };
+      });
+    } catch (error: any) {
+      return { error: `Failed to message "${running.name}": ${error?.message ?? String(error)}` };
+    }
   }
 
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
@@ -1082,54 +1116,35 @@ function steerSubagent(
     send(running.surface, flattened);
     return { ok: true };
   } catch (error: any) {
-    return {
-      error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
-        `${error?.message ?? String(error)}`,
-    };
+    return { error: `Failed to deliver message to subagent "${running.name}" via tmux: ${error?.message ?? String(error)}` };
   }
 }
 
-function handleSubagentSteer(
+async function handleSubagentSteer(
   params: { name?: string; message?: string },
   send: (surface: string, command: string) => void = sendCommand,
 ) {
-  const message = params.message?.trim();
-  if (!message) {
+  const message = params.message;
+  if (!message?.trim()) {
     const err = "`message` is required to steer a running subagent.";
     return { content: [{ type: "text" as const, text: err }], details: { error: err } };
   }
-
   const resolved = resolveRunningByName(params.name ?? "");
   if ("error" in resolved) {
-    return {
-      content: [{ type: "text" as const, text: resolved.error }],
-      details: { error: resolved.error },
-    };
+    return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
   }
-
   const running = resolved.running;
-  const now = Date.now();
-  observeRunningSubagent(running, now);
-
-  const steer = steerSubagent(running, message, send);
+  observeRunningSubagent(running, Date.now());
+  const steer = await steerSubagent(running, message, send);
   if ("error" in steer) {
-    return {
-      content: [{ type: "text" as const, text: steer.error }],
-      details: { error: steer.error, id: running.id, name: running.name },
-    };
+    return { content: [{ type: "text" as const, text: steer.error }],
+      details: { error: steer.error, id: running.id, name: running.name } };
   }
-
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  running.statusState = forceStatusAfterInterrupt(running.statusState, Date.now());
   updateWidget();
-
   return {
-    content: [{
-      type: "text" as const,
-      text:
-        `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
-        `turn boundary. If it exits, its result still arrives as a steer message.`,
-    }],
+    content: [{ type: "text" as const,
+      text: `Message delivered to running subagent "${running.name}". It picks this up at its next turn boundary. If it exits, its result still arrives as a steer message.` }],
     details: { id: running.id, name: running.name, status: "steered" },
   };
 }
@@ -1225,14 +1240,9 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
-  // codex CLI path
+  // external CLI profiles
   resolveCliKind,
   slugifyName,
-  resolveCodexBinary,
-  buildCodexExecCommand,
-  appendCompletionSentinel,
-  findCodexRollout,
-  archiveCodexRollout,
 };
 
 function startWidgetRefresh() {
@@ -1287,6 +1297,9 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
+
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
@@ -1294,9 +1307,6 @@ async function launchSubagent(
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
-
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1330,148 +1340,24 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (cliKind === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
-    const pluginDir = join(SUBAGENTS_DIR, "plugin");
-
-    const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
-
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+  if (cliKind) {
+    if (!existsSync(subagentSessionFile)) {
+      seedSubagentSessionFile({ mode: "lineage-only", parentSessionFile: sessionFile,
+        childSessionFile: subagentSessionFile, childCwd: targetCwdForSession });
     }
-
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
-    }
-
-    const sp = agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
-
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-
-    const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      launchScriptFile,
-      cli: "claude",
-      sentinelFile,
-      interactive: effectiveInteractive,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
+    const externalSession: ExternalCliSession = {
+      version: 1, kind: cliKind,
+      nativeId: cliKind === "claude" ? randomUUID() : null,
+      cwd: targetCwdForSession, model: effectiveModel ?? null,
+      thinking: effectiveThinking ?? null, identity,
+      systemPromptMode: systemPromptMode ?? null,
+      autoExit: agentDefs?.autoExit ?? false,
     };
-
-    runningSubagents.set(id, running);
-    return running;
-  }
-
-  // ── Codex CLI path ──
-  // Mirrors the claude branch: spawn the external agent in its own pane,
-  // detect completion via a shell-written sentinel, and return the final
-  // message as the summary. Differences: codex exec is one-shot (no TUI to
-  // steer), and identity injection uses the `instructions` config key because
-  // codex has no --append-system-prompt flag.
-  if (cliKind === "codex") {
-    const sentinelFile = `/tmp/pi-codex-${id}-done`;
-    const outputFile = `${sentinelFile}.last`;
-
-    // The codex binary often lives inside the ChatGPT.app bundle and only
-    // reaches PATH via login-shell rc files, which mux panes never source.
-    // Resolve an absolute path (or PI_CODEX_BIN) at spawn time.
-    const codexBin = resolveCodexBinary();
-
-    // Compose the prompt: codex has no system-prompt channel apart from the
-    // `instructions` config key, so the agent body goes there and the task
-    // text carries the autonomy/summary wrapper instructions. `fullTask` is
-    // the single source of truth for that composition (fork mode is rejected
-    // for CLI agents, so it is always the blank-session variant here).
-    const taskFile = join(
-      artifactDir,
-      "context",
-      `codex-${slugifyName(params.name)}-${id}.md`,
-    );
-    mkdirSync(dirname(taskFile), { recursive: true });
-    writeFileSync(taskFile, fullTask.trimStart(), "utf8");
-
-    const codexCommand = appendCompletionSentinel(
-      buildCodexExecCommand({
-        codexBin,
-        model: effectiveModel ?? null,
-        thinking: effectiveThinking ?? null,
-        instructions: identityInSystemPrompt ? identity ?? null : null,
-        cwd: effectiveCwd ?? null,
-        outputFile,
-        taskFile,
-      }),
-      sentinelFile,
-    );
-
-    const launchScriptFile = join(
-      artifactDir,
-      "subagent-scripts",
-      `${slugifyName(params.name)}-${id}.sh`,
-    );
-
-    sendLongCommand(surface, codexCommand, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Codex CLI subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      launchScriptFile,
-      cli: "codex",
-      sentinelFile,
-      outputFile,
-      cwd: effectiveCwd ?? process.cwd(),
-      interactive: effectiveInteractive,
-      statusState: createStatusState({
-        source: "codex",
-        startTimeMs: startTime,
-      }),
-    };
-
-    runningSubagents.set(id, running);
-    return running;
+    writeExternalSession(subagentSessionFile, externalSession);
+    return launchExternalSubagent({ id, name: params.name, task: params.task,
+      prompt: fullTask, agent: params.agent, sessionFile: subagentSessionFile,
+      artifactDir, surface, startTime, session: externalSession,
+      resume: false, interactive: effectiveInteractive });
   }
 
   // ── Pi CLI path ──
@@ -1605,244 +1491,41 @@ async function launchSubagent(
   return running;
 }
 
-/**
- * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, cleans up the surface,
- * and removes the entry from runningSubagents.
- */
-const CLAUDE_SESSIONS_DIR = join(
-  process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
-);
-
-function copyClaudeSession(sentinelFile: string): string | null {
+function launchExternalSubagent(params: {
+  id: string; name: string; task: string; prompt: string; agent?: string;
+  sessionFile: string; artifactDir: string; surface: string; startTime: number;
+  session: ExternalCliSession; resume: boolean; interactive: boolean;
+}): RunningSubagent {
+  const runDir = join(params.artifactDir, "cli-runs", params.id);
+  mkdirSync(runDir, { recursive: true });
+  const taskFile = join(runDir, "task.md");
+  const sentinelFile = join(runDir, "result.json");
+  const launchScriptFile = join(runDir, "launch.sh");
+  const prompt = prepareExternalPrompt(params.session.kind, params.prompt);
+  writeFileSync(taskFile, prompt, { mode: 0o600 });
+  writeFileSync(`${sentinelFile}.inputs.json`, JSON.stringify([prompt]), { mode: 0o600 });
+  appendUserMessage(params.sessionFile, params.task);
+  const command = buildExternalCommand({ session: params.session,
+    sessionFile: params.sessionFile, resultFile: sentinelFile, taskFile,
+    hookFile: join(SUBAGENTS_DIR, "cli-hook.mjs"),
+    settingsFile: join(runDir, "claude-settings.json"), resume: params.resume });
+  writeFileSync(launchScriptFile, "#!/bin/bash\n" + command + "\n", { mode: 0o700 });
   try {
-    const transcriptFile = sentinelFile + ".transcript";
-    if (!existsSync(transcriptFile)) return null;
-    const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
-    copyFileSync(transcriptPath, dest);
-    return filename;
-  } catch {
-    return null;
+    startSurfaceProcess(params.surface, launchScriptFile);
+  } catch (error) {
+    try { closeSurface(params.surface); } catch {}
+    throw error;
   }
-}
-
-// ── Codex (OpenAI codex CLI) helpers ──────────────────────────────────────────
-
-/**
- * The codex binary is usually NOT on a non-login shell's PATH: it ships inside
- * the ChatGPT.app bundle and ~/.zprofile adds it to PATH, which a mux pane's
- * `bash -c` never sources. Resolve an absolute path at spawn time so the
- * launch script does not depend on the pane's login status.
- *
- * Resolution order:
- *   1. PI_CODEX_BIN (explicit override; absolute path to the binary)
- *   2. every directory on the spawning process's PATH
- *   3. well-known install locations
- * Falls back to the bare command name, which still works when the pane's
- * shell is interactive and has the bundle path on PATH.
- */
-const CODEX_BIN_DIRS = [
-  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin",
-  "/opt/homebrew/bin",
-  "/usr/local/bin",
-];
-
-function resolveCodexBinary(): string {
-  const override = process.env.PI_CODEX_BIN?.trim();
-  if (override) return override;
-
-  for (const dir of process.env.PATH?.split(":") ?? []) {
-    if (dir && existsSync(join(dir, "codex"))) return join(dir, "codex");
-  }
-  for (const dir of CODEX_BIN_DIRS) {
-    if (existsSync(join(dir, "codex"))) return join(dir, "codex");
-  }
-  return "codex";
-}
-
-/**
- * Build the `codex exec` invocation for one subagent run.
- *
- * Verified against codex-cli 0.158:
- *   - `--skip-git-repo-check` lets it run in non-repo working directories
- *   - `-o <file>` writes the FINAL assistant message when the run completes
- *   - `--` separates options from the prompt so a task that happens to start
- *     with a subcommand name (`review`, `resume`, …) is not misparsed
- *   - identity injection uses `-c instructions=…` because `codex exec` has no
- *     `--append-system-prompt` equivalent; `thinking` maps to
- *     `model_reasoning_effort`
- *   - the prompt is read from the task file via `"$(cat …)"`, which keeps
- *     multi-line/large tasks out of the command line without shell hazards
- */
-function buildCodexExecCommand(params: {
-  codexBin: string;
-  model: string | null;
-  thinking: string | null;
-  instructions: string | null;
-  cwd: string | null;
-  outputFile: string;
-  taskFile: string;
-}): string {
-  const parts: string[] = [
-    shellEscape(params.codexBin),
-    "exec",
-    "--skip-git-repo-check",
-    // Mirror cli: claude's --dangerously-skip-permissions: an autonomous agent
-    // in its own pane must not stall on approval prompts. Documented in the
-    // README — use a sandboxed wrapper if that trust level is not acceptable.
-    "--dangerously-bypass-approvals-and-sandbox",
-  ];
-
-  if (params.model) parts.push("-m", shellEscape(params.model));
-  if (params.thinking) {
-    parts.push("-c", shellEscape(`model_reasoning_effort="${params.thinking}"`));
-  }
-  if (params.instructions) {
-    parts.push("-c", shellEscape(`instructions=${JSON.stringify(params.instructions)}`));
-  }
-
-  parts.push("-o", shellEscape(params.outputFile));
-  parts.push("--", `"$(cat ${shellEscape(params.taskFile)})"`);
-
-  const cdPrefix = params.cwd ? `cd ${shellEscape(params.cwd)} && ` : "";
-  return `${cdPrefix}${parts.join(" ")}`;
-}
-
-/**
- * Wrap a command so completion is observable from the parent:
- *   - the exit code is written to `sentinelFile` (poll fast path + real code)
- *   - the terminal sentinel string is printed as a screen fallback
- */
-function appendCompletionSentinel(command: string, sentinelFile: string): string {
-  return (
-    `${command}; RC=$?; ` +
-    `printf '%s' "$RC" > ${shellEscape(sentinelFile)}; ` +
-    `echo '__SUBAGENT_DONE_'"$RC"'__'`
-  );
-}
-
-/**
- * Locate the rollout transcript the codex run just produced.
- *
- * codex records every session under $CODEX_HOME/sessions/YYYY/MM/DD/
- * rollout-<timestamp>-<uuid>.jsonl. We don't know the uuid up front, so scan
- * the last two date directories and take the newest rollout written after the
- * run started whose header cwd matches the subagent's working directory.
- * Returns the thread id and file path, or null when nothing matches.
- */
-function findCodexRollout(
-  startedAtMs: number,
-  cwd: string | null,
-): { path: string; threadId: string | null } | null {
-  try {
-    const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
-    const sessionsRoot = join(codexHome, "sessions");
-    if (!existsSync(sessionsRoot)) return null;
-
-    const dayDirs: string[] = [];
-    for (let offset = 0; offset <= 1; offset++) {
-      const d = new Date(startedAtMs - offset * 24 * 60 * 60 * 1000);
-      const yyyy = String(d.getFullYear());
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      dayDirs.push(join(sessionsRoot, yyyy, mm, dd));
-    }
-
-    let best: { path: string; mtimeMs: number } | null = null;
-    const candidates: Array<{ path: string; mtimeMs: number }> = [];
-    for (const dir of dayDirs) {
-      if (!existsSync(dir)) continue;
-      for (const entry of readdirSync(dir)) {
-        if (!entry.startsWith("rollout-") || !entry.endsWith(".jsonl")) continue;
-        const path = join(dir, entry);
-        let mtimeMs: number;
-        try {
-          mtimeMs = statSync(path).mtimeMs;
-        } catch {
-          continue;
-        }
-        if (mtimeMs < startedAtMs - 10_000) continue;
-        candidates.push({ path, mtimeMs });
-      }
-    }
-    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    // Newest first; skip rollouts that belong to a different working
-    // directory (a concurrent codex run elsewhere) and take the first match.
-    for (const candidate of candidates) {
-      if (cwd) {
-        const headerCwd = readCodexRolloutCwd(candidate.path);
-        if (headerCwd && normalizeFsPath(headerCwd) !== normalizeFsPath(cwd)) continue;
-      }
-      best = candidate;
-      break;
-    }
-
-    if (!best) return null;
-    return { path: best.path, threadId: readCodexRolloutThreadId(best.path) };
-  } catch {
-    return null;
-  }
-}
-
-function readCodexRolloutHeader(rolloutPath: string): any | null {
-  try {
-    const first = readFileSync(rolloutPath, "utf8").split("\n")[0] ?? "";
-    const parsed = JSON.parse(first);
-    return parsed?.payload ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function readCodexRolloutCwd(rolloutPath: string): string | null {
-  const payload = readCodexRolloutHeader(rolloutPath);
-  return typeof payload?.cwd === "string" ? payload.cwd : null;
-}
-
-function readCodexRolloutThreadId(rolloutPath: string): string | null {
-  const payload = readCodexRolloutHeader(rolloutPath);
-  const id = payload?.session_id ?? payload?.id;
-  return typeof id === "string" && id.trim() !== "" ? id.trim() : null;
-}
-
-/** Compare paths after resolving symlinks (macOS /tmp vs /private/tmp). */
-function normalizeFsPath(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
-}
-
-/**
- * Best-effort transcript archiving for a finished codex subagent: copy the
- * rollout JSONL next to the pi session file so it can be reopened later.
- * Also records the codex thread id beside it, so a future resume can call
- * `codex exec resume <threadId>`.
- *
- * @returns the archived rollout path, or null when no rollout matched.
- */
-function archiveCodexRollout(startedAtMs: number, cwd: string | null, piSessionFile: string): string | null {
-  const found = findCodexRollout(startedAtMs, cwd);
-  if (!found) return null;
-  try {
-    const destDir = `${piSessionFile}.codex`;
-    mkdirSync(destDir, { recursive: true });
-    const dest = join(destDir, "rollout.jsonl");
-    copyFileSync(found.path, dest);
-    if (found.threadId) {
-      writeFileSync(join(destDir, "thread-id"), found.threadId, "utf8");
-    }
-    return dest;
-  } catch {
-    return null;
-  }
+  const running: RunningSubagent = {
+    id: params.id, name: params.name, task: params.task, agent: params.agent,
+    surface: params.surface, startTime: params.startTime,
+    sessionFile: params.sessionFile, launchScriptFile, sentinelFile,
+    cli: params.session.kind,
+    interactive: params.interactive,
+    statusState: createStatusState({ source: params.session.kind, startTimeMs: params.startTime }),
+  };
+  runningSubagents.set(running.id, running);
+  return running;
 }
 
 /**
@@ -1887,6 +1570,11 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+/**
+ * Watch a launched subagent until it exits. Polls for completion, extracts
+ * the summary from the session file, cleans up the surface,
+ * and removes the entry from runningSubagents.
+ */
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1898,6 +1586,7 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      cli: Boolean(running.cli),
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1906,85 +1595,21 @@ async function watchSubagent(
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    if (running.cli === "claude") {
-      // Claude Code result extraction
-      let summary = "";
-
-      if (running.sentinelFile) {
-        try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
-        } catch {}
+    if (running.cli) {
+      let payload: { summary?: string; exitCode?: number; nativeId?: string } = {};
+      try {
+        payload = existsSync(running.sentinelFile!)
+          ? JSON.parse(readFileSync(running.sentinelFile!, "utf8"))
+          : readCliExitResult(running.sentinelFile!, result.exitCode, result.errorMessage);
+      } catch (error: any) {
+        payload = { exitCode: 1, summary: `Cannot read native CLI result: ${error.message}` };
       }
-
-      if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
-      }
-
-      if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
-      }
-
-      // Copy Claude session transcript
-      let sessionId: string | null = null;
-      if (running.sentinelFile) {
-        sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
-      }
-
-      closeSurface(surface);
+      const exitCode = payload.exitCode ?? result.exitCode;
+      const summary = payload.summary || result.errorMessage || `CLI exited with code ${exitCode} without a final response.`;
+      try { closeSurface(surface); } catch {}
       runningSubagents.delete(running.id);
-
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
-    }
-
-    if (running.cli === "codex") {
-      // Codex CLI result extraction. <sentinelFile> holds the exit code the
-      // launch shell wrote after codex exited; <outputFile> (codex -o) holds
-      // the final assistant message.
-      let codexExitCode = result.exitCode;
-      if (running.sentinelFile) {
-        try {
-          const parsed = Number.parseInt(readFileSync(running.sentinelFile, "utf-8").trim(), 10);
-          if (Number.isFinite(parsed)) codexExitCode = parsed;
-        } catch {}
-      }
-
-      let codexSummary = "";
-      if (running.outputFile) {
-        try {
-          codexSummary = readFileSync(running.outputFile, "utf-8").trim();
-        } catch {}
-      }
-      if (!codexSummary) {
-        codexSummary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
-      }
-      if (!codexSummary) {
-        codexSummary = codexExitCode !== 0
-          ? `Codex exited with code ${codexExitCode}`
-          : "Codex exited without output";
-      }
-
-      // Best-effort: archive the rollout transcript next to the pi session
-      // file, and remember the codex thread id for potential follow-ups.
-      if (running.outputFile) {
-        archiveCodexRollout(running.startTime, running.cwd ?? null, running.sessionFile);
-        try { unlinkSync(running.outputFile); } catch {}
-      }
-      if (running.sentinelFile) {
-        try { unlinkSync(running.sentinelFile); } catch {}
-      }
-
-      closeSurface(surface);
-      runningSubagents.delete(running.id);
-
-      return { name, task, summary: codexSummary, exitCode: codexExitCode, elapsed };
+      return { name, task, summary, exitCode, elapsed, sessionFile,
+        sessionId: getSessionId(sessionFile) ?? undefined };
     }
 
     // Pi subagent result extraction
@@ -2237,43 +1862,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: result.sessionFile,
-                  ...(result.sessionId ? { sessionId: result.sessionId } : {}),
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                  ...(result.stats ? { stats: result.stats } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
+            publishSubagentResult(pi, result, running.agent);
           })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+          .catch((err) => publishSubagentError(pi, running.name, err, running.task));
 
         // Return immediately
         return {
@@ -2489,6 +2080,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        if (!params.message.trim()) {
+          const error = "`message` must contain non-whitespace text.";
+          return { content: [{ type: "text" as const, text: error }], details: { error } };
+        }
+
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
         }
@@ -2538,6 +2134,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
             return handleSubagentSteer({ name: r.name, message: params.message });
           }
+        }
+
+        const external = readExternalSession(sessionPath);
+        if (external) {
+          if (!external.nativeId) {
+            const error = `Subagent "${name}" has no native CLI session ID; start a fresh subagent.`;
+            return { content: [{ type: "text" as const, text: error }], details: { error } };
+          }
+          const surface = createSurface(name);
+          const running = launchExternalSubagent({ id, name, task: message, prompt: message,
+            sessionFile: sessionPath, artifactDir: parentArtifactDir, surface, startTime,
+            session: { ...external, autoExit }, resume: true, interactive });
+          const watcherAbort = new AbortController();
+          running.abortController = watcherAbort;
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+          watchSubagent(running, watcherAbort.signal)
+            .then(result => publishSubagentResult(pi, result))
+            .catch(error => publishSubagentError(pi, name, error));
+          return { content: [{ type: "text" as const, text: `Session "${name}" resumed.` }],
+            details: { id, name, sessionFile: sessionPath, sessionId: getSessionId(sessionPath),
+              launchScriptFile: running.launchScriptFile, status: "started" } };
         }
 
         // Reconstruct the sandbox from the snapshot written at spawn time.
@@ -2661,8 +2279,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            updateWidget();
-
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
@@ -2670,41 +2286,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 : result.exitCode !== 0
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
+            publishSubagentResult(pi,
               { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
-              name,
-            );
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name,
-                  task: message,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  sessionFile: sessionPath,
-                  sessionId: resumedSessionId,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
+              loadout.agent ?? undefined);
           })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+          .catch((err) => publishSubagentError(pi, name, err));
 
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],

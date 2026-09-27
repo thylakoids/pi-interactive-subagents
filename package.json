@@ -13,8 +13,9 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "node --test test/*.test.ts test/test.ts",
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "test:cli-integration": "node --test test/integration/external-cli.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

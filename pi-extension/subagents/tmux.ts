@@ -96,7 +96,7 @@ function rebalanceSurfaces(hintPane?: string): void {
     try {
       // -t <pane> resolves to that pane's window; does not change focus.
       execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
-        encoding: "utf8",
+        stdio: "ignore",
       });
     } catch {
       // Pane/window may be gone; balancing is best-effort.
@@ -234,7 +234,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", stdio: "pipe" });
   rebalanceSurfaces();
 }
 
@@ -283,6 +283,7 @@ export async function pollForExit(
     interval: number;
     sessionFile?: string;
     sentinelFile?: string;
+    cli?: boolean;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -305,7 +306,7 @@ export async function pollForExit(
       } catch {}
     }
 
-    // Check Claude sentinel file (written by plugin Stop hook)
+    // Check the native CLI hook result (or shell-exit result).
     if (options.sentinelFile) {
       try {
         if (existsSync(options.sentinelFile)) {
@@ -314,14 +315,33 @@ export async function pollForExit(
       } catch {}
     }
 
+    if (options.cli && options.sentinelFile) {
+      const diagnostic = `${options.sentinelFile}.hook-error`;
+      if (existsSync(diagnostic)) {
+        try {
+          const data = JSON.parse(readFileSync(diagnostic, "utf8"));
+          return { reason: "error", exitCode: 1, errorMessage: data.errorMessage };
+        } catch (error: any) {
+          return { reason: "error", exitCode: 1, errorMessage: `Cannot read CLI hook diagnostic: ${error.message}` };
+        }
+      }
+    }
+
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
+      if (match && !options.cli) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      // Native pane exits are definitive: no surrounding shell survives it.
+      if (options.cli) {
+        if (options.sentinelFile && existsSync(options.sentinelFile)) {
+          return { reason: "sentinel", exitCode: 0 };
+        }
+        return { reason: "error", exitCode: 1, errorMessage: "Native CLI pane closed before reporting completion." };
+      }
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
         try {
@@ -350,5 +370,25 @@ export async function pollForExit(
       }
       signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+}
+
+/** Launch a native CLI as the pane process, with no shell left behind. */
+export function startSurfaceProcess(surface: string, scriptPath: string): void {
+  requireTmux();
+  execFileSync("tmux", ["respawn-pane", "-k", "-t", surface,
+    `exec bash ${shellEscape(scriptPath)}`], { encoding: "utf8" });
+}
+
+/** Bracketed paste preserves multiline text as one TUI submission. */
+export function pasteMessage(surface: string, message: string): void {
+  requireTmux();
+  const buffer = `pi-message-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  execFileSync("tmux", ["load-buffer", "-b", buffer, "-"], { input: message, encoding: "utf8" });
+  try {
+    execFileSync("tmux", ["paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", surface]);
+    execFileSync("tmux", ["send-keys", "-t", surface, "Enter"]);
+  } finally {
+    try { execFileSync("tmux", ["delete-buffer", "-b", buffer], { stdio: "ignore" }); } catch {}
   }
 }
