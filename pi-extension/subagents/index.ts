@@ -11,6 +11,8 @@ import {
   existsSync,
   mkdirSync,
   copyFileSync,
+  realpathSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -384,6 +386,25 @@ function resolveLaunchBehavior(
 }
 
 /**
+ * `fork` means "seed the child with the caller's pi conversation". A CLI agent
+ * (claude/codex) cannot read a pi session, so the mode would silently degrade
+ * into a context-free run. Fail fast instead of pretending it worked.
+ */
+function assertCliSessionModeSupported(
+  agentDefs: AgentDefaults | null,
+  sessionMode: SubagentSessionMode,
+  agentName?: string,
+): void {
+  if (sessionMode === "fork" && agentDefs?.cli) {
+    throw new Error(
+      `Agent "${agentName ?? "unknown"}" sets cli: ${agentDefs.cli} and cannot use ` +
+      `session-mode: fork — the external CLI does not read pi session context. ` +
+      `Use session-mode: standalone (or lineage-only) instead.`,
+    );
+  }
+}
+
+/**
  * Decide whether a subagent is interactive (user-driven, long-running).
  *
  * Resolution order:
@@ -618,6 +639,10 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** codex only: file codex writes the final assistant message to (`-o`). */
+  outputFile?: string;
+  /** codex only: working directory the run was started in. */
+  cwd?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -735,7 +760,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
-      : agent.cli === "claude"
+      : agent.cli
         ? " running… "
         : " starting… ";
 
@@ -904,7 +929,8 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
+  // CLI-backed runs (claude/codex) have no pi activity snapshot to read.
+  if (running.cli) return;
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -1001,6 +1027,18 @@ function steerSubagent(
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
+  // `codex exec` runs non-interactively: it never reads stdin after the task
+  // argument, so typed keystrokes would sit in the pane's input buffer and be
+  // interpreted by the shell once codex exits. Refuse rather than risk that.
+  if (running.cli === "codex") {
+    return {
+      error:
+        `Subagent "${running.name}" runs the codex CLI non-interactively and cannot ` +
+        `receive mid-run messages. Wait for it to finish, then spawn a follow-up ` +
+        `subagent with the result as context.`,
+    };
+  }
+
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     send(running.surface, flattened);
@@ -1141,6 +1179,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  assertCliSessionModeSupported,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1148,6 +1187,12 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  // codex CLI path
+  resolveCodexBinary,
+  buildCodexExecCommand,
+  appendCompletionSentinel,
+  findCodexRollout,
+  archiveCodexRollout,
 };
 
 function startWidgetRefresh() {
@@ -1210,6 +1255,7 @@ async function launchSubagent(
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  assertCliSessionModeSupported(agentDefs, launchBehavior.sessionMode, params.agent);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1304,6 +1350,96 @@ async function launchSubagent(
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
+        startTimeMs: startTime,
+      }),
+    };
+
+    runningSubagents.set(id, running);
+    return running;
+  }
+
+  // ── Codex CLI path ──
+  // Mirrors the claude branch: spawn the external agent in its own pane,
+  // detect completion via a shell-written sentinel, and return the final
+  // message as the summary. Differences: codex exec is one-shot (no TUI to
+  // steer), and identity injection uses the `instructions` config key because
+  // codex has no --append-system-prompt flag.
+  if (agentDefs?.cli === "codex") {
+    const sentinelFile = `/tmp/pi-codex-${id}-done`;
+    const outputFile = `${sentinelFile}.last`;
+
+    // The codex binary often lives inside the ChatGPT.app bundle and only
+    // reaches PATH via login-shell rc files, which mux panes never source.
+    // Resolve an absolute path (or PI_CODEX_BIN) at spawn time.
+    const codexBin = resolveCodexBinary();
+
+    // Compose the prompt: codex has no system-prompt channel apart from the
+    // `instructions` config key, so the agent body goes there and the task
+    // text carries the autonomy/summary wrapper instructions.
+    const taskFile = join(
+      artifactDir,
+      "context",
+      `codex-${(params.name || "subagent")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "") || "subagent"}-${id}.md`,
+    );
+    mkdirSync(dirname(taskFile), { recursive: true });
+    writeFileSync(
+      taskFile,
+      `${identity && !identityInSystemPrompt ? `${identity}\n\n` : ""}${modeHint}\n\n${params.task}\n\n${summaryInstruction}`,
+      "utf8",
+    );
+
+    const codexCommand = appendCompletionSentinel(
+      buildCodexExecCommand({
+        codexBin,
+        model: effectiveModel ?? null,
+        thinking: effectiveThinking ?? null,
+        instructions: identityInSystemPrompt ? identity ?? null : null,
+        cwd: effectiveCwd ?? null,
+        outputFile,
+        taskFile,
+      }),
+      sentinelFile,
+    );
+
+    const codexScriptFile = join(
+      artifactDir,
+      "subagent-scripts",
+      `${(params.name || "subagent")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .replace(/\s+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`,
+    );
+
+    sendLongCommand(surface, codexCommand, {
+      scriptPath: codexScriptFile,
+      scriptPreamble: [
+        `# Codex CLI subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+
+    const running: RunningSubagent = {
+      id,
+      name: params.name,
+      task: params.task,
+      agent: params.agent,
+      surface,
+      startTime,
+      sessionFile: subagentSessionFile,
+      launchScriptFile: codexScriptFile,
+      cli: "codex",
+      sentinelFile,
+      outputFile,
+      cwd: effectiveCwd ?? process.cwd(),
+      interactive: effectiveInteractive,
+      statusState: createStatusState({
+        source: "codex",
         startTimeMs: startTime,
       }),
     };
@@ -1479,6 +1615,218 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+// ── Codex (OpenAI codex CLI) helpers ──────────────────────────────────────────
+
+/**
+ * The codex binary is usually NOT on a non-login shell's PATH: it ships inside
+ * the ChatGPT.app bundle and ~/.zprofile adds it to PATH, which a mux pane's
+ * `bash -c` never sources. Resolve an absolute path at spawn time so the
+ * launch script does not depend on the pane's login status.
+ *
+ * Resolution order:
+ *   1. PI_CODEX_BIN (explicit override; absolute path to the binary)
+ *   2. every directory on the spawning process's PATH
+ *   3. well-known install locations
+ * Falls back to the bare command name, which still works when the pane's
+ * shell is interactive and has the bundle path on PATH.
+ */
+const CODEX_BIN_DIRS = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+];
+
+function resolveCodexBinary(): string {
+  const override = process.env.PI_CODEX_BIN?.trim();
+  if (override) return override;
+
+  for (const dir of process.env.PATH?.split(":") ?? []) {
+    if (dir && existsSync(join(dir, "codex"))) return join(dir, "codex");
+  }
+  for (const dir of CODEX_BIN_DIRS) {
+    if (existsSync(join(dir, "codex"))) return join(dir, "codex");
+  }
+  return "codex";
+}
+
+/**
+ * Build the `codex exec` invocation for one subagent run.
+ *
+ * Verified against codex-cli 0.158:
+ *   - `--skip-git-repo-check` lets it run in non-repo working directories
+ *   - `-o <file>` writes the FINAL assistant message when the run completes
+ *   - `--` separates options from the prompt so a task that happens to start
+ *     with a subcommand name (`review`, `resume`, …) is not misparsed
+ *   - identity injection uses `-c instructions=…` because `codex exec` has no
+ *     `--append-system-prompt` equivalent; `thinking` maps to
+ *     `model_reasoning_effort`
+ *   - the prompt is read from the task file via `"$(cat …)"`, which keeps
+ *     multi-line/large tasks out of the command line without shell hazards
+ */
+function buildCodexExecCommand(params: {
+  codexBin: string;
+  model: string | null;
+  thinking: string | null;
+  instructions: string | null;
+  cwd: string | null;
+  outputFile: string;
+  taskFile: string;
+}): string {
+  const parts: string[] = [
+    shellEscape(params.codexBin),
+    "exec",
+    "--skip-git-repo-check",
+    // Mirror cli: claude's --dangerously-skip-permissions: an autonomous agent
+    // in its own pane must not stall on approval prompts. Documented in the
+    // README — use a sandboxed wrapper if that trust level is not acceptable.
+    "--dangerously-bypass-approvals-and-sandbox",
+  ];
+
+  if (params.model) parts.push("-m", shellEscape(params.model));
+  if (params.thinking) {
+    parts.push("-c", shellEscape(`model_reasoning_effort="${params.thinking}"`));
+  }
+  if (params.instructions) {
+    parts.push("-c", shellEscape(`instructions=${JSON.stringify(params.instructions)}`));
+  }
+
+  parts.push("-o", shellEscape(params.outputFile));
+  parts.push("--", `"$(cat ${shellEscape(params.taskFile)})"`);
+
+  const cdPrefix = params.cwd ? `cd ${shellEscape(params.cwd)} && ` : "";
+  return `${cdPrefix}${parts.join(" ")}`;
+}
+
+/**
+ * Wrap a command so completion is observable from the parent:
+ *   - the exit code is written to `sentinelFile` (poll fast path + real code)
+ *   - the terminal sentinel string is printed as a screen fallback
+ */
+function appendCompletionSentinel(command: string, sentinelFile: string): string {
+  return (
+    `${command}; RC=$?; ` +
+    `printf '%s' "$RC" > ${shellEscape(sentinelFile)}; ` +
+    `echo '__SUBAGENT_DONE_'"$RC"'__'`
+  );
+}
+
+/**
+ * Locate the rollout transcript the codex run just produced.
+ *
+ * codex records every session under $CODEX_HOME/sessions/YYYY/MM/DD/
+ * rollout-<timestamp>-<uuid>.jsonl. We don't know the uuid up front, so scan
+ * the last two date directories and take the newest rollout written after the
+ * run started whose header cwd matches the subagent's working directory.
+ * Returns the thread id and file path, or null when nothing matches.
+ */
+function findCodexRollout(
+  startedAtMs: number,
+  cwd: string | null,
+): { path: string; threadId: string | null } | null {
+  try {
+    const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
+    const sessionsRoot = join(codexHome, "sessions");
+    if (!existsSync(sessionsRoot)) return null;
+
+    const dayDirs: string[] = [];
+    for (let offset = 0; offset <= 1; offset++) {
+      const d = new Date(startedAtMs - offset * 24 * 60 * 60 * 1000);
+      const yyyy = String(d.getFullYear());
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      dayDirs.push(join(sessionsRoot, yyyy, mm, dd));
+    }
+
+    let best: { path: string; mtimeMs: number } | null = null;
+    const candidates: Array<{ path: string; mtimeMs: number }> = [];
+    for (const dir of dayDirs) {
+      if (!existsSync(dir)) continue;
+      for (const entry of readdirSync(dir)) {
+        if (!entry.startsWith("rollout-") || !entry.endsWith(".jsonl")) continue;
+        const path = join(dir, entry);
+        let mtimeMs: number;
+        try {
+          mtimeMs = statSync(path).mtimeMs;
+        } catch {
+          continue;
+        }
+        if (mtimeMs < startedAtMs - 10_000) continue;
+        candidates.push({ path, mtimeMs });
+      }
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    // Newest first; skip rollouts that belong to a different working
+    // directory (a concurrent codex run elsewhere) and take the first match.
+    for (const candidate of candidates) {
+      if (cwd) {
+        const headerCwd = readCodexRolloutCwd(candidate.path);
+        if (headerCwd && normalizeFsPath(headerCwd) !== normalizeFsPath(cwd)) continue;
+      }
+      best = candidate;
+      break;
+    }
+
+    if (!best) return null;
+    return { path: best.path, threadId: readCodexRolloutThreadId(best.path) };
+  } catch {
+    return null;
+  }
+}
+
+function readCodexRolloutHeader(rolloutPath: string): any | null {
+  try {
+    const first = readFileSync(rolloutPath, "utf8").split("\n")[0] ?? "";
+    const parsed = JSON.parse(first);
+    return parsed?.payload ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readCodexRolloutCwd(rolloutPath: string): string | null {
+  const payload = readCodexRolloutHeader(rolloutPath);
+  return typeof payload?.cwd === "string" ? payload.cwd : null;
+}
+
+function readCodexRolloutThreadId(rolloutPath: string): string | null {
+  const payload = readCodexRolloutHeader(rolloutPath);
+  const id = payload?.session_id ?? payload?.id;
+  return typeof id === "string" && id.trim() !== "" ? id.trim() : null;
+}
+
+/** Compare paths after resolving symlinks (macOS /tmp vs /private/tmp). */
+function normalizeFsPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Best-effort transcript archiving for a finished codex subagent: copy the
+ * rollout JSONL next to the pi session file so it can be reopened later.
+ */
+function archiveCodexRollout(startedAtMs: number, cwd: string | null, piSessionFile: string): string | null {
+  const found = findCodexRollout(startedAtMs, cwd);
+  if (!found) return null;
+  try {
+    const destDir = `${piSessionFile}.codex`;
+    mkdirSync(destDir, { recursive: true });
+    const dest = join(destDir, "rollout.jsonl");
+    copyFileSync(found.path, dest);
+    // Remember the thread id so a future resume can call
+    // `codex exec resume <threadId>`; harmless if unused.
+    if (found.threadId) {
+      writeFileSync(join(destDir, "thread-id"), found.threadId, "utf8");
+    }
+    return found.threadId ?? dest;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
  * orchestrator without ending the subagent. Each subagent has its own
@@ -1574,6 +1922,51 @@ async function watchSubagent(
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+    }
+
+    if (running.cli === "codex") {
+      // Codex CLI result extraction. <sentinelFile> holds the exit code the
+      // launch shell wrote after codex exited; <outputFile> (codex -o) holds
+      // the final assistant message.
+      let codexExitCode = result.exitCode;
+      if (running.sentinelFile) {
+        try {
+          const parsed = Number.parseInt(readFileSync(running.sentinelFile, "utf-8").trim(), 10);
+          if (Number.isFinite(parsed)) codexExitCode = parsed;
+        } catch {}
+      }
+
+      let codexSummary = "";
+      if (running.outputFile) {
+        try {
+          codexSummary = readFileSync(running.outputFile, "utf-8").trim();
+        } catch {}
+      }
+      if (!codexSummary) {
+        codexSummary = readScreen(surface, 200)
+          .replace(/__SUBAGENT_DONE_\d+__/, "")
+          .trimEnd();
+      }
+      if (!codexSummary) {
+        codexSummary = codexExitCode !== 0
+          ? `Codex exited with code ${codexExitCode}`
+          : "Codex exited without output";
+      }
+
+      // Best-effort: archive the rollout transcript next to the pi session
+      // file, and remember the codex thread id for potential follow-ups.
+      if (running.outputFile) {
+        archiveCodexRollout(running.startTime, running.cwd ?? null, running.sessionFile);
+        try { unlinkSync(running.outputFile); } catch {}
+      }
+      if (running.sentinelFile) {
+        try { unlinkSync(running.sentinelFile); } catch {}
+      }
+
+      closeSurface(surface);
+      runningSubagents.delete(running.id);
+
+      return { name, task, summary: codexSummary, exitCode: codexExitCode, elapsed };
     }
 
     // Pi subagent result extraction

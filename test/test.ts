@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -817,6 +817,18 @@ describe("status.ts", () => {
 
     assert.equal(snapshot.kind, "running");
     assert.equal(snapshot.elapsedText, "2m");
+  });
+
+  it("uses elapsed-only fallback for codex-backed subagents too", () => {
+    let state = createStatusState({ source: "codex", startTimeMs: 0 });
+    // Observations are ignored (no pi activity snapshot exists) and the state
+    // never degrades to stalled, regardless of elapsed time.
+    state = observeStatus(state, { snapshot: "missing" }, 5_000);
+    const advanced = advanceStatusState(state, 600_000);
+
+    assert.equal(advanced.transition, null);
+    assert.equal(advanced.snapshot.kind, "running");
+    assert.equal(advanced.snapshot.elapsedText, "10m");
   });
 
   it("detects stalled transitions and recovery", () => {
@@ -2650,6 +2662,155 @@ describe("subagent display helpers", () => {
       assert.equal(strip(testApi.widgetIcon("starting")), "○");
     });
   });
+
+});
+
+describe("codex CLI path", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const { buildCodexExecCommand, appendCompletionSentinel, resolveCodexBinary, findCodexRollout } = testApi;
+
+    it("builds a codex exec invocation with model, effort, identity and -o", () => {
+      const cmd = buildCodexExecCommand({
+        codexBin: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        model: "gpt-6-luna",
+        thinking: "high",
+        instructions: "Be terse.",
+        cwd: "/tmp/work dir",
+        outputFile: "/tmp/out.last",
+        taskFile: "/tmp/task.md",
+      });
+
+      assert.ok(cmd.startsWith("cd '/tmp/work dir' && "));
+      assert.ok(cmd.includes("'/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex' exec"));
+      assert.ok(cmd.includes("--skip-git-repo-check"));
+      assert.ok(cmd.includes("--dangerously-bypass-approvals-and-sandbox"));
+      assert.ok(cmd.includes("-m 'gpt-6-luna'"));
+      assert.ok(cmd.includes(`-c 'model_reasoning_effort="high"'`));
+      assert.ok(cmd.includes(`-c 'instructions="Be terse."'`));
+      assert.ok(cmd.includes("-o '/tmp/out.last'"));
+      // Task is read from the artifact file, never interpolated inline.
+      assert.ok(cmd.includes(`-- "$(cat '/tmp/task.md')"`));
+    });
+
+    it("omits optional flags when the agent def leaves them unset", () => {
+      const cmd = buildCodexExecCommand({
+        codexBin: "codex",
+        model: null,
+        thinking: null,
+        instructions: null,
+        cwd: null,
+        outputFile: "/tmp/out.last",
+        taskFile: "/tmp/task.md",
+      });
+
+      assert.ok(!cmd.includes("-m "));
+      assert.ok(!cmd.includes("model_reasoning_effort"));
+      assert.ok(!cmd.includes("instructions="));
+      assert.ok(!cmd.includes("cd "));
+      assert.equal(cmd.startsWith("'codex' exec"), true);
+    });
+
+    it("escapes single quotes in the identity payload", () => {
+      const cmd = buildCodexExecCommand({
+        codexBin: "codex",
+        model: null,
+        thinking: null,
+        instructions: "don't panic",
+        cwd: null,
+        outputFile: "/tmp/out.last",
+        taskFile: "/tmp/task.md",
+      });
+      assert.ok(cmd.includes("'\\''"), cmd);
+      assert.ok(!cmd.includes("don't"), cmd);
+    });
+
+    it("appends exit-code sentinel and screen fallback after the command", () => {
+      const wrapped = appendCompletionSentinel("codex exec -- 'hi'", "/tmp/sentinel");
+      assert.ok(wrapped.startsWith("codex exec -- 'hi'; RC=$?; "));
+      assert.ok(wrapped.includes("printf '%s' \"$RC\" > '/tmp/sentinel'"));
+      assert.ok(wrapped.includes(`echo '__SUBAGENT_DONE_'"$RC"'__'`));
+    });
+
+    it("prefers PI_CODEX_BIN over PATH resolution", () => {
+      const key = "PI_CODEX_BIN";
+      const prev = process.env[key];
+      try {
+        process.env[key] = "/custom/bin/codex";
+        assert.equal(resolveCodexBinary(), "/custom/bin/codex");
+      } finally {
+        if (prev === undefined) delete process.env[key];
+        else process.env[key] = prev;
+      }
+    });
+
+    it("falls back to the bare command name when nothing is found", () => {
+      const pathPrev = process.env.PATH;
+      const binPrev = process.env.PI_CODEX_BIN;
+      delete process.env.PI_CODEX_BIN;
+      process.env.PATH = "/nonexistent-dir-xyz";
+      try {
+        // May still find a real install under CODEX_BIN_DIRS on this machine;
+        // the assertion only requires a non-empty command name either way.
+        const resolved = resolveCodexBinary();
+        assert.ok(resolved === "codex" || resolved.endsWith("/codex"), resolved);
+      } finally {
+        process.env.PATH = pathPrev;
+        if (binPrev === undefined) delete process.env.PI_CODEX_BIN;
+        else process.env.PI_CODEX_BIN = binPrev;
+      }
+    });
+
+    it("rejects cli-backed agents combined with session-mode: fork", () => {
+      const { assertCliSessionModeSupported } = testApi;
+      const codexAgent = { name: "codex-cli", cli: "codex" } as any;
+      const claudeAgent = { name: "claude-cli", cli: "claude" } as any;
+      const piAgent = { name: "worker" } as any;
+
+      assert.throws(() => assertCliSessionModeSupported(codexAgent, "fork"), /session-mode: fork/);
+      assert.throws(() => assertCliSessionModeSupported(claudeAgent, "fork"), /session-mode: fork/);
+      // Unsupported for CLI agents, fine for pi agents and other modes.
+      assertCliSessionModeSupported(codexAgent, "standalone");
+      assertCliSessionModeSupported(codexAgent, "lineage-only");
+      assertCliSessionModeSupported(piAgent, "fork");
+      assertCliSessionModeSupported(null, "fork");
+    });
+
+    it("finds the newest rollout matching cwd and rejects foreign cwds", () => {
+      const homePrev = process.env.CODEX_HOME;
+      const dir = createTestDir();
+      const cwd = mkdtempSync(join(tmpdir(), "codex-cwd-"));
+      try {
+        process.env.CODEX_HOME = dir;
+        const stamp = new Date();
+        const dayDir = join(
+          dir, "sessions",
+          String(stamp.getFullYear()),
+          String(stamp.getMonth() + 1).padStart(2, "0"),
+          String(stamp.getDate()).padStart(2, "0"),
+        );
+        mkdirSync(dayDir, { recursive: true });
+        const header = (cwdValue: string, id: string) =>
+          JSON.stringify({ type: "session_meta", payload: { cwd: cwdValue, session_id: id } });
+        writeFileSync(join(dayDir, "rollout-old.jsonl"), header(cwd, "old-id"), "utf8");
+        writeFileSync(join(dayDir, "rollout-new.jsonl"), header(cwd, "new-id"), "utf8");
+        writeFileSync(join(dayDir, "rollout-other.jsonl"), header("/somewhere/else", "other-id"), "utf8");
+
+        const startedAt = Date.now() - 60_000;
+        const found = findCodexRollout(startedAt, cwd);
+        assert.ok(found, "expected a rollout match");
+        assert.equal(found!.threadId, "new-id");
+        // Foreign cwd must not be picked even when it is the newest entry.
+        utimesSync(join(dayDir, "rollout-other.jsonl"), new Date(), new Date());
+        const foundForCwd = findCodexRollout(startedAt, cwd);
+        assert.equal(foundForCwd!.threadId, "new-id");
+        assert.equal(findCodexRollout(startedAt, "/no/such/cwd"), null);
+      } finally {
+        if (homePrev === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = homePrev;
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
 });
 
 describe("tmux.ts", () => {

@@ -117,13 +117,30 @@ You are a specialized agent that does X...
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+| `cli` | string | `claude` runs the agent via the Claude Code CLI, `codex` via the OpenAI codex CLI — instead of pi. See [CLI-backed agents](#cli-backed-agents) |
 
 ### session-mode
 
 - `standalone` — fresh session, no lineage link to the caller (default)
 - `lineage-only` — fresh session with `parentSession` linkage for discovery/fork UX, but no copied turns
 - `fork` — child session seeded with the caller's conversation context
+
+### CLI-backed agents
+
+Set `cli: claude` or `cli: codex` to run the subagent as an external coding-agent CLI in its own pane instead of a pi child process. The CLI's own auth/config apply; pi tools, `tools:` allowlists, and `subagent_agents` are ignored.
+
+| | `cli: claude` | `cli: codex` |
+| --- | --- | --- |
+| Binary | `claude` on PATH | `codex` resolved from PATH / ChatGPT.app bundle / `PI_CODEX_BIN` |
+| Autonomy | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
+| Identity (`system-prompt: append`) | `--append-system-prompt` | `-c instructions="…"` |
+| `thinking` | — | `-c model_reasoning_effort` |
+| Completion | sentinel written by the bundled Stop hook | exit-code sentinel written by the launch shell; `-o` captures the final message |
+| Transcript | copied to `~/.pi/agent/sessions/claude-code/` | rollout copied next to the pi session file (`.codex/rollout.jsonl`) |
+| Mid-run messaging | TUI accepts keys, so `subagent_message` steers it | non-interactive: steering is refused; spawn a follow-up instead |
+| `session-mode: fork` | pi transcript is seeded but claude does not read it | must not be used (codex has no pi conversation context) |
+
+`codex exec` runs one-shot: it takes the task, finishes, and exits. `subagent_message` cannot steer it while running; use the result message and spawn a new subagent for follow-ups. Both CLI paths are async: completion still arrives as a steer message with the final assistant message as the summary.
 
 ### auto-exit
 
