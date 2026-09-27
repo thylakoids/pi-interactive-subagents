@@ -96,15 +96,15 @@ function claudeTranscriptInputs(event) {
     return text && entry.uuid ? [{ id: entry.uuid, text }] : [];
   });
 }
-export function handleCliEvent(kind, sessionFile, resultFile, mode, event) {
-  return withCliRunLock(resultFile, () => handleLockedEvent(kind, sessionFile, resultFile, mode, event));
+export function handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
+  return withCliRunLock(resultFile, () => handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event));
 }
-function handleLockedEvent(kind, sessionFile, resultFile, mode, event) {
+function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
   const sidecar = `${sessionFile}.cli.json`;
   const session = JSON.parse(readFileSync(sidecar, 'utf8'));
   if (existsSync(resultFile)) return; // A completed run cannot be overwritten by shell exit.
   if (kind === 'exit') {
-    const exitCode = Number(mode);
+    const exitCode = Number(modeOrExitCode);
     const validExitCode = Number.isInteger(exitCode) ? exitCode : 1;
     atomicJson(resultFile, { ...readCliExitResult(resultFile, validExitCode), nativeId: session.nativeId });
     return;
@@ -147,7 +147,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, mode, event) {
       const entries = readFileSync(event.transcript_path, 'utf8').split('\n').filter(Boolean);
       for (let i = entries.length - 1; i >= 0; i--) {
         const entry = JSON.parse(entries[i]);
-        if (entry.type !== 'assistant') continue;
+        if (entry.type !== 'assistant' || entry.isSidechain) continue;
         summary = entry.message?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') || '';
         if (summary) break;
       }
@@ -195,16 +195,16 @@ function handleLockedEvent(kind, sessionFile, resultFile, mode, event) {
   // A native turn can finish while follow-up prompts await the next turn.
   // Failure is terminal even if the transcript or pending-input ledger cannot
   // be read. Do not make reporting a native error depend on history parsing.
-  if (failed || (mode === 'auto' && pendingInputs(resultFile, completedInputs).length === 0)) {
+  if (failed || (modeOrExitCode === 'auto' && pendingInputs(resultFile, completedInputs).length === 0)) {
     atomicJson(resultFile, result);
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [kind, sessionFile, resultFile, mode, payload] = process.argv.slice(2);
+  const [kind, sessionFile, resultFile, modeOrExitCode, payload] = process.argv.slice(2);
   try {
     const event = kind === 'exit' ? {} : JSON.parse(kind === 'codex' ? payload : readFileSync(0, 'utf8'));
-    handleCliEvent(kind, sessionFile, resultFile, mode, event);
+    handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event);
   } catch (error) {
     // Hook errors must be observable but must never block the CLI's own loop.
     console.error(`pi subagent hook: ${error.message}`);

@@ -25,6 +25,8 @@ Use P1 for serious defects or substantial maintainability damage, P2 for clear a
 
 ## Your focus
 
+For concurrency claims, identify the processes and an actual interleaving point; synchronous operations in one event loop do not overlap merely because a read is outside a lock.
+
 Trace concrete inputs through branches and track state across calls. Check boundaries, null/undefined propagation, changed sentinel meanings and their consumers, race/order assumptions, invalid state transitions, and broken error propagation or fallback values that mask failures. Verify the implementation against the supplied requirements, not just whether it compiles.
 
 For changed scripts/configuration, inspect environment inheritance, working directories, quoting, fallback consistency, and whether checks exercise the same context as the real operation. For changed resource lifecycles, inspect setup and cleanup paths. Inspect relevant tests for meaningful assertions about changed behavior; identify a specific unverified behavior rather than demanding tests mechanically.

@@ -29,7 +29,7 @@ import {
 
 import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
-import { buildExternalCommand, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
+import { isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
 
 import {
   countSessionEntryLines,
@@ -417,7 +417,7 @@ function resolveLaunchBehavior(
 function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): ExternalCliKind | null {
   const raw = agentDefs?.cli;
   if (!raw) return null;
-  if (raw === "claude" || raw === "codex") return raw;
+  if (isExternalCliKind(raw)) return raw;
   throw new Error(
     `Agent "${agentName ?? "unknown"}" sets unknown cli: "${raw}" — ` +
     `supported values are "claude" and "codex".`,
@@ -1341,7 +1341,7 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   if (cliKind) {
-    if (!existsSync(subagentSessionFile)) {
+    if (!launchBehavior.seededSessionMode) {
       seedSubagentSessionFile({ mode: "lineage-only", parentSessionFile: sessionFile,
         childSessionFile: subagentSessionFile, childCwd: targetCwdForSession });
     }
@@ -1505,7 +1505,7 @@ function launchExternalSubagent(params: {
   writeFileSync(taskFile, prompt, { mode: 0o600 });
   writeFileSync(`${sentinelFile}.inputs.json`, JSON.stringify([prompt]), { mode: 0o600 });
   appendUserMessage(params.sessionFile, params.task);
-  const command = buildExternalCommand({ session: params.session,
+  const command = prepareExternalLaunch({ session: params.session,
     sessionFile: params.sessionFile, resultFile: sentinelFile, taskFile,
     hookFile: join(SUBAGENTS_DIR, "cli-hook.mjs"),
     settingsFile: join(runDir, "claude-settings.json"), resume: params.resume });

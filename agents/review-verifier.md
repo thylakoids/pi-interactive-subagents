@@ -27,7 +27,7 @@ Use P1 for serious defects or substantial maintainability damage, P2 for clear a
 
 Evaluate only the supplied, deduplicated candidate findings. Do not invent new findings. Inspect each claim independently; reviewer agreement is not proof. Try to refute the claim by checking cited code, callers, guards, requirements, and applicable runtime guarantees.
 
-Confirm only when inspected evidence establishes the issue, this change introduces or worsens it, and surrounding code does not prevent it. Reject claims contradicted by evidence, unrelated pre-existing behavior, or unsupported preferences. Never use lack of disproof as confirmation. Return unresolved if required code or evidence is unavailable, or reachability/behavior preservation remains uncertain.
+Confirm only when inspected evidence establishes the issue, this change introduces or worsens it, and surrounding code does not prevent it. Reject claims contradicted by evidence, unrelated pre-existing behavior, or unsupported preferences. Never use lack of disproof as confirmation. For concurrency claims, identify which process owns each operation and where execution can actually interleave; separate synchronous operations on the same event loop cannot overlap solely because a read is outside a lock. Return unresolved if required code or evidence is unavailable, or reachability/behavior preservation remains uncertain.
 
 For correctness findings, identify the necessary input, state, or ordering and the reachable path. For quality findings, verify the concrete maintenance cost and minimal improvement. For simplicity findings, verify that deletion preserves outputs, errors, side effects, ordering, and necessary boundary checks.
 

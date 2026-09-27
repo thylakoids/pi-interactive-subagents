@@ -26,7 +26,7 @@ Context gathering is preparation, not an independent review. Do not inspect impl
 
 ## 2. Dispatch two independent reviewers in parallel
 
-Call subagent for each of correctness-reviewer and code-quality-reviewer in the same turn, with explicit agent and cwd. Do not wait for one before launching the next. Each task must contain the same scope, revision, requirements, diff or absolute diff-file path, and project instruction paths. Ask them to read relevant surrounding code and callers when needed for a concrete risk. Do not give a reviewer another reviewer's findings during this independent pass.
+Call subagent for each of correctness-reviewer and code-quality-reviewer in the same turn, with explicit agent and cwd. Do not wait for one before launching the next. Each task must contain the same scope, revision, requirements, diff or absolute diff-file path, and project instruction paths. Ask them to read relevant surrounding code and callers when needed for a concrete risk. Do not give a reviewer another reviewer's findings during this independent pass. Historical review reports are prior judgments, not requirements or proof; do not use them to seed the independent pass unless the user explicitly asks to recheck those findings.
 
 Example tool shape (replace placeholders with real context):
 
@@ -44,7 +44,7 @@ Merge duplicate findings about the same underlying issue into one candidate, ret
 
 When candidates exist, dispatch one fresh review-verifier with the same review context and all deduplicated candidates with unique IDs. Wait for its terminal result through the harness. When there are no candidates, skip verification. Require exactly one confirmed/rejected/unresolved verdict for every candidate ID; request correction of missing, duplicate, or malformed verdicts before treating validation as complete.
 
-Present confirmed findings as findings. Keep unresolved claims and reviewer access limitations in a separate uncertainties section. Exclude rejected claims from actionable findings. If a reviewer/verifier fails or cannot inspect required context, report incomplete coverage; never turn that failure into approval. Check whether HEAD or working-tree state changed during review; if changed, disclose that the report covers the supplied snapshot and do not claim it covers newer changes.
+Present confirmed findings as findings. Keep unresolved claims and reviewer access limitations in a separate uncertainties section. Exclude rejected claims from actionable findings. Do not reintroduce rejected or unverified claims as optional cleanup; optional suggestions still need the existing evidence and behavior-preservation standard. If a reviewer/verifier fails or cannot inspect required context, report incomplete coverage; never turn that failure into approval. Check whether HEAD or working-tree state changed during review; if changed, disclose that the report covers the supplied snapshot and do not claim it covers newer changes.
 
 ## 4. Final report
 

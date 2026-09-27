@@ -1,11 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, mkdirSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
-import { buildExternalCommand, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession } from "../pi-extension/subagents/external-cli.ts";
-import { handleCliEvent, readCliExitResult } from "../pi-extension/subagents/cli-hook.mjs";
+import { prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, isExternalCliKind, type ExternalCliSession } from "../pi-extension/subagents/external-cli.ts";
+import { handleCliEvent, readCliExitResult, withCliRunLockAsync } from "../pi-extension/subagents/cli-hook.mjs";
 
 function fixture(kind: "claude" | "codex", run: (f: any) => void) {
   const dir = mkdtempSync(join(tmpdir(), "pi-cli-test-"));
@@ -19,6 +19,27 @@ function fixture(kind: "claude" | "codex", run: (f: any) => void) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 describe("native CLI hooks", () => {
+  it("yields while the parent waits for a run lock and releases it on failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-cli-lock-"));
+    const resultFile = join(dir, "result.json"), lock = `${resultFile}.lock`;
+    mkdirSync(lock);
+    const timer = setTimeout(() => rmdirSync(lock), 25);
+    try {
+      await assert.rejects(withCliRunLockAsync(resultFile, () => { throw new Error("action failed"); }), /action failed/);
+      assert.equal(existsSync(lock), false);
+      assert.equal(await withCliRunLockAsync(resultFile, () => "next action"), "next action");
+    } finally { clearTimeout(timer); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("uses the main Claude response when the fallback transcript ends in a sidechain", () => fixture("claude", f => {
+    const transcript = join(f.dir, "transcript.jsonl");
+    const user = { type: "user", uuid: "input", message: { content: "task" } };
+    const assistant = (text: string, isSidechain: boolean) => ({ type: "assistant", isSidechain,
+      message: { content: [{ type: "text", text }] } });
+    writeFileSync(transcript, [user, assistant("main answer", false), assistant("child answer", true)].map(x => JSON.stringify(x)).join("\n") + "\n");
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "main answer");
+  }));
+
   it("retains the latest answer and pending work after an interrupted exit", () => fixture("codex", f => {
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["first", "queued"]));
     writeFileSync(`${f.resultFile}.latest`, JSON.stringify({ summary: "first answer", completedInputs: ["first"], nativeId: "native" }));
@@ -35,6 +56,10 @@ describe("native CLI hooks", () => {
       "claude", f.sessionFile, f.resultFile, "auto"], { input: "invalid JSON", stdio: "pipe" }));
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "finished");
     assert.ok(JSON.parse(readFileSync(`${f.resultFile}.hook-error`, "utf8")).errorMessage);
+  }));
+  it("rejects valid JSON metadata with an unsupported CLI kind", () => fixture("codex", f => {
+    writeFileSync(`${f.sessionFile}.cli.json`, JSON.stringify({ ...f.session, kind: "codexx" }));
+    assert.throws(() => readExternalSession(f.sessionFile), /Unsupported or invalid native CLI session metadata/);
   }));
   it("distinguishes missing metadata from damaged metadata", () => fixture("codex", f => {
     assert.equal(readExternalSession(join(f.dir, "missing")), null);
@@ -234,6 +259,11 @@ describe("native CLI hooks", () => {
   }));
 });
 describe("native CLI command construction", () => {
+  it("validates external CLI kind values", () => {
+    assert.equal(isExternalCliKind("codex"), true);
+    assert.equal(isExternalCliKind("claude"), true);
+    for (const value of ["codexx", "", null, undefined, 1]) assert.equal(isExternalCliKind(value), false);
+  });
   it("preserves prompt text while giving each Codex submission a distinct receipt", () => {
     const text = 'continue\n<!-- user text -->\r\n$(echo untouched)\n';
     const first = prepareExternalPrompt("codex", text);
@@ -254,7 +284,7 @@ describe("native CLI command construction", () => {
         const prompt = 'resume\n"single\'quote" $(touch SHOULD_NOT_EXIST) `touch SHOULD_NOT_EXIST`';
         const taskFile = join(f.dir, "task.md"); writeFileSync(taskFile, prompt);
         f.session.nativeId = "native-id";
-        const command = buildExternalCommand({ session: f.session, sessionFile: f.sessionFile,
+        const command = prepareExternalLaunch({ session: f.session, sessionFile: f.sessionFile,
           resultFile: f.resultFile, taskFile, hookFile: join(f.dir, "absent-hook"),
           settingsFile: join(f.dir, "settings.json"), resume: true });
         execFileSync("bash", ["-c", command], { stdio: "ignore" });

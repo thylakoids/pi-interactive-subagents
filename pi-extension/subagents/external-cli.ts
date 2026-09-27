@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { shellEscape } from "./tmux.ts";
 
-export type ExternalCliKind = "codex" | "claude";
+const EXTERNAL_CLI_KINDS = ["codex", "claude"] as const;
+export type ExternalCliKind = (typeof EXTERNAL_CLI_KINDS)[number];
+export function isExternalCliKind(value: unknown): value is ExternalCliKind {
+  return EXTERNAL_CLI_KINDS.some(kind => kind === value);
+}
 export interface ExternalCliSession {
   version: 1;
   kind: ExternalCliKind;
@@ -32,7 +36,7 @@ export function readExternalSession(sessionFile: string): ExternalCliSession | n
   let value: ExternalCliSession;
   try { value = JSON.parse(content); }
   catch (error: any) { throw new Error(`Invalid native CLI session metadata ${path}: ${error.message}`); }
-  if (!value || value.version !== 1 || !["codex", "claude"].includes(value.kind) || typeof value.cwd !== "string") {
+  if (!value || value.version !== 1 || !isExternalCliKind(value.kind) || typeof value.cwd !== "string") {
     throw new Error(`Unsupported or invalid native CLI session metadata: ${path}`);
   }
   return value;
@@ -49,7 +53,8 @@ export function resolveCliBinary(kind: ExternalCliKind): string {
   return dirs.map(dir => join(dir, kind)).find(path => existsSync(path)) ?? kind;
 }
 
-export function buildExternalCommand(params: {
+/** Write per-run identity/hook settings and return the launch shell command. */
+export function prepareExternalLaunch(params: {
   session: ExternalCliSession;
   sessionFile: string;
   resultFile: string;
