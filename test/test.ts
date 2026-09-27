@@ -2771,6 +2771,16 @@ describe("codex CLI path", () => {
     assertCliSessionModeSupported(null, "fork");
   });
 
+  it("slugifyName normalizes names and applies fallbacks", () => {
+    const { slugifyName } = testApi;
+    assert.equal(slugifyName("My Agent!"), "my-agent");
+    assert.equal(slugifyName("  spaced   out  "), "spaced-out");
+    assert.equal(slugifyName("--weird--name--"), "weird-name");
+    assert.equal(slugifyName(""), "subagent");
+    assert.equal(slugifyName(null), "subagent");
+    assert.equal(slugifyName(undefined, "resume"), "resume");
+  });
+
   it("resolveCliKind rejects unknown cli values instead of falling back to pi", () => {
     const { resolveCliKind } = testApi;
     assert.equal(resolveCliKind({ cli: "claude" }), "claude");
@@ -2851,6 +2861,53 @@ describe("codex CLI path", () => {
       else process.env.CODEX_HOME = homePrev;
       rmSync(dir, { recursive: true, force: true });
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("archives rollouts without a thread id and prefers session_id over id", () => {
+    const homePrev = process.env.CODEX_HOME;
+    const dir = createTestDir();
+    const noIdCwd = mkdtempSync(join(tmpdir(), "codex-noid-"));
+    const fallbackIdCwd = mkdtempSync(join(tmpdir(), "codex-fallback-"));
+    try {
+      process.env.CODEX_HOME = dir;
+      const stamp = new Date();
+      const dayDir = join(
+        dir, "sessions",
+        String(stamp.getFullYear()),
+        String(stamp.getMonth() + 1).padStart(2, "0"),
+        String(stamp.getDate()).padStart(2, "0"),
+      );
+      mkdirSync(dayDir, { recursive: true });
+      writeFileSync(
+        join(dayDir, "rollout-no-id.jsonl"),
+        JSON.stringify({ type: "session_meta", payload: { cwd: noIdCwd } }),
+        "utf8",
+      );
+      writeFileSync(
+        join(dayDir, "rollout-fallback-id.jsonl"),
+        JSON.stringify({ type: "session_meta", payload: { cwd: fallbackIdCwd, id: "fallback-id" } }),
+        "utf8",
+      );
+
+      // No session_id / id at all: the rollout is archived but no thread-id is written.
+      const noIdSession = join(dir, "no-id-session.jsonl");
+      const noIdArchived = testApi.archiveCodexRollout(Date.now() - 60_000, noIdCwd, noIdSession);
+      assert.ok(noIdArchived, "rollout without a thread id should still be archived");
+      assert.ok(existsSync(noIdArchived!));
+      assert.ok(!existsSync(join(`${noIdSession}.codex`, "thread-id")));
+
+      // payload.id is the documented fallback when session_id is absent.
+      const fallbackSession = join(dir, "fallback-session.jsonl");
+      const fallbackArchived = testApi.archiveCodexRollout(Date.now() - 60_000, fallbackIdCwd, fallbackSession);
+      assert.equal(fallbackArchived, join(`${fallbackSession}.codex`, "rollout.jsonl"));
+      assert.equal(readFileSync(join(`${fallbackSession}.codex`, "thread-id"), "utf8"), "fallback-id");
+    } finally {
+      if (homePrev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = homePrev;
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(noIdCwd, { recursive: true, force: true });
+      rmSync(fallbackIdCwd, { recursive: true, force: true });
     }
   });
 });

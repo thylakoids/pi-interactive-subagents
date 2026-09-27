@@ -125,9 +125,9 @@ type CliKind = "claude" | "codex";
  * Slugify a display name for use in artifact and script filenames.
  * Earlier code duplicated this chain in ~8 places.
  */
-function slugifyName(name: string, fallback = "subagent"): string {
+function slugifyName(name: string | null | undefined, fallback = "subagent"): string {
   return (
-    name
+    (name ?? "")
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "")
       .replace(/\s+/g, "-")
@@ -1227,6 +1227,7 @@ export const __test__ = {
   widgetIcon,
   // codex CLI path
   resolveCliKind,
+  slugifyName,
   resolveCodexBinary,
   buildCodexExecCommand,
   appendCompletionSentinel,
@@ -1359,7 +1360,7 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
-    const launchScriptName = `${slugifyName(params.name || "subagent")}-${id}.sh`;
+    const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
@@ -1416,7 +1417,7 @@ async function launchSubagent(
     const taskFile = join(
       artifactDir,
       "context",
-      `codex-${slugifyName(params.name || "subagent")}-${id}.md`,
+      `codex-${slugifyName(params.name)}-${id}.md`,
     );
     mkdirSync(dirname(taskFile), { recursive: true });
     writeFileSync(taskFile, fullTask.trimStart(), "utf8");
@@ -1437,7 +1438,7 @@ async function launchSubagent(
     const launchScriptFile = join(
       artifactDir,
       "subagent-scripts",
-      `${slugifyName(params.name || "subagent")}-${id}.sh`,
+      `${slugifyName(params.name)}-${id}.sh`,
     );
 
     sendLongCommand(surface, codexCommand, {
@@ -1549,7 +1550,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = slugifyName(params.name || "subagent");
+    const safeName = slugifyName(params.name);
     const artifactName = `context/${safeName}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
@@ -1571,7 +1572,7 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${slugifyName(params.name || "subagent")}-${id}.sh`;
+  const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
