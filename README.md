@@ -138,7 +138,7 @@ Set `cli: claude` or `cli: codex` to run the subagent as an external coding-agen
 | Completion | sentinel written by the bundled Stop hook | exit-code sentinel written by the launch shell; `-o` captures the final message |
 | Transcript | copied to `~/.pi/agent/sessions/claude-code/` | rollout copied next to the pi session file (`.codex/rollout.jsonl`) |
 | Mid-run messaging | TUI accepts keys, so `subagent_message` steers it | non-interactive: steering is refused; spawn a follow-up instead |
-| `session-mode: fork` | pi transcript is seeded but claude does not read it | must not be used (codex has no pi conversation context) |
+| `session-mode: fork` | rejected for both CLI paths (a CLI agent cannot read pi conversation context) | same |
 
 `codex exec` runs one-shot: it takes the task, finishes, and exits. `subagent_message` cannot steer it while running; use the result message and spawn a new subagent for follow-ups. Both CLI paths are async: completion still arrives as a steer message with the final assistant message as the summary.
 

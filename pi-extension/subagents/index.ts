@@ -118,6 +118,24 @@ const SubagentParams = Type.Object({
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
+/** External coding-agent CLIs a subagent can run in its own pane. */
+type CliKind = "claude" | "codex";
+
+/**
+ * Slugify a display name for use in artifact and script filenames.
+ * Earlier code duplicated this chain in ~8 places.
+ */
+function slugifyName(name: string, fallback = "subagent"): string {
+  return (
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || fallback
+  );
+}
+
 interface AgentDefaults {
   model?: string;
   tools?: string;
@@ -135,6 +153,10 @@ interface AgentDefaults {
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
   cwd?: string;
+  /**
+   * External CLI to run this agent with instead of pi. Unknown strings are
+   * rejected at launch (see resolveCliKind), never silently ignored.
+   */
   cli?: string;
   body?: string;
   disableModelInvocation?: boolean;
@@ -386,18 +408,34 @@ function resolveLaunchBehavior(
 }
 
 /**
+ * Resolve an agent's `cli` frontmatter to a known CLI kind.
+ *
+ * Returns null for pi agents. Throws for unknown values so a typo
+ * (`cli: codexx`) fails loudly instead of silently running a pi child.
+ */
+function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): CliKind | null {
+  const raw = agentDefs?.cli;
+  if (!raw) return null;
+  if (raw === "claude" || raw === "codex") return raw;
+  throw new Error(
+    `Agent "${agentName ?? "unknown"}" sets unknown cli: "${raw}" — ` +
+    `supported values are "claude" and "codex".`,
+  );
+}
+
+/**
  * `fork` means "seed the child with the caller's pi conversation". A CLI agent
  * (claude/codex) cannot read a pi session, so the mode would silently degrade
  * into a context-free run. Fail fast instead of pretending it worked.
  */
 function assertCliSessionModeSupported(
-  agentDefs: AgentDefaults | null,
+  cliKind: CliKind | null,
   sessionMode: SubagentSessionMode,
   agentName?: string,
 ): void {
-  if (sessionMode === "fork" && agentDefs?.cli) {
+  if (sessionMode === "fork" && cliKind) {
     throw new Error(
-      `Agent "${agentName ?? "unknown"}" sets cli: ${agentDefs.cli} and cannot use ` +
+      `Agent "${agentName ?? "unknown"}" sets cli: ${cliKind} and cannot use ` +
       `session-mode: fork — the external CLI does not read pi session context. ` +
       `Use session-mode: standalone (or lineage-only) instead.`,
     );
@@ -637,7 +675,12 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  cli?: string;
+  /** External CLI backing this run; absent for pi children. */
+  cli?: CliKind;
+  /**
+   * claude: summary written by the Stop hook; codex: exit code written by the
+   * launch shell after codex exits. Both double as the poll sentinel.
+   */
   sentinelFile?: string;
   /** codex only: file codex writes the final assistant message to (`-o`). */
   outputFile?: string;
@@ -870,13 +913,8 @@ function applySandboxToParts(
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = opts.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    const spSafeName = slugifyName(opts.name);
+    const spPath = join(opts.artifactDir, `context/${spSafeName}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(spPath), { recursive: true });
     writeFileSync(spPath, loadout.identity, "utf8");
     parts.push(flag, shellEscape(spPath));
@@ -1188,6 +1226,7 @@ export const __test__ = {
   formatUsageSegments,
   widgetIcon,
   // codex CLI path
+  resolveCliKind,
   resolveCodexBinary,
   buildCodexExecCommand,
   appendCompletionSentinel,
@@ -1219,6 +1258,7 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const cliKind = resolveCliKind(agentDefs, params.agent);
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
@@ -1255,7 +1295,7 @@ async function launchSubagent(
   }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-  assertCliSessionModeSupported(agentDefs, launchBehavior.sessionMode, params.agent);
+  assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
 
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
@@ -1290,7 +1330,7 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
+  if (cliKind === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
@@ -1319,12 +1359,7 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptName = `${slugifyName(params.name || "subagent")}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
@@ -1364,7 +1399,7 @@ async function launchSubagent(
   // message as the summary. Differences: codex exec is one-shot (no TUI to
   // steer), and identity injection uses the `instructions` config key because
   // codex has no --append-system-prompt flag.
-  if (agentDefs?.cli === "codex") {
+  if (cliKind === "codex") {
     const sentinelFile = `/tmp/pi-codex-${id}-done`;
     const outputFile = `${sentinelFile}.last`;
 
@@ -1375,21 +1410,16 @@ async function launchSubagent(
 
     // Compose the prompt: codex has no system-prompt channel apart from the
     // `instructions` config key, so the agent body goes there and the task
-    // text carries the autonomy/summary wrapper instructions.
+    // text carries the autonomy/summary wrapper instructions. `fullTask` is
+    // the single source of truth for that composition (fork mode is rejected
+    // for CLI agents, so it is always the blank-session variant here).
     const taskFile = join(
       artifactDir,
       "context",
-      `codex-${(params.name || "subagent")
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "") || "subagent"}-${id}.md`,
+      `codex-${slugifyName(params.name || "subagent")}-${id}.md`,
     );
     mkdirSync(dirname(taskFile), { recursive: true });
-    writeFileSync(
-      taskFile,
-      `${identity && !identityInSystemPrompt ? `${identity}\n\n` : ""}${modeHint}\n\n${params.task}\n\n${summaryInstruction}`,
-      "utf8",
-    );
+    writeFileSync(taskFile, fullTask.trimStart(), "utf8");
 
     const codexCommand = appendCompletionSentinel(
       buildCodexExecCommand({
@@ -1404,19 +1434,14 @@ async function launchSubagent(
       sentinelFile,
     );
 
-    const codexScriptFile = join(
+    const launchScriptFile = join(
       artifactDir,
       "subagent-scripts",
-      `${(params.name || "subagent")
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`,
+      `${slugifyName(params.name || "subagent")}-${id}.sh`,
     );
 
     sendLongCommand(surface, codexCommand, {
-      scriptPath: codexScriptFile,
+      scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Codex CLI subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
@@ -1432,7 +1457,7 @@ async function launchSubagent(
       surface,
       startTime,
       sessionFile: subagentSessionFile,
-      launchScriptFile: codexScriptFile,
+      launchScriptFile,
       cli: "codex",
       sentinelFile,
       outputFile,
@@ -1524,13 +1549,8 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+    const safeName = slugifyName(params.name || "subagent");
+    const artifactName = `context/${safeName}-${timestamp}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
@@ -1551,12 +1571,7 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const launchScriptName = `${slugifyName(params.name || "subagent")}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -1807,6 +1822,10 @@ function normalizeFsPath(p: string): string {
 /**
  * Best-effort transcript archiving for a finished codex subagent: copy the
  * rollout JSONL next to the pi session file so it can be reopened later.
+ * Also records the codex thread id beside it, so a future resume can call
+ * `codex exec resume <threadId>`.
+ *
+ * @returns the archived rollout path, or null when no rollout matched.
  */
 function archiveCodexRollout(startedAtMs: number, cwd: string | null, piSessionFile: string): string | null {
   const found = findCodexRollout(startedAtMs, cwd);
@@ -1816,12 +1835,10 @@ function archiveCodexRollout(startedAtMs: number, cwd: string | null, piSessionF
     mkdirSync(destDir, { recursive: true });
     const dest = join(destDir, "rollout.jsonl");
     copyFileSync(found.path, dest);
-    // Remember the thread id so a future resume can call
-    // `codex exec resume <threadId>`; harmless if unused.
     if (found.threadId) {
       writeFileSync(join(destDir, "thread-id"), found.threadId, "utf8");
     }
-    return found.threadId ?? dest;
+    return dest;
   } catch {
     return null;
   }
@@ -2566,12 +2583,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            `${slugifyName(name, "resume")}-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
@@ -2609,12 +2621,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,

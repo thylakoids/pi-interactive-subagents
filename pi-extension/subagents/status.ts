@@ -19,7 +19,7 @@ export type SubagentStatusSource = "pi" | "claude" | "codex";
  * status is elapsed-only ("running"), never stalled/recovered.
  */
 function isCliBacked(source: SubagentStatusSource): boolean {
-  return source !== "pi";
+  return source === "claude" || source === "codex";
 }
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
