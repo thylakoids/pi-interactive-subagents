@@ -1,13 +1,14 @@
-/** Deterministic end-to-end tool tests using real tmux and stand-in native TUIs. */
+/** Tool integration tests using real tmux and stand-in native TUIs; not real CLI end-to-end coverage. */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import extension, { __test__ } from "../../pi-extension/subagents/index.ts";
+import { readNameRegistry, writeSubagentLoadout } from "../../pi-extension/subagents/session.ts";
 import { readExternalSession } from "../../pi-extension/subagents/external-cli.ts";
-import { readScreen } from "../../pi-extension/subagents/tmux.ts";
+import { readScreen, pollForExit } from "../../pi-extension/subagents/tmux.ts";
 
 let hasTmux = true;
 try { execFileSync("tmux", ["-V"], { stdio: "ignore" }); } catch { hasTmux = false; }
@@ -229,6 +230,62 @@ setInterval(() => {}, 1000);
     assert.equal(result.details.exitCode, 1);
     assert.match(result.content, /first response/);
     assert.equal(__test__.runningSubagents.size, 0);
+  });
+
+  const panes = () => execFileSync("tmux", ["list-panes", "-s", "-t", muxSession, "-F", "#{pane_id}"], { encoding: "utf8" }).trim().split("\n").sort();
+  it("finishes polling a destroyed pi pane without an exit sidecar", async () => {
+    const pane = execFileSync("tmux", ["new-window", "-d", "-t", muxSession, "-P", "-F", "#{pane_id}"], { encoding: "utf8" }).trim();
+    execFileSync("tmux", ["kill-pane", "-t", pane]);
+    const result = await pollForExit(pane, AbortSignal.timeout(2000), { interval: 10, sessionFile: join(dir, "missing.jsonl") });
+    assert.equal(result.reason, "closed");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage!, /Pi subagent pane unavailable/);
+  });
+  it("closes a pi spawn pane when session seeding fails and releases its name", async () => {
+    const sessions = join(dir, "sessions");
+    writeFileSync(join(dir, "agents", "broken-pi.md"), "---\ntools: read\n---\nTest profile.\n");
+    const before = panes();
+    renameSync(sessions, `${sessions}.saved`);
+    writeFileSync(sessions, "block session directory creation");
+    try {
+      await assert.rejects(tools.get("subagent").execute("broken", { agent: "broken-pi", task: "test" }, new AbortController().signal, undefined, ctx));
+      assert.deepEqual(panes(), before);
+      assert.equal(__test__.reservedNames.has("broken-pi"), false);
+    } finally { rmSync(sessions); renameSync(`${sessions}.saved`, sessions); }
+
+  });
+  it("closes native spawn and resume panes when preparing run files fails", async () => {
+    const runDir = join(dir, "sessions", "artifacts", "parent", "cli-runs");
+    renameSync(runDir, `${runDir}.saved`);
+    writeFileSync(runDir, "block directory creation");
+    const before = panes();
+    try {
+      await assert.rejects(tools.get("subagent").execute("broken-native", { name: "broken-native", agent: "test-codex", task: "test" }, new AbortController().signal, undefined, ctx));
+      assert.deepEqual(panes(), before);
+      await assert.rejects(tools.get("subagent_message").execute("broken-resume", { name: "native-codex", message: "test" }, new AbortController().signal, undefined, ctx));
+      assert.deepEqual(panes(), before);
+      assert.equal(__test__.runningSubagents.size, 0);
+    } finally { rmSync(runDir); renameSync(`${runDir}.saved`, runDir); }
+  });
+  it("closes a pi resume pane when identity preparation fails", async () => {
+    const artifacts = join(dir, "sessions", "artifacts", "parent");
+    const file = readNameRegistry(artifacts)["native-claude"].sessionFile;
+    renameSync(`${file}.cli.json`, `${file}.cli.saved`);
+    writeSubagentLoadout(file, { agent: "broken-pi", toolAllowlist: "read", model: null, thinking: null,
+      systemPromptMode: "append", identity: "test identity", spawnable: null, autoExit: true, cwd: dir, agentDir: dir });
+    const contextDir = join(artifacts, "context");
+    mkdirSync(contextDir, { recursive: true });
+    renameSync(contextDir, `${contextDir}.saved`);
+    writeFileSync(contextDir, "block directory creation");
+    const before = panes();
+    try {
+      await assert.rejects(tools.get("subagent_message").execute("broken-pi-resume", { name: "native-claude", message: "test" }, new AbortController().signal, undefined, ctx));
+      assert.deepEqual(panes(), before);
+      assert.equal(__test__.runningSubagents.size, 0);
+    } finally {
+      rmSync(contextDir); renameSync(`${contextDir}.saved`, contextDir);
+      renameSync(`${file}.cli.saved`, `${file}.cli.json`); rmSync(`${file}.loadout.json`);
+    }
   });
 
 });

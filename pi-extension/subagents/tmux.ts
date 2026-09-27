@@ -242,7 +242,7 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
+  reason: "done" | "sentinel" | "error" | "closed";
   /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
@@ -267,6 +267,16 @@ function interpretExitSidecar(data: any): PollResult {
     return { reason: "error", exitCode: 1, errorMessage };
   }
   return { reason: "done", exitCode: 0 };
+}
+
+function readExitSidecar(sessionFile: string): PollResult | null {
+  try {
+    const exitFile = `${sessionFile}.exit`;
+    if (!existsSync(exitFile)) return null;
+    const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+    rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch { return null; }
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar };
@@ -296,23 +306,13 @@ export async function pollForExit(
 
     // Fast path: check for .exit sidecar file (written by the error path)
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const exit = readExitSidecar(options.sessionFile);
+      if (exit) return exit;
     }
 
     // Check the native CLI hook result (or shell-exit result).
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
+    if (options.sentinelFile && existsSync(options.sentinelFile)) {
+      return { reason: "sentinel", exitCode: 0 };
     }
 
     if (options.cli && options.sentinelFile) {
@@ -344,15 +344,10 @@ export async function pollForExit(
       }
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const exit = readExitSidecar(options.sessionFile);
+        if (exit) return exit;
       }
+      return { reason: "closed", exitCode: 1, errorMessage: "Pi subagent pane unavailable before reporting completion." };
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

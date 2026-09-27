@@ -1,7 +1,7 @@
 /** Hook shared by Codex notify, Claude Stop/StopFailure, and the launch shell.
  * No dependencies, no global config edits, and no transcript directory scans.
  */
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, rmdirSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
@@ -76,9 +76,19 @@ function acknowledgeInputs(resultFile, completed, inputs) {
     pending.splice(index, 1);
   }
 }
+function readClaudeTranscript(path) {
+  const lines = readFileSync(path, 'utf8').split('\n');
+  const tail = lines.pop();
+  const entries = lines.filter(Boolean).map(line => JSON.parse(line));
+  // A hook can observe an unfinished trailing record; complete records stay strict.
+  if (tail) {
+    try { entries.push(JSON.parse(tail)); } catch {}
+  }
+  return entries;
+}
 function claudeTranscriptInputs(event) {
   if (!event.transcript_path || !existsSync(event.transcript_path)) return [];
-  const entries = readFileSync(event.transcript_path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const entries = readClaudeTranscript(event.transcript_path);
   // Inputs after the final assistant entry may still be waiting for a turn.
   const lastAssistant = entries.findLastIndex(entry => entry.type === 'assistant');
   return entries.slice(0, lastAssistant + 1).filter(entry => !entry.isSidechain).flatMap(entry => {
@@ -144,9 +154,9 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
   // Older Claude versions omit last_assistant_message in Stop payloads.
   if (!failed && !summary && kind === 'claude' && event.transcript_path) {
     try {
-      const entries = readFileSync(event.transcript_path, 'utf8').split('\n').filter(Boolean);
+      const entries = readClaudeTranscript(event.transcript_path);
       for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = JSON.parse(entries[i]);
+        const entry = entries[i];
         if (entry.type !== 'assistant' || entry.isSidechain) continue;
         summary = entry.message?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') || '';
         if (summary) break;
@@ -157,7 +167,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
   if (failed && !summary) summary = `Claude Code error: ${event.error_details || event.error || 'unknown'}`;
   const result = { summary, exitCode: failed ? 1 : 0, nativeId: session.nativeId };
   if (event.transcript_path) result.transcriptPath = event.transcript_path;
-  const turnId = event['turn-id'];
+  const turnId = kind === 'codex' ? event['turn-id'] : event.prompt_id;
   let previous = null;
   try { previous = JSON.parse(readFileSync(`${resultFile}.latest`, 'utf8')); } catch {}
   const completedTurns = previous?.completedTurns || [];
@@ -200,7 +210,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && existsSync(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   const [kind, sessionFile, resultFile, modeOrExitCode, payload] = process.argv.slice(2);
   try {
     const event = kind === 'exit' ? {} : JSON.parse(kind === 'codex' ? payload : readFileSync(0, 'utf8'));

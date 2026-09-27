@@ -226,7 +226,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Pi agents with a non-empty `tools:` list or a spawning grant use `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the allowed tools are loaded explicitly. The allowlist includes the frontmatter tools, subagent control tools, and spawning tools when granted. Agents omitting both `tools:` and `subagent_agents` inherit pi’s default toolset and global extensions. Resume preserves this choice via the loadout snapshot. CLI-backed agents use the native CLI’s tool configuration.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

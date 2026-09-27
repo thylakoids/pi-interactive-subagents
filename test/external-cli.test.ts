@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, mkdirSync, rmdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, mkdirSync, rmdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -19,6 +19,75 @@ function fixture(kind: "claude" | "codex", run: (f: any) => void) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 describe("native CLI hooks", () => {
+  it("baselines complete history at SessionStart and accepts a completed record without a newline", () => fixture("claude", f => {
+    const transcript = join(f.dir, "transcript.jsonl");
+    const oldInput = { type: "user", uuid: "old", message: { content: "old task" } };
+    writeFileSync(transcript, JSON.stringify(oldInput) + '\n' + JSON.stringify({ type: "assistant", uuid: "old-answer", message: { content: [] } }) + '\n{"type":');
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "SessionStart", session_id: "claude-id", transcript_path: transcript });
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.claude-seen.json`, "utf8")), ["old"]);
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["new task"]));
+    writeFileSync(transcript, [oldInput,
+      { type: "user", uuid: "new", message: { content: "new task" } },
+      { type: "assistant", uuid: "answer", message: { content: [{ type: "text", text: "done" }] } },
+    ].map(x => JSON.stringify(x)).join("\n"));
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript, last_assistant_message: "done" });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "done");
+  }));
+  it("does not silently accept malformed complete transcript records", () => fixture("claude", f => {
+    const transcript = join(f.dir, "transcript.jsonl");
+    writeFileSync(transcript, 'invalid JSON\n');
+    assert.throws(() => handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", {
+      hook_event_name: "SessionStart", session_id: "claude-id", transcript_path: transcript }), SyntaxError);
+  }));
+
+  it("can be imported by a Node stdin program", () => {
+    const hook = new URL("../pi-extension/subagents/cli-hook.mjs", import.meta.url).href;
+    const output = execFileSync(process.execPath, ["--input-type=module", "-"],
+      { input: `import { readCliExitResult } from ${JSON.stringify(hook)}; console.log(typeof readCliExitResult);`, encoding: "utf8" });
+    assert.equal(output.trim(), "function");
+  });
+  it("keeps a completed Claude response when the transcript has an unfinished tail", () => fixture("claude", f => {
+    const transcript = join(f.dir, "transcript.jsonl");
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["task"]));
+    writeFileSync(transcript, [
+      { type: "user", uuid: "u1", message: { content: "task" } },
+      { type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "done" }] } },
+    ].map(x => JSON.stringify(x)).join("\n") + '\n{"type":');
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", {
+      hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript, last_assistant_message: "done", prompt_id: "p1" });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "done");
+  }));
+  it("recovers an older Claude response without payload text from a transcript with an unfinished tail", () => fixture("claude", f => {
+    const transcript = join(f.dir, "transcript.jsonl");
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["task"]));
+    writeFileSync(transcript, [
+      { type: "user", uuid: "u1", message: { content: "task" } },
+      { type: "assistant", uuid: "a1", message: { content: [{ type: "text", text: "done" }] } },
+    ].map(x => JSON.stringify(x)).join("\n") + '\n{"type":');
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", {
+      hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript, prompt_id: "p1" });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "done");
+  }));
+  it("does not append or replace the answer for a repeated Claude prompt_id", () => fixture("claude", f => {
+    const event = { hook_event_name: "Stop", session_id: "claude-id", prompt_id: "p1", last_assistant_message: "first answer" };
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", event);
+    const session = readFileSync(f.sessionFile, "utf8");
+    const latest = readFileSync(`${f.resultFile}.latest`, "utf8");
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", { ...event, last_assistant_message: "duplicate" });
+    assert.equal(readFileSync(f.sessionFile, "utf8"), session);
+    assert.equal(readFileSync(`${f.resultFile}.latest`, "utf8"), latest);
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", { ...event, prompt_id: "p2", last_assistant_message: "next answer" });
+    assert.equal(JSON.parse(readFileSync(`${f.resultFile}.latest`, "utf8")).summary, "next answer");
+  }));
+
+  it("runs the executable hook through a symbolic link", () => fixture("claude", f => {
+    const hookLink = join(f.dir, "hook.mjs");
+    symlinkSync(join(import.meta.dirname, "../pi-extension/subagents/cli-hook.mjs"), hookLink);
+    execFileSync(process.execPath, [hookLink, "claude", f.sessionFile, f.resultFile, "auto"],
+      { input: JSON.stringify({ hook_event_name: "Stop", session_id: "claude-id", last_assistant_message: "linked hook response" }), stdio: "pipe" });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "linked hook response");
+  }));
+
   it("yields while the parent waits for a run lock and releases it on failure", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-cli-lock-"));
     const resultFile = join(dir, "result.json"), lock = `${resultFile}.lock`;
