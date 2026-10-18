@@ -81,10 +81,12 @@ const reviewed = await pipeline(
       ].join('\n'),
       { label: 'audit:' + dimension.name, phase: 'Review', agent: dimension.agent, schema: AUDIT_SCHEMA },
     )
+    if (!audit) return null
     const findings = audit && Array.isArray(audit.findings) ? audit.findings : []
     return { dimension: dimension.name, findings: findings }
   },
   async (audited, dimension) => {
+    if (!audited) return null
     const findings = audited && Array.isArray(audited.findings) ? audited.findings : []
     if (findings.length === 0) return { dimension: dimension.name, confirmed: [], unverified: [], rejected: 0 }
     // 每条发现单独交给一个验证者：只拿到这一条，独立复核，并默认它是错的

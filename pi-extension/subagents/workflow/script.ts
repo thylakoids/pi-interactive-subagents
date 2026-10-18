@@ -37,14 +37,21 @@ export function listSavedWorkflows(opts: { cwd: string; agentDir: string }): {
   workflows: SavedWorkflow[];
   errors: Array<{ path: string; error: string }>;
 } {
+  return discoverWorkflows([
+    { dir: join(opts.cwd, ".pi", "workflows"), source: "project" },
+    { dir: join(opts.agentDir, "workflows"), source: "global" },
+    { dir: BUNDLED_WORKFLOWS_DIR, source: "bundled" },
+  ]);
+}
+
+export function listBundledWorkflows() {
+  return discoverWorkflows([{ dir: BUNDLED_WORKFLOWS_DIR, source: "bundled" }]);
+}
+
+function discoverWorkflows(roots: Array<{ dir: string; source: SavedWorkflow["source"] }>) {
   const workflows: SavedWorkflow[] = [];
   const errors: Array<{ path: string; error: string }> = [];
   const seen = new Set<string>();
-  const roots = [
-    { dir: join(opts.cwd, ".pi", "workflows"), source: "project" as const },
-    { dir: join(opts.agentDir, "workflows"), source: "global" as const },
-    { dir: BUNDLED_WORKFLOWS_DIR, source: "bundled" as const },
-  ];
   for (const { dir, source } of roots) {
     let names: string[];
     try { names = readdirSync(dir).sort(); }
@@ -81,7 +88,8 @@ export interface ParsedScript {
  * Locate a saved workflow by name.
  *
  * Search order: an explicit absolute/relative path, then
- * `<cwd>/.pi/workflows/<name>.js`, then `<agentDir>/workflows/<name>.js`.
+ * `<cwd>/.pi/workflows/<name>.js`, then `<agentDir>/workflows/<name>.js`,
+ * then the bundled examples.
  * Names are validated before they touch the filesystem.
  */
 export function resolveSavedScriptPath(

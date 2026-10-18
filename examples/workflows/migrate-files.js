@@ -74,7 +74,8 @@ const results = await pipeline(
     }
   },
   async (planned, file) => {
-    await agent(
+    if (!planned) return null
+    const applied = await agent(
       [
         '按给定的迁移计划修改文件。你没有父会话上下文，以下是全部信息。',
         '',
@@ -88,9 +89,11 @@ const results = await pipeline(
       ].join('\n'),
       { label: 'apply:' + baseName(file), phase: 'Apply', agent: applyAgent },
     )
+    if (applied === null) return null
     return { file: file, risky: planned.risky, stepsText: planned.stepsText }
   },
   async (applied, file) => {
+    if (!applied) return null
     // 分支：验证强度由计划的 risky 决定——非 risky 用只读轻量核验，risky 升级到能跑测试的完整核验
     let verifier = quickVerifierAgent
     let prompt = [
@@ -122,7 +125,7 @@ const results = await pipeline(
     const verdict = await agent(
       prompt,
       { label: 'verify:' + baseName(file), phase: 'Verify', agent: verifier, schema: VERIFY_SCHEMA },
-    ).catch(() => null)
+    )
     if (!verdict) {
       return { file: file, risky: applied.risky, verifier: verifier, ok: false, issues: ['验证没有完成（agent 失败或没有结构化结果）'] }
     }

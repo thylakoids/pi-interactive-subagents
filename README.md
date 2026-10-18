@@ -135,7 +135,10 @@ const reviews = await pipeline(REVIEWERS,
   once when the run settles. The main context never holds the intermediate results.
 
 Scripts see `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget` and
-`workflow` — nothing else: no filesystem, network, timers, or `Date.now()`.
+`workflow` (nested workflows are currently unsupported). There is no filesystem, network
+or timer access. `Date.now()` and parameterless `new Date()` stay fixed at the persisted
+run start; `performance.now()` stays zero. `Math.random()` is seeded, but concurrent
+branches can consume it in different orders: do not use shared randomness for call keys.
 `PI_WORKFLOW_SIZE=small|medium|large|unrestricted` adjusts the tool's planning target
 (about 5/10/50 calls; medium by default) without changing runtime limits. It is read when
 the extension registers, so `/reload` after changing it.

@@ -166,7 +166,7 @@ export function prepareScriptSource(source: string, args: unknown, maxItemsPerBa
   return `${prelude}\n${source}`;
 }
 
-/** No filesystem, network, timers, require, process, or Date.now()/Math.random(): the script is deterministic and sandboxed. */
+/** No filesystem, network, timers, require or process. Date is frozen at run.startedAt and Math.random is seeded. */
 
 /**
  * How many agents may run at once.
@@ -238,8 +238,8 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
   const limits: ScriptLimits = { ...DEFAULT_LIMITS, ...options.limits };
   const sandbox = new CodemodeSandbox({ memoryLimitBytes: limits.memoryLimitBytes });
 
-  /** seq → the answer waiting to be delivered. */
-  const pending = new Map<number, { id: number; outcome: CodemodeOutcome }>();
+  /** Answers received synchronously while sandbox.start() is still returning. */
+  const pending: Array<{ id: number; outcome: CodemodeOutcome }> = [];
   let nextResultSeq = 1;
   let issuedCalls = 0;
   let fingerprint: string | undefined;
@@ -249,7 +249,7 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
   if (options.signal.aborted) abort();
   else options.signal.addEventListener("abort", abort, { once: true });
 
-  // The VM's clock only advances when a result arrives, so a script waiting on
+  // The VM's clock is frozen at the persisted run epoch, so a script waiting on
   // an answer nobody sends would hang invisibly. The watchdog is host-side and
   // resets on any call, result, or idle transition.
   let lastActivity = Date.now();
@@ -264,23 +264,15 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
   }, 250);
   watchdog.unref?.();
 
-  let nextSeqToDeliver = 1;
   /** Set once `start()` returns; before that, answers wait in `pending`. */
   let run: CodemodeRun | undefined;
 
-  const flush = () => {
-    if (!run) return;
-    while (pending.has(nextSeqToDeliver)) {
-      const item = pending.get(nextSeqToDeliver)!;
-      pending.delete(nextSeqToDeliver);
-      try {
-        run.deliver(nextSeqToDeliver, Date.now(), item.id, item.outcome);
-      } catch {
-        // The run already ended; remaining answers have nowhere to go.
-        return;
-      }
-      nextSeqToDeliver++;
-    }
+  const answer = (item: { id: number; outcome: CodemodeOutcome }) => {
+    if (!run) { pending.push(item); return; }
+    if (run.finished) return;
+    // Host wall time is for the watchdog and UI only. Every VM clock read,
+    // including globalThis.Date and performance, uses the persisted epoch.
+    run.deliver(nextResultSeq++, options.startedAt, item.id, item.outcome);
   };
 
   try {
@@ -307,16 +299,14 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
         const deliver = (outcome: CodemodeOutcome) => {
           if (answered) return;
           answered = true;
-          const seq = nextResultSeq++;
-          pending.set(seq, { id: call.id, outcome });
           lastActivity = Date.now();
-          flush();
+          answer({ id: call.id, outcome });
         };
         options.onCall(call, deliver);
       },
     });
     // Answers that arrived while the VM was still starting up are delivered now.
-    flush();
+    for (const item of pending.splice(0)) answer(item);
 
     const result = await run.result;
     const output = result.output

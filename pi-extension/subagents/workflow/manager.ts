@@ -13,7 +13,7 @@
  *  - An answer is journaled *before* it is handed to the script, so a crash can
  *    never leave a consumed-but-unrecorded result.
  *  - Skipped and failed calls are journaled but never replayed: resume retries
- *    them only when their content changed.
+ *    them on resume.
  */
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -39,6 +39,7 @@ import {
   writeJsonAtomic,
 } from "./journal.ts";
 import { defaultConcurrency, runScript } from "./runner.ts";
+import { isCallSettled, summarizeCalls } from "./state.ts";
 import { WorkflowScriptError, parseScript } from "./script.ts";
 import type {
   WorkflowAgentOutcome,
@@ -503,9 +504,12 @@ export class WorkflowRun {
     // caller waiting forever.
     const queue = this.queue.splice(0);
     for (const start of queue) start();
+    for (const live of this.live.values()) {
+      if (!isCallSettled(live.status)) {
+        this.recordOutcome(live, { ok: false, status: "aborted", value: null, error: reason });
+      }
+    }
     for (const [key, waiters] of this.waiters) {
-      const live = this.live.get(key);
-      if (live) live.status = "aborted";
       this.waiters.delete(key);
       for (const resolve of waiters) resolve({ ok: false, status: "aborted", value: null, error: reason });
     }
@@ -755,7 +759,7 @@ export class WorkflowRun {
   /** Mark a queued or running call as skipped by the user. */
   skip(callKey: string): boolean {
     const live = this.live.get(callKey);
-    if (!live) return false;
+    if (!live || isCallSettled(live.status)) return false;
     const entry: WorkflowJournalEntry = {
       type: "call",
       callKey,
@@ -871,19 +875,7 @@ export class WorkflowRun {
   view(): WorkflowRunView {
     const calls = [...this.live.keys()].map((key) => this.viewFor(key)!).filter(Boolean);
     const total = calls.length;
-    const done = calls.filter((c) => c.status === "completed" || c.status === "failed" || c.status === "skipped").length;
-    const failed = calls.filter((c) => c.status === "failed").length;
-    const active = calls.filter((c) => c.status === "running").length;
-    const usage: WorkflowUsage = {};
-    for (const call of calls) {
-      if (!call.usage) continue;
-      usage.inputTokens = (usage.inputTokens ?? 0) + (call.usage.inputTokens ?? 0);
-      usage.outputTokens = (usage.outputTokens ?? 0) + (call.usage.outputTokens ?? 0);
-      usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + (call.usage.cacheReadTokens ?? 0);
-      usage.cacheWriteTokens = (usage.cacheWriteTokens ?? 0) + (call.usage.cacheWriteTokens ?? 0);
-      usage.totalTokens = (usage.totalTokens ?? 0) + (call.usage.totalTokens ?? 0);
-      usage.cost = (usage.cost ?? 0) + (call.usage.cost ?? 0);
-    }
+    const stats = summarizeCalls(calls);
     return {
       runId: this.runId,
       meta: this.meta,
@@ -894,13 +886,13 @@ export class WorkflowRun {
       startedAtWall: this.executionStartedWall,
       finishedAt: this.snapshot.finishedAt,
       agentCount: calls.length,
-      activeCount: active,
-      completedCount: calls.filter((c) => c.status === "completed").length,
-      failedCount: failed,
+      activeCount: stats.active,
+      completedCount: stats.completed,
+      failedCount: stats.failed,
       totalCount: total,
       maxConcurrent: this.maxConcurrent,
-      progress: total === 0 ? 0 : done / total,
-      usage,
+      progress: stats.progress,
+      usage: stats.usage,
       budgetTotal: this.snapshot.budgetTotal,
       scriptPath: this.snapshot.scriptPath,
       runDir: this.runDir,
@@ -1119,7 +1111,7 @@ export class WorkflowManager {
       error: entry.error,
       usage: entry.usage,
     }));
-    const completed = calls.filter((c) => c.status === "completed").length;
+    const stats = summarizeCalls(calls);
     return {
       runId,
       meta: snapshot.meta,
@@ -1131,12 +1123,12 @@ export class WorkflowManager {
       finishedAt: snapshot.finishedAt,
       agentCount: calls.length,
       activeCount: 0,
-      completedCount: completed,
-      failedCount: calls.filter((c) => c.status === "failed").length,
+      completedCount: stats.completed,
+      failedCount: stats.failed,
       totalCount: calls.length,
       maxConcurrent: defaultConcurrency(),
-      progress: calls.length === 0 ? 0 : completed / calls.length,
-      usage: {},
+      progress: stats.progress,
+      usage: stats.usage,
       budgetTotal: snapshot.budgetTotal,
       scriptPath: snapshot.scriptPath,
       runDir,

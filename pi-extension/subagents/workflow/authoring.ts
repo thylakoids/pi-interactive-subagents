@@ -1,6 +1,7 @@
 /** Cheap discovery in the tool prompt; full guidance is fetched only on demand. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { listBundledWorkflows } from "./script.ts";
 import { WORKFLOW_GLOBAL_DECLARATIONS } from "./runner.ts";
 
 export type WorkflowSize = "small" | "medium" | "large" | "unrestricted";
@@ -48,7 +49,7 @@ OPT-IN
 Start only when the user requested a workflow, orchestration or fan-out, or an applicable skill/command explicitly calls for it. Mere benefit from parallelism is not opt-in. Loading this guide or inspecting templates does not authorize starting agents. A single task or a handful of agents you will manage yourself belongs in subagent.
 
 BEFORE AUTHORING
-Load the workflow-authoring skill if available. Otherwise call workflow({ action: 'guide' }) for the same guidance and runtime API, even with skills disabled or no read tool. It covers six composable shapes: fan-out, per-item pipeline, per-finding expansion, adversarial voting, synthesis, and bounded budget loops. Use workflow({ action: 'list' }) to discover project/global/bundled scripts with whenToUse. workflow({ action: 'guide', name: 'deep-research' }) reads a complete template without executing it. Other bundled templates: review-changes, migrate-files, compare-options, verify-claims, iterative-refinement.
+Load the workflow-authoring skill if available. Otherwise call workflow({ action: 'guide' }) for the same guidance and runtime API, even with skills disabled or no read tool. It covers six composable shapes: fan-out, per-item pipeline, per-finding expansion, adversarial voting, synthesis, and bounded budget loops. Use workflow({ action: 'list' }) to discover project/global/bundled scripts with whenToUse. workflow({ action: 'guide', name: '<name>' }) reads a complete template without executing it. Bundled templates: ${listBundledWorkflows().workflows.map(entry => entry.name).join(", ")}.
 
 SHAPE RULES
 Default to pipeline(items, ...stages): each item advances independently. Use parallel(thunks) when a consumer needs ALL previous results (cross-item comparison, voting or synthesis). Both return arrays in input order. Use schema whenever code branches on or extracts fields from agent output; free text is suitable when only passed through. Each prompt must include the task and relevant input: children do not see this conversation.
@@ -57,7 +58,7 @@ COMPLETE EXAMPLE
 ${CANONICAL_WORKFLOW}
 
 CONTRACT
-Plain JavaScript async function body, starting with literal export const meta = { name, description, phases? }. Globals: agent, pipeline, parallel, phase, log, args, budget. Agent options: label, phase, schema, agent/agentType, model, effort. Schema root: object with properties; required fields must exist. No filesystem, network, timers, require or process in the script; agents perform I/O. Nested workflow() and worktree isolation are unsupported. Do not assume phase titles schedule work.
+Plain JavaScript async function body, starting with literal export const meta = { name, description, phases? }. Globals: agent, pipeline, parallel, phase, log, args, budget. Agent options: label, phase, schema, agent/agentType, model, effort. Schema root: object with properties; required fields must exist. No filesystem, network, timers, require or process in the script; agents perform I/O. Nested workflow() and worktree isolation are unsupported. Do not assume phase titles schedule work. Date.now()/new Date() are frozen at persisted run.startedAt; performance.now() is 0. Math.random() is seeded, but concurrent scheduling can change consumption order: do not derive call keys from shared randomness.
 A failed/dead/skipped agent returns null, including bare await agent(). Guard null before accessing fields. Malformed calls and exhausted budgets fail the run; do not blanket-catch programming errors. Parallel agents share the working directory: partition writes and serialize overlapping edits.
 
 RECOVERY AND LIMITS

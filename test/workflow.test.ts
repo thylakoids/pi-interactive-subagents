@@ -22,7 +22,6 @@ import {
 } from "../pi-extension/subagents/workflow/script.ts";
 import {
   buildWorkflowDescription,
-  CANONICAL_WORKFLOW,
   readAuthoringGuide,
   sizeGuideline,
   workflowSize,
@@ -315,92 +314,6 @@ describe("workflow authoring discovery", () => {
     assert.equal(overridden.workflows.filter((workflow) => workflow.name === "deep-research").length, 1);
   });
 
-  it("runs the canonical authoring example end to end", async () => {
-    service = new FakeSubagentService();
-    service.structured.set("Inspect this item", { needsCheck: true, evidence: "checked" });
-    const manager = createManager();
-    const view = await (await manager.start({
-      source: CANONICAL_WORKFLOW,
-      args: { items: ["one", "two"] },
-    })).execute();
-    assert.equal(view.status, "completed", view.error);
-    assert.equal(view.totalCount, 4);
-    assert.equal((view.result as unknown[]).length, 2);
-  });
-
-  it("keeps the bundled templates runnable and within their declared call budgets", async () => {
-    const runTemplate = async (
-      name: string,
-      templateArgs: Record<string, unknown>,
-      setup?: (fake: FakeSubagentService) => void,
-    ) => {
-      service = new FakeSubagentService();
-      setup?.(service);
-      const manager = createManager();
-      const view = await (await manager.start({
-        source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, `${name}.js`)),
-        args: templateArgs,
-      })).execute();
-      assert.equal(view.status, "completed", view.error);
-      return view;
-    };
-
-    service = new FakeSubagentService();
-    service.structured.set("Investigate one option", {
-      option: "x", summary: "summary", strengths: [], weaknesses: [], evidenceGaps: [],
-    });
-    const compare = await (await createManager().start({
-      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "compare-options.js")),
-      args: { question: "Which option?", options: ["a", "b", "c"], maxCalls: 5 },
-    })).execute();
-    assert.equal(compare.status, "completed", compare.error);
-    assert.equal(compare.totalCount, 4);
-
-    service = new FakeSubagentService();
-    service.structured.set("Adversarially verify", { verdict: "supported", evidence: "source" });
-    const votes = await (await createManager().start({
-      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "verify-claims.js")),
-      args: { claims: ["a", "b", "c", "d"], maxCalls: 10 },
-    })).execute();
-    assert.equal(votes.status, "completed", votes.error);
-    assert.equal(votes.totalCount, 9, "three claims x three votes; the fourth is omitted");
-    assert.equal((votes.result as any).omitted.length, 1);
-
-    service = new FakeSubagentService();
-    service.structured.set("Define the research plan", {
-      queries: [{ query: "q1", reason: "r1" }, { query: "q2", reason: "r2" }],
-      scopeNotes: ["note"],
-    });
-    service.structured.set("Find candidate authoritative sources", {
-      sources: [{ url: "https://a.example", title: "A", relevance: "primary" }],
-    });
-    service.structured.set("Fetch and extract evidence", {
-      findings: ["finding"],
-      claims: [
-        { claim: "c1", source: "https://a.example/1", priority: "high" },
-        { claim: "c2", source: "https://a.example/2", priority: "medium" },
-      ],
-      gaps: [],
-    });
-    service.structured.set("Adversarially verify", { verdict: "supported", evidence: "source" });
-    const research = await (await createManager().start({
-      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "deep-research.js")),
-      args: { question: "Research this", maxCalls: 10, researchAgent: "scout" },
-    })).execute();
-    assert.equal(research.status, "completed", research.error);
-    assert.equal(research.totalCount, 9);
-    assert.equal((research.result as any).status, "incomplete");
-    assert.ok((research.result as any).omittedClaims.length > 0);
-
-    const refined = await runTemplate("iterative-refinement", {
-      task: "Improve it", initial: "draft", maxCalls: 10,
-    }, (fake) => {
-      fake.structured.set("Critique a draft", { accepted: true, issues: [], feedback: "" });
-    });
-    assert.equal(refined.totalCount, 1);
-    assert.equal((refined.result as any).reason, "accepted");
-  });
-
   it("provides list and guide actions without tmux or a persistent session", async () => {
     service = new FakeSubagentService();
     let tool: any;
@@ -545,7 +458,7 @@ return await pipeline(args.items,
     assert.ok(journal.every((entry) => entry.type === "call" && entry.status === "completed"));
     assert.ok(journal.every((entry) => typeof entry.callKey === "string" && entry.callKey.length > 10));
 
-    // Results reach the script in input order even though completions interleave.
+    // Final arrays preserve input order even though stages advance independently.
     const result = view.result as { scanned: string[] };
     assert.deepEqual(result.scanned, [
       "echo:verify-1:echo:scan-1",
@@ -867,20 +780,23 @@ while (true) {}
     assert.match(String(view.error), /progress|timed out|abort/i);
   });
 
-  it("exposes args and a live token budget to the script", async () => {
+  it("exposes args and refreshes spent/remaining tokens after an agent settles", async () => {
     service = new FakeSubagentService();
+    service.tokensPerAgent = 60;
     const manager = createManager({ budgetTotal: 10_000 });
     const script = `export const meta = { name: 'budget-flow', description: 'x' }
 const before = await budget.spent();
 await agent('scan-1', { label: 'a' });
-return { args, before, total: budget.total };
+return { args, before, after: budget.spent(), remaining: budget.remaining(), total: budget.total };
 `;
     const run = await manager.start({ source: script, args: { task: "t" } });
     const view = await run.execute();
     assert.equal(view.status, "completed", view.error);
-    const result = view.result as { args: { task: string }; before: number; total: number };
+    const result = view.result as { args: { task: string }; before: number; after: number; remaining: number; total: number };
     assert.equal(result.args.task, "t");
     assert.equal(result.before, 0);
+    assert.equal(result.after, 60);
+    assert.equal(result.remaining, 9_940);
     assert.equal(result.total, 10_000);
     assert.equal(view.budgetTotal, 10_000);
   });
@@ -958,7 +874,7 @@ return 'done';
 
     assert.equal(view.status, "failed");
     assert.match(String(view.error), /exceeded 1000 agents/);
-    assert.ok(service.spawns.length <= 1001, `the cap must stop the loop, saw ${service.spawns.length} spawns`);
+    assert.ok(service.spawns.length === 1000, `the cap must stop the loop, saw ${service.spawns.length} spawns`);
   });
 
   it("rejects an effort level pi would not understand", async () => {

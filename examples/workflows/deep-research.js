@@ -72,8 +72,15 @@ const VERDICT_SCHEMA = {
   },
 }
 
+// Reserve final synthesis using actual calls, including failed branches.
+let issuedCalls = 0
+const callAgent = (prompt, options) => {
+  issuedCalls++
+  return agent(prompt, options)
+}
+
 await phase('Scope')
-const scope = await agent([
+const scope = await callAgent([
   'Define the research plan for a question. You do not have the parent conversation.',
   '',
   'Question: ' + question,
@@ -108,7 +115,7 @@ if (queries.length === 0) {
 
 await phase('Search')
 const researched = await pipeline(queries, async (entry, _, index) => {
-  const search = await agent([
+  const search = await callAgent([
     'Find candidate authoritative sources for one research query. Work independently.',
     '',
     'Overall question: ' + question,
@@ -128,7 +135,7 @@ const researched = await pipeline(queries, async (entry, _, index) => {
   return { query: entry, sources: Array.isArray(search.sources) ? search.sources.slice(0, 4) : [] }
 }, async (found, entry, index) => {
   if (!found || found.sources.length === 0) return null
-  const evidence = await agent([
+  const evidence = await callAgent([
     'Fetch and extract evidence for one research query. Work independently.',
     '',
     'Overall question: ' + question,
@@ -149,12 +156,14 @@ const researched = await pipeline(queries, async (entry, _, index) => {
   return { query: entry, sources: found.sources, evidence }
 })
 
-const evidence = researched.filter(Boolean)
+const evidence = researched.filter((entry) => entry && entry.evidence)
 const allClaims = evidence.flatMap((entry, evidenceIndex) =>
   (entry.evidence && Array.isArray(entry.evidence.claims) ? entry.evidence.claims : [])
     .map((claim, claimIndex) => ({ ...claim, evidenceIndex, claimIndex }))
 )
-const claimBudget = Math.max(0, Math.floor((maxCalls - 2 - evidence.length * 2) / VOTES))
+const priority = { high: 0, medium: 1, low: 2 }
+allClaims.sort((a, b) => priority[a.priority] - priority[b.priority])
+const claimBudget = Math.max(0, Math.floor((maxCalls - 1 - issuedCalls) / VOTES))
 const admittedClaims = allClaims.slice(0, claimBudget)
 const omittedClaims = allClaims.slice(admittedClaims.length)
 
@@ -172,7 +181,7 @@ const verdicts = await parallel(admittedClaims.map((claim, claimIndex) => async 
     'Try to refute it. Use supported, refuted or uncertain, and cite the evidence you inspected.',
   ].filter(Boolean).join('\n')
   const votes = await parallel(Array.from({ length: VOTES }, (_, voteIndex) => async () =>
-    agent(prompt, {
+    callAgent(prompt, {
       label: 'verify:' + (claimIndex + 1) + ':' + (voteIndex + 1),
       phase: 'Verify',
       agent: researchAgent,
@@ -191,13 +200,13 @@ const verdicts = await parallel(admittedClaims.map((claim, claimIndex) => async 
 }))
 
 await phase('Synthesize')
-const answer = evidence.length > 0 ? await agent([
+const answer = evidence.length > 0 ? await callAgent([
   'Write a sourced research answer from the evidence below. You do not have the parent conversation.',
   '',
   'Question: ' + question,
   context ? 'Additional context: ' + context : '',
   'Scope notes: ' + JSON.stringify(scope ? scope.scopeNotes : []),
-  'Failed or empty research branches: ' + researched.filter((entry) => !entry).length,
+  'Failed or empty research branches: ' + (researched.length - evidence.length),
   'Evidence: ' + JSON.stringify(evidence, null, 2),
   'Claim checks: ' + JSON.stringify(verdicts, null, 2),
   'Claims omitted because of maxCalls: ' + JSON.stringify(omittedClaims),
@@ -212,7 +221,7 @@ const answer = evidence.length > 0 ? await agent([
 
 return {
   question,
-  status: answer && omittedClaims.length === 0 && evidence.length === queries.length ? 'complete' : 'incomplete',
+  status: answer && omittedClaims.length === 0 && evidence.length === queries.length && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted')) ? 'complete' : 'incomplete',
   scope,
   queries: queries.map((query) => query.query),
   sources: evidence.flatMap((entry) => entry.sources),

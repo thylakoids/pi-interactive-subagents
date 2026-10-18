@@ -1,6 +1,7 @@
 /** Centered workflow tree. Navigation follows Pi lists and Vim tree conventions. */
 import { isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import type { WorkflowAgentResultMeta, WorkflowRunView } from "./types.ts";
+import { summarizeCalls } from "./state.ts";
 
 export interface WorkflowPanelCallbacks {
   focus(name: string, sessionFile?: string): { ok: true } | { error: string } | Promise<{ ok: true } | { error: string }>;
@@ -75,7 +76,7 @@ const ACTION_LABEL: Record<Action, string> = { focus: "Focus", skip: "Skip", abo
 
 /** Progress describes issued calls, never a prediction of future script work. */
 export function workflowSummary(view: WorkflowRunView, width: number): string[] {
-  const settled = view.calls.filter(c => c.status !== "running" && c.status !== "queued").length;
+  const { settled } = summarizeCalls(view.calls);
   const size = Math.max(4, Math.min(14, Math.floor(width / 6)));
   const filled = view.totalCount ? Math.round(size * settled / view.totalCount) : 0;
   const bar = "▰".repeat(Math.min(size, filled)) + "▱".repeat(Math.max(0, size - filled));

@@ -24,7 +24,7 @@ export const meta = {
 
 `meta.agent` optionally selects an ordinary agent definition. Without it, `agent()` uses `workflow-subagent`. Phases are display grouping, not scheduling barriers. Use `opts.phase` for per-call grouping in interleaved pipelines. `phase()` only updates the run's displayed stage.
 
-Inputs come from `args` (JSON). The sandbox has no file/network access or timers. Pass paths, task scope, acceptance criteria and source constraints to agents, which perform I/O. Avoid scripts based on wall-clock time or randomness: replay depends on reproducible call content. Every prompt must include enough context to work independently; agents cannot read the parent conversation.
+Inputs come from `args` (JSON). The sandbox has no file/network access or timers. Pass paths, task scope, acceptance criteria and source constraints to agents, which perform I/O. Date.now() and parameterless new Date() are frozen at the persisted run start; performance.now() is always zero, not elapsed time. Math.random() replays a seeded sequence, but concurrent branches may consume it in different orders: never derive call keys from shared randomness. Pass business timestamps explicitly in args. Replay depends on reproducible call content. Every prompt must include enough context to work independently; agents cannot read the parent conversation.
 
 `agent(prompt, opts)` returns final text, or a validated object when `schema` is supplied. Options: `label`, `phase`, `schema`, `agent`/`agentType`, `model`, `effort`. Do not encode provider assumptions in templates. Use an available ordinary agent definition with the tools it needs. `cli:` definitions cannot supply pi's `structured_output`; do not pair them with schemas.
 
