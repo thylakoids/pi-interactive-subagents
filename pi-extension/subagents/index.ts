@@ -29,6 +29,8 @@ import {
 
 import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
+import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
+import { registerWorkflowExtension } from "./workflow/index.ts";
 import { isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
 
 import {
@@ -224,9 +226,11 @@ export function registerToolExtension(name: string, extensionPath: string): void
 // Expose registration on a process-global so project-local extensions loaded
 // via jiti (separate module instances) can reach this shared map. Set at module
 // load so it's available before any `session_start` listener runs.
+// `workflow` is added at session start (see the extension factory) once the
+// subagent service exists; until then only registration is available.
 (globalThis as any).__pi_interactive_subagents = {
   registerToolExtension,
-};
+} as Record<string, unknown>;
 
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that
@@ -425,6 +429,17 @@ function resolveCliKind(agentDefs: AgentDefaults | null, agentName?: string): Ex
 }
 
 /**
+ * Whether a named definition runs as a pi child or as an external coding CLI.
+ * A CLI agent brings its own toolset and has no pi tool layer, so it cannot
+ * satisfy a schema — callers that need to know ask before spawning.
+ */
+function agentKindOf(name: string): "pi" | "cli" | undefined {
+  const defs = loadAgentDefaults(name);
+  if (!defs) return undefined;
+  return defs.cli ? "cli" : "pi";
+}
+
+/**
  * `fork` means "seed the child with the caller's pi conversation". A CLI agent
  * (claude/codex) cannot read a pi session, so the mode would silently degrade
  * into a context-free run. Fail fast instead of pretending it worked.
@@ -456,7 +471,9 @@ function assertCliSessionModeSupported(
 function resolveEffectiveInteractive(
   _params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
+  override?: boolean,
 ): boolean {
+  if (override != null) return override;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
 }
@@ -743,6 +760,31 @@ let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
 
+/**
+ * The parent session's model and thinking level, as the fallback for a child
+ * whose call and definition both leave them unset. Refreshed on every session
+ * start and model select, so a mid-session model switch reaches new children.
+ */
+const sessionDefaults: { model?: string; thinking?: string } = {};
+
+/** `provider/model:level` — the `:level` suffix pi accepts on a model id. */
+const MODEL_EFFORT_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max)$/;
+
+/** Record the session's resolved model/thinking for children that inherit. */
+function captureSessionDefaults(pi: ExtensionAPI): void {
+  try {
+    const model = pi.getModel();
+    if (model?.id) sessionDefaults.model = model.provider ? `${model.provider}/${model.id}` : model.id;
+  } catch {
+    // Older runtime without getModel: children fall back to their own default.
+  }
+  try {
+    sessionDefaults.thinking = pi.getThinkingLevel();
+  } catch {
+    // Same: leave it unset.
+  }
+}
+
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -890,6 +932,21 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
  * manually resumed or user-touched subagent unable to call ask_question.
  */
+/**
+ * Add an extra tool to a child's allowlist.
+ *
+ * Workflow children request `structured_output` (their schema-driven result
+ * tool) through `extraExtensions`. Without this, a restricted child loads the
+ * extension but `--tools` hides it and the agent can never answer with data.
+ * A null allowlist means "no restriction", which already grants the tool.
+ */
+function withExtraTool(extraExtensions: string[] | undefined, allowlist: string | null): string | null {
+  if (!allowlist || !extraExtensions?.length) return allowlist;
+  const allow = new Set(allowlist.split(",").map((tool) => tool.trim()).filter(Boolean));
+  allow.add("structured_output");
+  return [...allow].join(",");
+}
+
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
   opts?: { grantSpawning?: boolean },
@@ -933,8 +990,11 @@ function applySandboxToParts(
   opts: { artifactDir: string; name: string },
 ): void {
   if (loadout.model) {
-    const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
-    parts.push("--model", shellEscape(model));
+    // A model that already carries a `:level` suffix keeps it: a caller that
+    // passed `provider/model:high` meant that level, and appending the
+    // definition's own level would produce `provider/model:high:medium`.
+    const suffix = loadout.thinking && !MODEL_EFFORT_SUFFIX.test(loadout.model) ? `:${loadout.thinking}` : "";
+    parts.push("--model", shellEscape(`${loadout.model}${suffix}`));
   }
 
   if (loadout.identity) {
@@ -1263,18 +1323,41 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: {
+    surface?: string;
+    /** Extra `-e` extension files for this child (e.g. workflow structured output). */
+    extraExtensions?: string[];
+    /** Extra environment assignments exported to the child process. */
+    extraEnv?: Record<string, string>;
+    /** Reasoning effort for this child, applied to its resolved model. */
+    thinking?: string;
+    /** The child's final message is a value a program reads, not a report. */
+    outputIsData?: boolean;
+    /** Force a terminating child: nobody is watching this pane. */
+    nonInteractive?: boolean;
+  },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const cliKind = resolveCliKind(agentDefs, params.agent);
-  const effectiveModel = params.model ?? agentDefs?.model;
+  // Precedence: what the caller asked for, then the definition's own pin, then
+  // the parent session. The session is a last resort, never an override — every
+  // bundled definition pins its model deliberately.
+  const effectiveModel = params.model ?? agentDefs?.model ?? sessionDefaults.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
-  const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? sessionDefaults.thinking;
+  const effectiveInteractive = resolveEffectiveInteractive(
+    params,
+    agentDefs,
+    options?.nonInteractive ? false : undefined,
+  );
+  // A caller with nobody watching the pane (a workflow) needs the child to end
+  // on its own; a definition that does not auto-exit would otherwise wait for a
+  // human who is never coming.
+  const effectiveAutoExit = options?.nonInteractive ? true : (agentDefs?.autoExit ?? false);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1325,12 +1408,18 @@ async function launchSubagent(
     // Build the task message
     // Only full-context fork mode inherits prior conversation state.
     // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-    const modeHint = agentDefs?.autoExit
+    const modeHint = effectiveAutoExit
       ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
       : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-    const summaryInstruction = agentDefs?.autoExit
-      ? "Your FINAL assistant message should summarize what you accomplished."
-      : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+    // A workflow call consumes the final message as a *value*, so asking for a
+    // summary is asking for the wrong thing: the caller wants the data, not a
+    // report about the work. Callers that read the result as data say so.
+    const summaryInstruction = options?.outputIsData
+      ? "Your FINAL assistant message IS the return value: give the requested result itself, " +
+        "as raw data. No preamble, no restating the task, no offer of further help."
+      : effectiveAutoExit
+        ? "Your FINAL assistant message should summarize what you accomplished."
+        : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
     // An agent with a non-empty subagent_agents list is granted the spawning
     // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
     const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
@@ -1352,7 +1441,7 @@ async function launchSubagent(
         cwd: targetCwdForSession, model: effectiveModel ?? null,
         thinking: effectiveThinking ?? null, identity,
         systemPromptMode: systemPromptMode ?? null,
-        autoExit: agentDefs?.autoExit ?? false,
+        autoExit: effectiveAutoExit,
       };
       writeExternalSession(subagentSessionFile, externalSession);
       return launchExternalSubagent({ id, name: params.name, task: params.task,
@@ -1387,15 +1476,17 @@ async function launchSubagent(
     // Snapshot the fully-resolved sandbox beside the session file so a later
     // `subagent_message({ name })` resume can replay the exact same
     // restriction instead of relaunching pi with all global extensions + tools.
+    // Workflow children add structured_output to the loadout itself, so a later
+    // resume keeps the same tools.
     const loadout: SubagentLoadout = {
       agent: params.agent ?? null,
-      toolAllowlist,
+      toolAllowlist: withExtraTool(options?.extraExtensions, toolAllowlist),
       model: effectiveModel ?? null,
       thinking: effectiveThinking ?? null,
       systemPromptMode: systemPromptMode ?? null,
       identity: identityInSystemPrompt ? identity : null,
       spawnable: agentDefs?.subagentAgents ?? null,
-      autoExit: agentDefs?.autoExit ?? false,
+      autoExit: effectiveAutoExit,
       cwd: effectiveCwd ?? null,
       agentDir: resolvedAgentDir,
     };
@@ -1404,6 +1495,14 @@ async function launchSubagent(
     // Apply model, identity, and the default-deny tool/extension restriction via
     // the shared helper (same code path resume uses — they can't drift).
     applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+
+    // Extra extensions (e.g. workflow structured output) ride alongside the
+    // sandbox's own whitelist; `-e` is additive even after --no-extensions.
+    // A child that asks for an extra extension needs its tool in the allowlist
+    // too, or the extension loads but the model cannot call it.
+    for (const extensionPath of options?.extraExtensions ?? []) {
+      parts.push("-e", shellEscape(extensionPath));
+    }
 
     // Build env prefix: subagent identity + config dir propagation + spawn allowlist
     const envParts: string[] = [];
@@ -1419,12 +1518,15 @@ async function launchSubagent(
     if (params.agent) {
       envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
     }
-    if (agentDefs?.autoExit) {
+    if (effectiveAutoExit) {
       envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
     }
     envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+    for (const [key, value] of Object.entries(options?.extraEnv ?? {})) {
+      envParts.push(`${key}=${shellEscape(value)}`);
+    }
     const envPrefix = envParts.join(" ") + " ";
 
     // Pass task and skill prompts to the sub-agent.
@@ -1671,9 +1773,14 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+  // A child that neither its call nor its definition gives a model to inherits
+  // the session's; keep that fresh across a mid-session model switch.
+  captureSessionDefaults(pi);
+  pi.on("model_select", () => captureSessionDefaults(pi));
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    captureSessionDefaults(pi);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -2340,6 +2447,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       pi.sendUserMessage(toolCall);
     },
   });
+
+  // ── Workflow runtime ──
+  // The workflow tool reuses this module's spawn/watch/steer path through a
+  // thin service object, so a workflow agent is an ordinary interactive
+  // subagent in every observable way (pane, registry, status, permissions).
+  try {
+    const surface: SubagentPluginSurface = {
+      launch: launchSubagent,
+      watch: watchSubagent,
+      steer: steerSubagent,
+      resolveRunning: resolveRunningByName,
+      runningSubagents,
+      registerName,
+      readNameRegistry,
+      getArtifactDir,
+      updateWidget,
+      startWidgetRefresh,
+      discoverAgents: () => discoverAgentDefinitions().map((agent) => agent.name),
+      isAgentAllowed: (name) => {
+        const permitted = SUBAGENT_ALLOWLIST
+          ? [...SUBAGENT_ALLOWLIST]
+          : discoverAgentDefinitions().map((agent) => agent.name);
+        return permitted.includes(name);
+      },
+      agentKind: agentKindOf,
+      sessionDefaults: () => ({ ...sessionDefaults }),
+      sessionSnapshot: () => ({
+        sessionFile: latestCtx?.sessionManager.getSessionFile() ?? "",
+        sessionId: latestCtx?.sessionManager.getSessionId() ?? "",
+        sessionDir: latestCtx?.sessionManager.getSessionDir() ?? "",
+      }),
+      agentDir: getAgentConfigDir,
+      cwd: () => latestCtx?.cwd ?? process.cwd(),
+    };
+    const workflowService = createWorkflowSubagentService(surface);
+    (globalThis as any).__pi_interactive_subagents.workflow = workflowService;
+    registerWorkflowExtension(pi, { service: workflowService });
+  } catch (error: any) {
+    pi.on("session_start", (_event, ctx) => {
+      ctx.ui.notify(
+        `Workflow runtime unavailable: ${error?.message ?? String(error)}`,
+        "warning",
+      );
+    });
+  }
 
   // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {

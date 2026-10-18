@@ -86,6 +86,32 @@ export interface StatusSnapshot {
   statusLabel: string | null;
 }
 
+/**
+ * The phase detail a status label is made of: the active tool scope and how
+ * long it has run, how long the agent has been waiting, or why it stalled.
+ *
+ * The widget renders it after the kind word and the workflow panel renders it
+ * inside its own bracket, so both surfaces describe a phase the same way.
+ */
+export function formatStatusDetail(snapshot: StatusSnapshot): string {
+  if (snapshot.kind === "starting") return "…";
+  if (snapshot.kind === "running") return ` ${snapshot.elapsedText}`;
+  if (snapshot.kind === "active") {
+    const label = snapshot.activityLabel ?? snapshot.activeScope;
+    if (!label) return "";
+    const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
+    return ` · ${label}${duration}`;
+  }
+  if (snapshot.kind === "waiting") {
+    const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+    return `${duration}${detail}`;
+  }
+  const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
+  return `${detail}${duration}`;
+}
+
 export interface CappedStatusLines {
   visibleLines: string[];
   overflow: number;
