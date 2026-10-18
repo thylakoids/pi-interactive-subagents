@@ -81,10 +81,10 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
-| **workflow-subagent** | `opencode-go/deepseek-v4.1-flash` | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | Default for a workflow `agent()` call that names no agent; returns its final message as data |
+| **scout** | *(inherits session)* | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | *(inherits session)* | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **workflow-subagent** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | Default for a workflow `agent()` call that names no agent; returns its final message as data |
 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -152,6 +152,13 @@ from extracted evidence.
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
 
+Bundled Pi agents (`worker`, `scout`, `researcher`, `workflow-subagent`) do not pin a
+model: new children inherit the main session's current model, including after a
+model switch. A call's explicit `model` overrides the agent definition's optional
+`model`, which overrides inheritance. To follow the main session, omit `model`
+from your definition. Existing user definitions are not rewritten. Native CLI
+profiles have their own model configuration; this default applies to Pi children.
+
 ```markdown
 ---
 name: my-agent
@@ -172,7 +179,7 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
+| `model` | string | Optional override; omit to inherit the main session's current model (Pi agents). A call's explicit `model` takes precedence |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |

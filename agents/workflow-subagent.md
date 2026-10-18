@@ -2,7 +2,6 @@
 name: workflow-subagent
 description: Default agent for workflow `agent()` calls that name no agent type — a general pi worker that returns its final message as data
 tools: read, write, edit, bash, grep, find, ls
-model: opencode-go/deepseek-v4.1-flash
 thinking: medium
 session-mode: lineage-only
 system-prompt: append

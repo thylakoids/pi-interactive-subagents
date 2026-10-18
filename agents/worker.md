@@ -3,7 +3,6 @@ name: worker
 description: General-purpose worker — reads, writes, and edits code
 tools: read, write, edit, bash, web_search, fetch_content, source_check, get_search_content
 subagent_agents: scout, researcher
-model: opencode-go/deepseek-v4.1-flash
 thinking: high
 system-prompt: append
 auto-exit: true

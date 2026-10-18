@@ -772,17 +772,18 @@ let latestPi: ExtensionAPI | null = null;
  */
 const sessionDefaults: { model?: string; thinking?: string } = {};
 
+function resolveAgentModel(callModel?: string, definitionModel?: string, inheritParent = true): string | undefined {
+  return callModel ?? definitionModel ?? (inheritParent ? sessionDefaults.model : undefined);
+}
+
 /** `provider/model:level` — the `:level` suffix pi accepts on a model id. */
 const MODEL_EFFORT_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max)$/;
 
 /** Record the session's resolved model/thinking for children that inherit. */
-function captureSessionDefaults(pi: ExtensionAPI): void {
-  try {
-    const model = pi.getModel();
-    if (model?.id) sessionDefaults.model = model.provider ? `${model.provider}/${model.id}` : model.id;
-  } catch {
-    // Older runtime without getModel: children fall back to their own default.
-  }
+function captureSessionDefaults(pi: ExtensionAPI, model?: { provider?: string; id: string }): void {
+  sessionDefaults.model = model?.id
+    ? (model.provider ? `${model.provider}/${model.id}` : model.id)
+    : undefined;
   try {
     sessionDefaults.thinking = pi.getThinkingLevel();
   } catch {
@@ -1292,6 +1293,7 @@ export const __test__ = {
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
+  resolveAgentModel,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -1455,10 +1457,10 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const cliKind = resolveCliKind(agentDefs, params.agent);
-  // Precedence: what the caller asked for, then the definition's own pin, then
-  // the parent session. The session is a last resort, never an override — every
-  // bundled definition pins its model deliberately.
-  const effectiveModel = params.model ?? agentDefs?.model ?? sessionDefaults.model;
+  // Explicit call and user definition overrides win; otherwise inherit the
+  // current parent session, including model switches made after startup.
+  // Native CLIs use their own defaults, not Pi provider/model identifiers.
+  const effectiveModel = resolveAgentModel(params.model, agentDefs?.model, !cliKind);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? sessionDefaults.thinking;
@@ -1897,11 +1899,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // A child that neither its call nor its definition gives a model to inherits
   // the session's; keep that fresh across a mid-session model switch.
   captureSessionDefaults(pi);
-  pi.on("model_select", () => captureSessionDefaults(pi));
+  pi.on("model_select", (event) => captureSessionDefaults(pi, event.model));
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
-    captureSessionDefaults(pi);
+    captureSessionDefaults(pi, ctx.model);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
