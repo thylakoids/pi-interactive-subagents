@@ -80,8 +80,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **workflow-subagent** | `opencode-go/deepseek-v4.1-flash` | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | Default for a workflow `agent()` call that names no agent; returns its final message as data |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
 ## Dynamic workflows
 
@@ -96,9 +97,15 @@ const REVIEWERS = [{ key: "bugs", prompt: "..." }, { key: "perf", prompt: "..." 
 const reviews = await parallel(REVIEWERS.map((r) => () => agent(r.prompt, { label: r.key, phase: "Review" })));
 ```
 
-- **Deterministic replay.** Calls are journaled by content hash, so re-running the same
-  script with the same args replays finished calls instead of redoing them. Edit one call
-  and only it, plus everything after it, re-runs — `workflow({ action: "resume", runId })`.
+- **Deterministic replay.** Calls are journaled by content hash — label, prompt, schema, agent,
+  model and effort — so re-running the same script with the same args replays finished calls
+  instead of redoing them, and editing a call re-runs exactly that call. Three identical calls
+  are three calls, not one replayed three times. `workflow({ action: "resume", runId })` picks
+  up an interrupted run; `reuse: "none"` forces every call to run again.
+- **Nothing fails quietly.** A dead agent resolves to `null` for that call only — as it does in
+  Claude Code — while a malformed one (unknown agent, misspelled option, unsatisfiable schema)
+  fails the run before it spends anything. The settled report names every call that came back
+  empty instead of counting it as done.
 - **Observable on demand.** `ctrl+alt+w` (or `/workflow [runId]`) opens a panel with one run
   on screen: name and status, progress, tokens and cost, and a row per agent with its live
   activity — `f` jumps to a pane, `m` messages it, `x` stops it, `s` skips the call, `a`/`r`

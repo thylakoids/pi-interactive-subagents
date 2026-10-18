@@ -9,6 +9,8 @@ Before updating or synchronizing a checkout, inspect HEAD, the working tree, and
 Agent definitions live in `agents/`. A multi-agent job — a review, a migration, a research
 sweep — is a [workflow](docs/workflow.md) script, not a dedicated agent definition: the script
 carries the orchestration, and each `agent()` call names an ordinary definition from `agents/`.
+`workflow-subagent.md` is the definition a call gets when it names none, so it is the one that
+has to stay general-purpose.
 
 ## Public documentation
 
