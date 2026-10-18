@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own tmux pane, split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,11 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Subagent panes stack in a column beside the parent. The parent keeps the left half of its window and subagents fill the right column — four of them on a 58-row terminal, a cap derived from the terminal height rather than a fixed number. Beyond that they move to extra windows in the same tmux session, tiled, opening another window as each fills up.
+
+If your window already has panes of your own, the extension leaves it alone and puts every subagent in an overflow window instead — it never rearranges panes it did not create.
+
+Each pane and its layout are created in a single tmux invocation, so the arrangement is never shown half-built and then rearranged. The policy lives in `pi-extension/subagents/layout.ts`.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
