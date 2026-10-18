@@ -96,16 +96,24 @@ const scope = await callAgent([
 })
 
 const queryLimit = Math.max(0, Math.min(2, Math.floor((maxCalls - 5) / 2)))
-const queries = scope && Array.isArray(scope.queries)
-  ? scope.queries.filter((entry) => entry && typeof entry.query === 'string' && entry.query.trim()).slice(0, queryLimit)
+const plannedQueries = scope && Array.isArray(scope.queries)
+  ? scope.queries.filter((entry) => entry && typeof entry.query === 'string' && entry.query.trim())
   : []
+// 被 queryLimit 截掉的计划查询和被 claimBudget 截掉的 claim 一样是证据缺口：
+// 必须单独记下来、交给综合提示词，并在 status 里体现，不能在 sliced 之后就不见了
+const queries = plannedQueries.slice(0, queryLimit)
+const omittedQueries = plannedQueries.slice(queryLimit).map((entry) => entry.query)
 
 if (queries.length === 0) {
   return {
     question,
     status: 'incomplete',
-    reason: scope ? 'The scope step found no usable search queries.' : 'The scope step failed.',
+    reason: scope
+      ? (plannedQueries.length > 0 ? 'maxCalls left no budget for a search query.' : 'The scope step found no usable search queries.')
+      : 'The scope step failed.',
     scope: scope || null,
+    queries: [],
+    omittedQueries: omittedQueries,
     sources: [],
     evidence: [],
     verdicts: [],
@@ -210,9 +218,11 @@ const answer = evidence.length > 0 ? await callAgent([
   'Evidence: ' + JSON.stringify(evidence, null, 2),
   'Claim checks: ' + JSON.stringify(verdicts, null, 2),
   'Claims omitted because of maxCalls: ' + JSON.stringify(omittedClaims),
+  'Planned queries omitted because of maxCalls: ' + JSON.stringify(omittedQueries),
   '',
   'Answer directly. Separate supported findings, disputed or uncertain claims, and evidence gaps.',
-  'Never present a refuted or unverified claim as established. Cite the source pointers present in the evidence.',
+  'State which planned query was not run; never present a refuted or unverified claim as established.',
+  'Cite the source pointers present in the evidence.',
 ].filter(Boolean).join('\n'), {
   label: 'synthesize',
   phase: 'Synthesize',
@@ -221,9 +231,10 @@ const answer = evidence.length > 0 ? await callAgent([
 
 return {
   question,
-  status: answer && omittedClaims.length === 0 && evidence.length === queries.length && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted')) ? 'complete' : 'incomplete',
+  status: answer && omittedClaims.length === 0 && omittedQueries.length === 0 && evidence.length === queries.length && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted')) ? 'complete' : 'incomplete',
   scope,
   queries: queries.map((query) => query.query),
+  omittedQueries,
   sources: evidence.flatMap((entry) => entry.sources),
   evidence,
   verdicts,

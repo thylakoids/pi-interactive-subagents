@@ -90,11 +90,18 @@ const results = await pipeline(
       { label: 'apply:' + baseName(file), phase: 'Apply', agent: applyAgent },
     )
     if (applied === null) return null
-    return { file: file, risky: planned.risky, stepsText: planned.stepsText }
+    // 执行者的自述原样带回：它未经核验，不作为结论，只是让下游（验证者和调用方）知道它自己报了什么
+    const applyReport = typeof applied === 'string' && applied.trim() ? applied.trim() : null
+    return { file: file, risky: planned.risky, stepsText: planned.stepsText, applyReport: applyReport }
   },
   async (applied, file) => {
     if (!applied) return null
     // 分支：验证强度由计划的 risky 决定——非 risky 用只读轻量核验，risky 升级到能跑测试的完整核验
+    // 执行者的自述只作为未经验证的线索（可能声称改到了别的文件，或自己跳过了某步），
+    // 不代替验证者读代码；断言仍以验证者独立核对的结论为准
+    const applierClaim = applied.applyReport
+      ? ['', '执行者自述（未经核验，不要当作结论；只用来定位你该独立复核的地方）：', applied.applyReport]
+      : []
     let verifier = quickVerifierAgent
     let prompt = [
       '核验一次文件迁移是否落实到位。你没有执行者的上下文，以下是全部信息。',
@@ -103,6 +110,7 @@ const results = await pipeline(
       '目标文件：' + file,
       '计划：',
       applied.stepsText,
+      ...applierClaim,
       '',
       '读该文件，逐步核对计划里的每一步是否都已落实，有没有漏改或明显改错的地方。',
       '只读检查，不要修改任何文件；不确定的地方写进 issues，不要猜。',
@@ -116,8 +124,10 @@ const results = await pipeline(
         '目标文件：' + file,
         '计划：',
         applied.stepsText,
+        ...applierClaim,
         '',
-        '逐步核对计划是否落实，再检查调用方、对外行为与错误路径有没有回归；有相关测试或构建的话，运行它们作为证据。',
+        '逐步核对计划是否落实，再检查调用方、对外行为与错误路径有没有回归；有相关测试或构建的话，运行它们，只作为证据。',
+        '只读核验：不要为了修问题而修改或新建文件，需要改动的地方写进 issues。',
         '不确定或缺少证据的地方写进 issues；ok=true 只允许用于已确认没有问题的文件。',
       ].join('\n')
     }
@@ -127,7 +137,7 @@ const results = await pipeline(
       { label: 'verify:' + baseName(file), phase: 'Verify', agent: verifier, schema: VERIFY_SCHEMA },
     )
     if (!verdict) {
-      return { file: file, risky: applied.risky, verifier: verifier, ok: false, issues: ['验证没有完成（agent 失败或没有结构化结果）'] }
+      return { file: file, risky: applied.risky, verifier: verifier, ok: false, issues: ['验证没有完成（agent 失败或没有结构化结果）'], applyReport: applied.applyReport }
     }
     return {
       file: file,
@@ -135,6 +145,7 @@ const results = await pipeline(
       verifier: verifier,
       ok: verdict.ok === true,
       issues: Array.isArray(verdict.issues) ? verdict.issues : [],
+      applyReport: applied.applyReport,
     }
   },
 )
@@ -146,7 +157,8 @@ for (let index = 0; index < results.length; index++) {
     report.unfinished.push(files[index])
     continue
   }
-  const summary = { file: entry.file, risky: entry.risky, verifier: entry.verifier, issues: entry.issues }
+  // applyReport 是执行者的自述原样带回，未经核验；结论只看 verifier 与 issues
+  const summary = { file: entry.file, risky: entry.risky, verifier: entry.verifier, issues: entry.issues, applyReport: entry.applyReport }
   if (entry.ok) report.verified.push(summary)
   else report.needsAttention.push(summary)
 }

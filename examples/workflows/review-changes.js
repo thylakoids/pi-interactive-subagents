@@ -38,10 +38,15 @@ const target = typeof args.target === 'string' && args.target.trim()
   ? args.target
   : '当前工作区相对 HEAD 的未提交改动（先用 git status / git diff 确认范围）'
 
+// 动态扇出必须在脚本里设上限：运行时只拒绝超大批次（单批 4096 项），不会替模板限制
+// 维度数或发现数，所以两者都在这里截断，并在 report 里如实报告被丢掉的部分。
+const maxDimensions = Number.isInteger(args.maxDimensions) ? Math.max(1, Math.min(24, args.maxDimensions)) : 8
+const maxFindings = Number.isInteger(args.maxFindings) ? Math.max(1, Math.min(50, args.maxFindings)) : 20
+
 // args.dimensions 每项是字符串或 { name, focus, agent }；缺省三个维度。
 // 维度本身不绑定 agent：审查者用 workflow 的默认子代理，维度要求写在提示词里。
 // 需要某个具体定义（例如只读的 reviewer）时，在 args.dimensions 里写 agent。
-const declared = Array.isArray(args.dimensions) && args.dimensions.length > 0
+const requested = Array.isArray(args.dimensions) && args.dimensions.length > 0
   ? args.dimensions
   : [
       { name: 'correctness', focus: '正确性：错误结果、异常路径、状态传播，以及真实可达的边界（null、空集、并发）' },
@@ -49,7 +54,7 @@ const declared = Array.isArray(args.dimensions) && args.dimensions.length > 0
       { name: 'regression', focus: '回归：调用方与内部契约是否被破坏，新行为是否被已有测试覆盖' },
     ]
 
-const dimensions = declared.map((entry, index) => {
+const allDimensions = requested.map((entry, index) => {
   if (typeof entry === 'string') return { name: 'dimension-' + (index + 1), focus: entry, agent: undefined }
   const name = typeof entry.name === 'string' && entry.name.trim() ? entry.name : 'dimension-' + (index + 1)
   return {
@@ -59,10 +64,16 @@ const dimensions = declared.map((entry, index) => {
   }
 })
 
+const dimensions = allDimensions.slice(0, maxDimensions)
+const droppedDimensions = allDimensions.slice(maxDimensions).map((dimension) => dimension.name)
+
 const verifierAgent = typeof args.verifierAgent === 'string' ? args.verifierAgent : undefined
 
 await phase('Review')
 await log('审查范围：' + target + '；维度：' + dimensions.map((dimension) => dimension.name).join('、'))
+if (droppedDimensions.length > 0) {
+  await log('维度超过上限 ' + maxDimensions + '，未审查：' + droppedDimensions.join('、'))
+}
 
 // pipeline 无屏障：先审完的维度立刻进入验证，不必等最慢的维度（parallel 要收齐全部审计才能开始）
 const reviewed = await pipeline(
@@ -76,19 +87,22 @@ const reviewed = await pipeline(
         '审查维度——' + dimension.name + '：' + dimension.focus,
         '',
         '先确认改动范围，再按需要读周围代码、调用方和现有测试。',
-        '只记录这批改动引入或加重的问题；每条发现都要给出具体触发路径，给不出就不要记录。',
-        '只审查，不修改任何文件，也不运行测试、构建或 lint。',
+        '只记录这批改动引入或加重的问题；每条发现都要给出具体触发路径，给不出就不要记录；列表按严重性从高到低排列。',
+        '只审查，不修改任何文件，也不运行测试、构建或 lint；不要为了凑足数量而虚报。',
       ].join('\n'),
       { label: 'audit:' + dimension.name, phase: 'Review', agent: dimension.agent, schema: AUDIT_SCHEMA },
     )
     if (!audit) return null
     const findings = audit && Array.isArray(audit.findings) ? audit.findings : []
-    return { dimension: dimension.name, findings: findings }
+    // 每个维度先截断再进入 fan-out：验证者数量 = 维度数 + admitted findings，不随发现数无限增长
+    const admitted = findings.slice(0, maxFindings)
+    return { dimension: dimension.name, findings: admitted, dropped: findings.length - admitted.length }
   },
   async (audited, dimension) => {
     if (!audited) return null
     const findings = audited && Array.isArray(audited.findings) ? audited.findings : []
-    if (findings.length === 0) return { dimension: dimension.name, confirmed: [], unverified: [], rejected: 0 }
+    const dropped = audited && Number.isInteger(audited.dropped) ? audited.dropped : 0
+    if (findings.length === 0) return { dimension: dimension.name, confirmed: [], unverified: [], rejected: 0, dropped: dropped }
     // 每条发现单独交给一个验证者：只拿到这一条，独立复核，并默认它是错的
     const verdicts = await parallel(
       findings.map((finding, index) => async () => {
@@ -130,18 +144,27 @@ const reviewed = await pipeline(
         rejected++
       }
     }
-    await log(dimension.name + '：候选 ' + findings.length + '，确认 ' + confirmed.length + '，驳回 ' + rejected + '，未验证 ' + unverified.length)
-    return { dimension: dimension.name, confirmed: confirmed, unverified: unverified, rejected: rejected }
+    await log(dimension.name + '：候选 ' + findings.length + '，确认 ' + confirmed.length + '，驳回 ' + rejected + '，未验证 ' + unverified.length + (dropped > 0 ? '，超上限未送验证 ' + dropped : ''))
+    return { dimension: dimension.name, confirmed: confirmed, unverified: unverified, rejected: rejected, dropped: dropped }
   },
 )
 
-const report = { target: target, confirmed: [], unverified: [], rejected: 0, failedDimensions: [] }
+const report = {
+  target: target,
+  confirmed: [],
+  unverified: [],
+  rejected: 0,
+  droppedDimensions: droppedDimensions,
+  droppedFindings: [],
+  failedDimensions: [],
+}
 for (let index = 0; index < reviewed.length; index++) {
   const entry = reviewed[index]
   if (!entry) {
     report.failedDimensions.push(dimensions[index].name)
     continue
   }
+  if (entry.dropped > 0) report.droppedFindings.push({ dimension: entry.dimension, count: entry.dropped })
   report.rejected += entry.rejected
   for (const finding of entry.confirmed) report.confirmed.push(finding)
   for (const finding of entry.unverified) report.unverified.push(finding)
@@ -154,5 +177,6 @@ report.confirmed.sort((left, right) => {
   return a - b
 })
 
-await log('完成：确认 ' + report.confirmed.length + ' 条，驳回 ' + report.rejected + ' 条，未验证 ' + report.unverified.length + ' 条')
+const droppedTotal = report.droppedFindings.reduce((sum, item) => sum + item.count, 0)
+await log('完成：确认 ' + report.confirmed.length + ' 条，驳回 ' + report.rejected + ' 条，未验证 ' + report.unverified.length + ' 条' + (droppedTotal > 0 ? '，超上限未送验证 ' + droppedTotal + ' 条' : ''))
 return report
