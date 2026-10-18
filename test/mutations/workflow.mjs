@@ -7,8 +7,18 @@ import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
-const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts'];
+const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts'];
 const mutants = [
+  ['workflow control tools re-enabled', 'pi-extension/subagents/workflow/execution.ts',
+    '!BLOCKED_TOOLS.has(tool)', 'true'],
+  ['workflow policy not passed to launcher', 'pi-extension/subagents/wiring.ts',
+    '          workflow: true,', '          workflow: false,'],
+  ['old default journal reuse disabled', 'pi-extension/subagents/workflow/manager.ts',
+    'if (!hasNamespace(base) && hasNamespace(legacyBase))', 'if (false)'],
+  ['legacy name alias disabled', 'pi-extension/subagents/workflow/manager.ts',
+    'requestedAgent === "workflow-subagent" && defined.unknown(requestedAgent)', 'false'],
+  ['native Codex model pinned again', 'agents/codex-cli.md',
+    'cli: codex\n', 'cli: codex\nmodel: hardcoded-test-model\n'],
   ['host clock leaks into replay', 'pi-extension/subagents/workflow/runner.ts',
     'run.deliver(nextResultSeq++, options.startedAt,', 'run.deliver(nextResultSeq++, Date.now(),'],
   ['aborted omitted from settled', 'pi-extension/subagents/workflow/state.ts',
@@ -26,7 +36,7 @@ const mutants = [
 ];
 const execute = () => spawnSync(process.execPath, ['--test', ...tests], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
 try {
-  for (const path of ['pi-extension', 'examples', 'skills', 'test', 'package.json']) cpSync(join(root, path), join(dir, path), { recursive: true });
+  for (const path of ['pi-extension', 'agents', 'examples', 'skills', 'test', 'package.json', 'config.json.example']) cpSync(join(root, path), join(dir, path), { recursive: true });
   symlinkSync(join(root, 'node_modules'), join(dir, 'node_modules'), 'dir');
   const baseline = execute();
   assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
@@ -44,5 +54,5 @@ try {
       console.log('Detected: ' + name);
     } finally { writeFileSync(target, source); }
   }
-  console.log(mutants.length + '/' + mutants.length + ' historical faults detected');
+  console.log(mutants.length + '/' + mutants.length + ' regression faults detected');
 } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }

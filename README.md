@@ -84,9 +84,15 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **scout** | *(inherits session)* | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | *(inherits session)* | `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `source_check`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
-| **workflow-subagent** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | Default for a workflow `agent()` call that names no agent; returns its final message as data |
 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+
+Workflows default to the same `worker` definition. The runtime enforces single-step
+execution: no delegation or question tools, no conversation fork, automatic termination,
+and direct result output (or `structured_output`). Normal workers retain their delegation
+capabilities. The old `workflow-subagent` name remains a workflow-only compatibility
+alias when no user definition of that name exists; old completed calls remain reusable
+on resume. No separate bundled definition is installed.
 
 ## Dynamic workflows
 
@@ -152,7 +158,7 @@ from extracted evidence.
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
 
-Bundled Pi agents (`worker`, `scout`, `researcher`, `workflow-subagent`) do not pin a
+Bundled Pi agents (`worker`, `scout`, `researcher`) do not pin a
 model: new children inherit the main session's current model, including after a
 model switch. A call's explicit `model` overrides the agent definition's optional
 `model`, which overrides inheritance. To follow the main session, omit `model`
@@ -213,6 +219,8 @@ Send `subagent_message({ name: "implement", message: "Also handle empty input" }
 to paste one message into the running TUI, or resume its native conversation when
 it has finished. Names and native session IDs persist across parent restarts.
 The bundled `claude-cli` profile works the same way and uses Claude's default model.
+Neither native CLI profile pins a model: Codex and Claude use their own configuration
+unless a profile or call explicitly overrides it; they never inherit Pi provider IDs.
 
 | | `cli: claude` | `cli: codex` |
 | --- | --- | --- |

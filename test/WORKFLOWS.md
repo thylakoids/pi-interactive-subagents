@@ -55,7 +55,11 @@ PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model \
 Without the opt-in variable this test skips, including during normal integration
 runs. It uses the production subagent service and real provider-backed Pi sessions,
 not a replacement service. Temporary project-local definitions select the requested
-model and ordinary read/edit/bash tools; both old template scripts run unchanged.
+parent model through ordinary bundled agent definitions (with reduced thinking for
+the billed test); both old template scripts run unchanged. Every child loadout is
+checked for the runtime workflow contract, no delegation/question tools, no spawning
+grant, and automatic exit. The recovery probe uses the legacy workflow-subagent
+name and verifies that it launches worker and reuses its completed result.
 
 The suite independently checks:
 - Review finds an injected boundary bug and a separate model verifies it.
@@ -70,3 +74,8 @@ A child session must contain actual provider usage and tool calls; a successful
 workflow status alone is insufficient. The test prints its temporary artifact
 directory and retains session files, snapshots, journals, marker files and events,
 on both success and failure. Its tmux session is stopped during teardown.
+
+`workflow-worker.test.ts` covers default worker selection, legacy script aliases,
+user legacy definitions, old journal replay (including repeated calls whose first
+occurrence failed), authorization, mandatory workflow adapter flags and execution
+policy. Model inheritance tests also ensure native CLI profiles do not pin models.

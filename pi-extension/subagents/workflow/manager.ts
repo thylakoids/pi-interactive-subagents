@@ -366,7 +366,7 @@ export class WorkflowRun {
     if (!requestedAgent && agentType === "worker") {
       const legacyLabel = parsed.opts.label?.trim() || "workflow-subagent";
       const legacyBase = makeCallKey({ ...content, agent: "workflow-subagent", label: legacyLabel });
-      const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key.startsWith(prefix + "-"));
+      const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key === prefix || key.startsWith(prefix + "-"));
       // Old default calls used the legacy agent (and sometimes its name as the
       // label). Reuse that namespace across resume, including failed ordinal 0.
       if (!hasNamespace(base) && hasNamespace(legacyBase)) { base = legacyBase; label = legacyLabel; }

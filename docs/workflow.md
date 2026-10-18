@@ -83,7 +83,7 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 子代理看不到本次对话，每个 prompt 都要自包含。
 
-**默认子代理。** `agent()` 没点名时，用本仓库自带的 `workflow-subagent`（一个普通 pi 子代理）。这一点是刻意的：`agents/` 目录里还有 `cli:` 型定义（外部 coding CLI），它们带自己的工具集和模型、也没有 pi 的工具层，不该被当成“随手跑个 prompt”的默认值。`meta.agent` 和 `opts.agent` 照常覆盖。
+**默认子代理。** `agent()` 没点名时使用普通 `worker`，`meta.agent` 和 `opts.agent` 照常覆盖。workflow 是执行模式，不是专用 agent 定义：运行时禁用委派、嵌套 workflow 和提问工具，强制非交互、自动退出、仅保留父会话 lineage，并将“直接返回步骤结果 / schema 最后调用 structured_output”的约束追加到系统提示。普通 worker 仍可委派。旧脚本的 `workflow-subagent` 名称在没有用户同名定义时映射到 worker；用户同名定义保留。旧默认调用的 journal 缓存键也兼容，resume 不会因此重跑已完成步骤。
 
 ## 编写指导与渐进披露
 
@@ -260,7 +260,7 @@ workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 - 命令 `/workflow`：TUI 下打开覆盖面板；非 TUI 会话打印文本报告，`/workflow <runId>` 查看指定 run。
 - 快捷键 **Ctrl+Alt+W**（默认绑定，见 `/hotkeys`）：切换面板的打开/关闭。确认页中也可直接关闭，关闭不会执行尚未确认的动作；再次打开保留树的位置与展开状态。
 
-主界面保留 `Subagents` 状态框，仍然展示运行中的所有子代理。默认定义名 `(workflow-subagent)` 不再重复显示；显式定义如 `(scout)` 仍显示。框底附上运行中 workflow 的名字、简单进度条、`settled/issued` 计数、running 数、累计 tokens、费用以及打开面板的快捷键。进度只反映脚本已发出的调用；脚本产生新调用时分母会增加，不代表预先知道整个脚本的任务总数。脚本仍在运行但没有活跃 agent 时，摘要继续保留。
+主界面保留 `Subagents` 状态框，仍然展示运行中的所有子代理。历史定义名 `(workflow-subagent)` 不再重复显示；当前定义如 `(worker)`、`(scout)` 正常显示。框底附上运行中 workflow 的名字、简单进度条、`settled/issued` 计数、running 数、累计 tokens、费用以及打开面板的快捷键。进度只反映脚本已发出的调用；脚本产生新调用时分母会增加，不代表预先知道整个脚本的任务总数。脚本仍在运行但没有活跃 agent 时，摘要继续保留。
 
 详情是一个居中、有完整边框的 overlay，四周留出背景，框内完整覆盖；宽度适配窗格并设置上限，高度在打开期间随终端尺寸保持稳定。里面不再重复进度条和用量，也没有底部快捷键提示。使用 Pi 列表的 `❯` 光标、状态符号和主题颜色。
 

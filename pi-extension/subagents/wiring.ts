@@ -44,6 +44,7 @@ export interface SubagentPluginSurface {
       thinking?: string;
       outputIsData?: boolean;
       nonInteractive?: boolean;
+      workflow?: boolean;
     },
   ): Promise<RunningSubagent>;
   watch(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult>;
@@ -142,8 +143,9 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
           ...(request.effort ? { thinking: request.effort } : {}),
           // A workflow child is read by a program and watched by nobody: its
           // final message is data, and it must end on its own.
-          outputIsData: request.outputIsData ?? true,
-          nonInteractive: request.nonInteractive ?? true,
+          workflow: true,
+          outputIsData: true,
+          nonInteractive: true,
         },
       );
 

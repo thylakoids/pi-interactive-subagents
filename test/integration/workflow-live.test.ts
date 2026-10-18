@@ -22,21 +22,12 @@ it('real models execute old templates, advance pipeline independently and recove
   const tmux = (...args: string[]) => execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const agentsDir = join(dir, '.pi', 'agents');
   mkdirSync(agentsDir, { recursive: true });
-  for (const name of ['worker', 'scout', 'workflow-subagent']) {
-    writeFileSync(join(agentsDir, name + '.md'), `---
-name: ${name}
-description: Live regression test agent with real provider and tools
-model: ${model}
-thinking: off
-tools: ${name === 'scout' ? 'read,grep,find,ls' : 'read,write,edit,bash,grep,find,ls'}
-spawning: false
-auto-exit: true
-system-prompt: append
----
-Execute the supplied task directly and concisely. Do not delegate or ask questions.
-Read the relevant source files. Do not modify anything unless the task explicitly requests it.
-If structured_output is available, finish by calling it with evidence-based values.
-`);
+  // Real bundled identities/tools; omit model so the parent model is inherited.
+  // Keep reasoning low for this billed test, not in the shipped definitions.
+  for (const name of ['worker', 'scout', 'researcher']) {
+    const definition = readFileSync(join(root, 'agents', name + '.md'), 'utf8')
+      .replace(/^thinking: .*$/m, 'thinking: off');
+    writeFileSync(join(agentsDir, name + '.md'), definition);
   }
   writeFileSync(join(dir, 'CONTRACT.md'), 'isAdult(age) must return true for age >= 18 and false below 18.\n');
   writeFileSync(join(dir, 'eligibility.cjs'), 'exports.isAdult = age => age >= 18;\n');

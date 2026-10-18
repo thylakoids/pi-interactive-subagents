@@ -2,7 +2,6 @@
 name: codex-cli
 description: Self-driving codex CLI session — deep investigation, experimentation, and hands-on work
 cli: codex
-model: gpt-5.6-sol
 thinking: medium
 auto-exit: true
 system-prompt: append

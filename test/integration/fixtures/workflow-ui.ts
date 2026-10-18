@@ -21,7 +21,7 @@ export default function fixture(pi: any) {
     sessionFile: join(dir, "parent.jsonl"), sessionId: "ui-fixture",
     service: {
       isAvailable: () => ({ ok: true }),
-      allowedAgents: () => ({ allowed: ["workflow-subagent"], unknown: name => name !== "workflow-subagent" }),
+      allowedAgents: () => ({ allowed: ["worker"], unknown: name => name !== "worker" }),
       agentKind: () => "pi", sessionDefaults: () => ({}), takenNames: () => new Set(),
       status: () => undefined, steer: async () => ({ ok: true }), focus: () => ({ ok: true }),
       stop: name => { pending.get(name)?.({ exitCode: 1, summary: "", elapsedMs: 0, error: "stopped" }); pending.delete(name); },

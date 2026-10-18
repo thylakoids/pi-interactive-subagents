@@ -52,7 +52,7 @@ BEFORE AUTHORING
 Load the workflow-authoring skill if available. Otherwise call workflow({ action: 'guide' }) for the same guidance and runtime API, even with skills disabled or no read tool. It covers six composable shapes: fan-out, per-item pipeline, per-finding expansion, adversarial voting, synthesis, and bounded budget loops. Use workflow({ action: 'list' }) to discover project/global/bundled scripts with whenToUse. workflow({ action: 'guide', name: '<name>' }) reads a complete template without executing it. Bundled templates: ${listBundledWorkflows().workflows.map(entry => entry.name).join(", ")}.
 
 SHAPE RULES
-Default to pipeline(items, ...stages): each item advances independently. Use parallel(thunks) when a consumer needs ALL previous results (cross-item comparison, voting or synthesis). Both return arrays in input order. Use schema whenever code branches on or extracts fields from agent output; free text is suitable when only passed through. Each prompt must include the task and relevant input: children do not see this conversation.
+Default to pipeline(items, ...stages): each item advances independently. Use parallel(thunks) when a consumer needs ALL previous results (cross-item comparison, voting or synthesis). Both return arrays in input order. Use schema whenever code branches on or extracts fields from agent output; free text is suitable when only passed through. Each prompt must include the task and relevant input: children do not see this conversation. Default agent: worker. Workflow runtime removes delegation and question tools and requires direct step results; normal workers keep their delegation capabilities. Legacy workflow-subagent names remain compatible.
 
 COMPLETE EXAMPLE
 ${CANONICAL_WORKFLOW}

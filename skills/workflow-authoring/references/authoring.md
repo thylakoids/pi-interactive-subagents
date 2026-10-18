@@ -22,7 +22,7 @@ export const meta = {
 }
 ```
 
-`meta.agent` optionally selects an ordinary agent definition. Without it, `agent()` uses `workflow-subagent`. Phases are display grouping, not scheduling barriers. Use `opts.phase` for per-call grouping in interleaved pipelines. `phase()` only updates the run's displayed stage.
+`meta.agent` optionally selects an ordinary agent definition. Without it, `agent()` uses `worker`. The runtime enforces single-step execution (no delegation/question tools, no conversation fork, autonomous exit and raw result output) regardless of the selected definition. `workflow-subagent` remains a compatibility alias when no user definition has that name; it is not a separate bundled agent. Phases are display grouping, not scheduling barriers. Use `opts.phase` for per-call grouping in interleaved pipelines. `phase()` only updates the run's displayed stage.
 
 Inputs come from `args` (JSON). The sandbox has no file/network access or timers. Pass paths, task scope, acceptance criteria and source constraints to agents, which perform I/O. Date.now() and parameterless new Date() are frozen at the persisted run start; performance.now() is always zero, not elapsed time. Math.random() replays a seeded sequence, but concurrent branches may consume it in different orders: never derive call keys from shared randomness. Pass business timestamps explicitly in args. Replay depends on reproducible call content. Every prompt must include enough context to work independently; agents cannot read the parent conversation.
 

@@ -87,7 +87,7 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 失败语义分两类：**子代理死掉/失败**只是该次调用落为 `null`（`parallel`/`pipeline` 如此，裸 `await agent()` 也如此，与 CC 一致），同时记为 `failed`、面板显示错误、日志写一行、落定消息按名字列出；**参数写错**（未知 agent、拼错的选项、不满足的 schema、超限、预算用尽、cli 型 agent 要 schema）抛错并让 run 失败。被跳过的调用同样返回 `null`。
 
-默认子代理是 `agents/workflow-subagent.md`（本仓库自带）。刻意不走“允许列表里的第一个”：`agents/` 里还有 `cli:` 型定义，那是外部 coding CLI，带自己的工具集和模型，不该被当成匿名调用的默认值。
+默认子代理是普通 `agents/worker.md`。workflow 执行约束由运行时强制并保存进 loadout：移除委派/提问工具、非交互自动退出、lineage-only、返回原始步骤结果。旧 `workflow-subagent` 名称及 journal 缓存键保持兼容，不再提供独立定义。刻意不走“允许列表里的第一个”：`agents/` 里还有 `cli:` 型定义，那是外部 coding CLI，带自己的工具集和模型，不该被当成匿名调用的默认值。
 
 每个 agent 的显示名唯一，并注册进插件既有名册，之后可用 `subagent_message` 找到它。
 

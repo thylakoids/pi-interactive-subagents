@@ -60,7 +60,7 @@ function launchArgs(model: string | undefined) {
 
 it('all bundled Pi definitions omit model and produce parent-model launch flags', () => {
   parent();
-  for (const name of ['worker', 'scout', 'researcher', 'workflow-subagent']) {
+  for (const name of ['worker', 'scout', 'researcher']) {
     const definition = __test__.loadAgentDefaults(name)!;
     assert.ok(definition, name);
     assert.equal(definition.model, undefined, name + ' must not pin a bundled model');
@@ -125,4 +125,8 @@ it('native CLI defaults never receive an incompatible Pi provider model', () => 
   assert.equal(__test__.resolveAgentModel(undefined, undefined, false), undefined);
   assert.equal(__test__.resolveAgentModel(undefined, 'native-model', false), 'native-model');
   assert.equal(__test__.resolveAgentModel('native-call', 'native-model', false), 'native-call');
+});
+
+it('bundled native CLI profiles leave model selection to native configuration', () => {
+  for (const name of ['codex-cli', 'claude-cli']) assert.equal(__test__.loadAgentDefaults(name)!.model, undefined);
 });

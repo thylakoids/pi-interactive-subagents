@@ -34,6 +34,7 @@ import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
+import { workflowExecution } from "./workflow/execution.ts";
 import { workflowSummary } from "./workflow/ui.ts";
 import type { WorkflowRunView } from "./workflow/types.ts";
 import { isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
@@ -1450,6 +1451,8 @@ async function launchSubagent(
     outputIsData?: boolean;
     /** Force a terminating child: nobody is watching this pane. */
     nonInteractive?: boolean;
+    /** Enforce single-step workflow permissions and output semantics. */
+    workflow?: boolean;
   },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1461,18 +1464,19 @@ async function launchSubagent(
   // current parent session, including model switches made after startup.
   // Native CLIs use their own defaults, not Pi provider/model identifiers.
   const effectiveModel = resolveAgentModel(params.model, agentDefs?.model, !cliKind);
+  const policy = options?.workflow ? workflowExecution(agentDefs) : undefined;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? sessionDefaults.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(
     params,
     agentDefs,
-    options?.nonInteractive ? false : undefined,
+    policy ? policy.interactive : options?.nonInteractive ? false : undefined,
   );
   // A caller with nobody watching the pane (a workflow) needs the child to end
   // on its own; a definition that does not auto-exit would otherwise wait for a
   // human who is never coming.
-  const effectiveAutoExit = options?.nonInteractive ? true : (agentDefs?.autoExit ?? false);
+  const effectiveAutoExit = policy?.autoExit ?? (options?.nonInteractive ? true : (agentDefs?.autoExit ?? false));
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1495,7 +1499,7 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  const launchBehavior = resolveLaunchBehavior(params, policy ? { ...agentDefs, sessionMode: policy.sessionMode } : agentDefs);
   assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
 
   // Use pre-created surface (parallel mode) or create a new one.
@@ -1529,7 +1533,7 @@ async function launchSubagent(
     // A workflow call consumes the final message as a *value*, so asking for a
     // summary is asking for the wrong thing: the caller wants the data, not a
     // report about the work. Callers that read the result as data say so.
-    const summaryInstruction = options?.outputIsData
+    const summaryInstruction = policy || options?.outputIsData
       ? "Your FINAL assistant message IS the return value: give the requested result itself, " +
         "as raw data. No preamble, no restating the task, no offer of further help."
       : effectiveAutoExit
@@ -1537,9 +1541,9 @@ async function launchSubagent(
         : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
     // An agent with a non-empty subagent_agents list is granted the spawning
     // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-    const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-    const identity = agentDefs?.body ?? null;
-    const systemPromptMode = agentDefs?.systemPromptMode;
+    const grantSpawning = !policy && !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+    const identity = policy?.identity ?? agentDefs?.body ?? null;
+    const systemPromptMode = policy?.systemPromptMode ?? agentDefs?.systemPromptMode;
     const identityInSystemPrompt = systemPromptMode && identity;
     const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
     const fullTask = inheritsConversationContext
@@ -1586,7 +1590,7 @@ async function launchSubagent(
     // spawning toolset), we disable global extension discovery and re-enable only
     // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
     // restriction keep their full default toolset and all global extensions.
-    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+    const toolAllowlist = policy?.toolAllowlist ?? buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
     // Snapshot the fully-resolved sandbox beside the session file so a later
     // `subagent_message({ name })` resume can replay the exact same
@@ -1600,7 +1604,7 @@ async function launchSubagent(
       thinking: effectiveThinking ?? null,
       systemPromptMode: systemPromptMode ?? null,
       identity: identityInSystemPrompt ? identity : null,
-      spawnable: agentDefs?.subagentAgents ?? null,
+      spawnable: policy ? null : agentDefs?.subagentAgents ?? null,
       autoExit: effectiveAutoExit,
       cwd: effectiveCwd ?? null,
       agentDir: resolvedAgentDir,

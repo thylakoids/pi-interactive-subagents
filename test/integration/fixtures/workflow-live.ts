@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import subagentsExtension from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { BUNDLED_WORKFLOWS_DIR } from '../../../pi-extension/subagents/workflow/script.ts';
+import { readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import type { WorkflowRunView } from '../../../pi-extension/subagents/workflow/types.ts';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -15,7 +16,7 @@ async function until(check: () => boolean, label: string, timeout = 240_000) {
   throw new Error('Timed out: ' + label);
 }
 const script = (name: string, body: string) =>
-  'export const meta = ' + JSON.stringify({ name, description: 'Live provider regression', agent: 'worker', phases: ['Recon', 'Verify'] }) + '\n' + body;
+  'export const meta = ' + JSON.stringify({ name, description: 'Live provider regression', phases: ['Recon', 'Verify'] }) + '\n' + body;
 
 export default function liveFixture(pi: any) {
   subagentsExtension(pi);
@@ -46,6 +47,14 @@ export default function liveFixture(pi: any) {
         for (const call of view.calls) {
           assert.equal(call.status, 'completed', call.label + ': ' + call.error);
           assert.ok(call.sessionFile && existsSync(call.sessionFile), 'Real child session must exist');
+          const loadout = readSubagentLoadout(call.sessionFile!)!;
+          assert.ok(loadout, 'Real workflow loadout must be persisted');
+          assert.equal(loadout.spawnable, null, 'Worker delegation must be removed for workflow steps');
+          assert.equal(loadout.autoExit, true);
+          assert.match(loadout.identity!, /Workflow execution contract/);
+          assert.equal(loadout.model, process.env.PI_TEST_MODEL, 'Unpinned worker inherits the parent model');
+          const tools = loadout.toolAllowlist!.split(',');
+          for (const denied of ['subagent', 'subagents_list', 'subagent_message', 'workflow', 'ask_question']) assert.ok(!tools.includes(denied), denied + ' must be unavailable');
           const rows = readFileSync(call.sessionFile!, 'utf8').trim().split('\n').map(line => JSON.parse(line));
           const responses = rows.filter(row => row.type === 'message' && row.message?.role === 'assistant');
           assert.ok(responses.some(row => row.message.usage?.input > 0 || row.message.usage?.output > 0), 'Must contain billed provider response, not a scripted reply');
@@ -127,7 +136,7 @@ export default function liveFixture(pi: any) {
 
         const recovery = await manager.start({
           source: script('live-recovery', `
-            const first = await agent("Use bash: echo done >> completed-side-effect. Reply COMPLETED_ONCE.", {label:'completed', phase:'Recon'});
+            const first = await agent("Use bash: echo done >> completed-side-effect. Reply COMPLETED_ONCE.", {agent:'workflow-subagent', label:'completed', phase:'Recon'});
             if (!first) throw new Error('First child failed');
             const second = await agent("Use bash to execute this exact command (timeout 240 seconds): echo started >> resume-attempts; while ! test -f allow-resume; do sleep 0.2; done; echo resumed >> resumed-side-effect. Reply RESUMED_OK.", {label:'interrupted', phase:'Verify'});
             return {first, second, epoch: Date.now()};
@@ -138,6 +147,7 @@ export default function liveFixture(pi: any) {
         await until(() => existsSync(join(dir, 'resume-attempts')), 'real second child blocks in bash before Abort');
         const originalCompleted = recovery.view().calls.find(call => call.label === 'completed')!;
         assert.equal(originalCompleted.status, 'completed');
+        assert.equal(originalCompleted.agentType, 'worker', 'Legacy script alias must actually launch worker');
         const oldPane = recovery.view().calls.find(call => call.label === 'interrupted')!.name!;
         recovery.abort('live regression: explicit user abort');
         const aborted = await execution;
