@@ -32,6 +32,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
+| `workflow` | Run a JavaScript program that orchestrates sub-agents deterministically (see [Dynamic workflows](#dynamic-workflows)) |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
@@ -82,15 +83,40 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
-## Review workflow
+## Dynamic workflows
 
-Use `/subagent review <scope and requirements>` to run independent correctness and combined
-code-quality/simplicity reviewers in parallel. The review orchestrator
-collects and deduplicates their findings, then asks a verifier to validate
-candidates before returning one report. Review does not apply fixes or run tests; it may read existing test code and results.
+`workflow` runs a plain-JavaScript orchestration script in a sandboxed QuickJS VM. Each
+`agent()` call inside it is an ordinary interactive sub-agent, so a fan-out of twelve
+reviewers is twelve real pi sessions in twelve panes you can watch, message, or stop.
 
-The four definitions are bundled in `agents/`; no global agent links are needed.
-See [review workflow](docs/review-workflow.md) for usage, configuration, and sources.
+```js
+export const meta = { name: "review-changes", description: "Review changed files", phases: ["Review", "Verify"] };
+
+const REVIEWERS = [{ key: "bugs", prompt: "..." }, { key: "perf", prompt: "..." }];
+const reviews = await parallel(REVIEWERS.map((r) => () => agent(r.prompt, { label: r.key, phase: "Review" })));
+```
+
+- **Deterministic replay.** Calls are journaled by content hash, so re-running the same
+  script with the same args replays finished calls instead of redoing them. Edit one call
+  and only it, plus everything after it, re-runs — `workflow({ action: "resume", runId })`.
+- **Observable on demand.** `ctrl+alt+w` (or `/workflow [runId]`) opens a panel with one run
+  on screen: name and status, progress, tokens and cost, and a row per agent with its live
+  activity — `f` jumps to a pane, `m` messages it, `x` stops it, `s` skips the call, `a`/`r`
+  aborts or resumes the run, `[`/`]` switch runs. It is windowed to the terminal height and
+  tracks its cursor by the call's identity, so a repaint never moves it. Nothing is drawn
+  above the editor: the panel repaints once a second only while a run is live and only when
+  the frame changed, and a settled run's elapsed time stays measured to its finish instead of
+  the clock.
+- **Fire and forget.** The tool returns a run id immediately; the main session is woken
+  once when the run settles. The main context never holds the intermediate results.
+
+Scripts see `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget` and
+`workflow` — nothing else: no filesystem, network, timers, or `Date.now()`.
+
+See [dynamic workflows](docs/workflow.md) for the script contract, saved workflows,
+resume semantics and limits, and [examples/workflows](examples/workflows) for runnable
+scripts. `docs/workflow-parity.md` compares this implementation against Claude Code's,
+from extracted evidence.
 
 ## Custom agents
 

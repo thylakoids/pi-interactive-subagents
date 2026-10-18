@@ -4,11 +4,11 @@
 
 Before updating or synchronizing a checkout, inspect HEAD, the working tree, and local versus remote history. Preserve local commits and uncommitted work. Pi's Git package updates may reset and clean the checkout; use Git to synchronize development work rather than assuming the remote branch supersedes local changes.
 
-## Review agents
+## Agent definitions
 
-Agent definitions live in `agents/`. The `review` entry point dispatches correctness and combined code-quality/simplicity reviewers in parallel, then verifies candidate findings. See [docs/review-workflow.md](docs/review-workflow.md).
-
-Review is read-only and does not run tests or other executable checks. Discuss changes to review rules or configured models before implementing them.
+Agent definitions live in `agents/`. A multi-agent job — a review, a migration, a research
+sweep — is a [workflow](docs/workflow.md) script, not a dedicated agent definition: the script
+carries the orchestration, and each `agent()` call names an ordinary definition from `agents/`.
 
 ## Public documentation
 
