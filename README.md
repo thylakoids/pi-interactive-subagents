@@ -82,8 +82,8 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **scout** | *(inherits session)* | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | *(inherits session)* | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **researcher** | *(inherits session)* | `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `source_check`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 | **workflow-subagent** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls` | Default for a workflow `agent()` call that names no agent; returns its final message as data |
 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
@@ -181,7 +181,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Optional override; omit to inherit the main session's current model (Pi agents). A call's explicit `model` takes precedence |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
