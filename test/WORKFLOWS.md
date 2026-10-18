@@ -44,3 +44,29 @@ and whether an LLM chooses an appropriate workflow require separate provider run
   or completion order, then assert the result and absence of new agent launches.
 - Preserve focused smoke tests for diagnosis, but use behavioral assertions for
   correctness claims. Add a failing fault-injection case for critical regressions.
+
+## Live-provider end-to-end checks (billed, explicit opt-in)
+
+```sh
+PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model \
+  node --test test/integration/workflow-live.test.ts
+```
+
+Without the opt-in variable this test skips, including during normal integration
+runs. It uses the production subagent service and real provider-backed Pi sessions,
+not a replacement service. Temporary project-local definitions select the requested
+model and ordinary read/edit/bash tools; both old template scripts run unchanged.
+
+The suite independently checks:
+- Review finds an injected boundary bug and a separate model verifies it.
+- Migration plans, edits and verifies two actual files; Node acceptance tests pass.
+- Fast Verify executes its real tool while slow Recon is blocked on a file gate.
+  The host releases that gate only after observing the next-stage side effect.
+- Abort stops a real blocked child. A new manager resumes from disk, reuses the
+  completed session without repeating its side effect, and retries the interrupted
+  call in a new session exactly once.
+
+A child session must contain actual provider usage and tool calls; a successful
+workflow status alone is insufficient. The test prints its temporary artifact
+directory and retains session files, snapshots, journals, marker files and events,
+on both success and failure. Its tmux session is stopped during teardown.

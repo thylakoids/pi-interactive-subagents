@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 
-export async function cleanupSession(session: string, dir: string) {
+export async function cleanupSession(session: string, dir: string, options: { preserveArtifacts?: boolean } = {}) {
   const pids = new Set<number>();
   try {
     const roots = execFileSync('tmux', ['list-panes', '-s', '-t', session, '-F', '#{pane_pid}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -25,5 +25,5 @@ export async function cleanupSession(session: string, dir: string) {
   while (alive().length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
   const remaining = alive();
   if (remaining.length) throw new Error('Terminal processes did not exit; preserving test artifacts at ' + dir + ': ' + remaining.join(', '));
-  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  if (!options.preserveArtifacts) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
