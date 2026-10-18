@@ -110,14 +110,15 @@ const reviews = await parallel(REVIEWERS.map((r) => () => agent(r.prompt, { labe
   Claude Code — while a malformed one (unknown agent, misspelled option, unsatisfiable schema)
   fails the run before it spends anything. The settled report names every call that came back
   empty instead of counting it as done.
-- **Observable on demand.** `ctrl+alt+w` (or `/workflow [runId]`) opens a panel with one run
-  on screen: name and status, progress, tokens and cost, and a row per agent with its live
-  activity — `f` jumps to a pane, `m` messages it, `x` stops it, `s` skips the call, `a`/`r`
-  aborts or resumes the run, `[`/`]` switch runs. It is windowed to the terminal height and
-  tracks its cursor by the call's identity, so a repaint never moves it. Nothing is drawn
-  above the editor: the panel repaints once a second only while a run is live and only when
-  the frame changed, and a settled run's elapsed time stays measured to its finish instead of
-  the clock.
+- **Observable on demand.** The existing Subagents widget keeps its running-agent list and
+  adds workflow progress, usage and a shortcut hint. `ctrl+alt+w` (or `/workflow [runId]`)
+  opens a centered, bordered tree: workflow → phase → subagent → action. Press the shortcut
+  again to close it, including from confirmation pages. Navigate with
+  arrows or `hjkl`, expand with Enter, and choose Focus or Skip beneath a call. Focus also
+  reopens a completed agent's original session without sending a message. Abort and Resume
+  belong to the workflow; changes to execution require confirmation. Selection and expansion
+  survive reopening, and settled durations stay frozen. The details tree has no progress bar,
+  usage block or keyboard-hint footer.
 - **Fire and forget.** The tool returns a run id immediately; the main session is woken
   once when the run settles. The main context never holds the intermediate results.
 

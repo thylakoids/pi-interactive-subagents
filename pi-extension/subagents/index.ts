@@ -26,12 +26,16 @@ import {
   currentTree,
   startSurfaceProcess,
   pasteMessage,
+  focusSurface,
+  surfaceExists,
 } from "./tmux.ts";
 
 import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
+import { workflowSummary } from "./workflow/ui.ts";
+import type { WorkflowRunView } from "./workflow/types.ts";
 import { isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
 
 import {
@@ -788,6 +792,8 @@ function captureSessionDefaults(pi: ExtensionAPI): void {
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
+let workflowViews: () => WorkflowRunView[] = () => [];
+let workflowShortcut = "Ctrl+Alt+W";
 
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
@@ -859,7 +865,10 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+function renderSubagentWidgetLines(
+  agents: RunningSubagent[], width: number,
+  views: WorkflowRunView[] = workflowViews(), shortcut = workflowShortcut,
+): string[] {
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -868,7 +877,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
-    const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    const agentTag = agent.agent && agent.agent !== "workflow-subagent" ? ` (${agent.agent})` : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
     const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
@@ -881,12 +890,19 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     lines.push(borderLine(left, right, width));
   }
 
+  const workflows = views.filter(view => view.status === "running");
+  for (const view of workflows) {
+    for (const line of workflowSummary(view, Math.max(1, width - 4))) {
+      lines.push(borderLine(` ${line.replace(/^([▰▱]+)/, `${ICON_DIM}$1${RST}`)}`, "", width));
+    }
+  }
+  if (workflows.length) lines.push(borderLine(` ${shortcut} details`, "", width));
   lines.push(borderBottom(width));
   return lines;
 }
 
 function updateWidget() {
-  if (runningSubagents.size === 0) {
+  if (runningSubagents.size === 0 && !workflowViews().some(view => view.status === "running")) {
     if (latestCtx?.hasUI) latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1324,6 +1340,93 @@ function finishCommand(command: string): string {
   return `${command}; status=$?; tmux set-option -p -t "$TMUX_PANE" -u @pi_subagent 2>/dev/null; echo '__SUBAGENT_DONE_'$status'__'`;
 }
 
+const openingSessions = new Set<string>();
+
+/** Open the original session without a prompt or an auto-exit workflow contract. */
+async function focusSubagentSession(name: string, savedSession?: string): Promise<{ ok: true } | { error: string }> {
+  let surface: string | undefined;
+  let sessionPath: string | undefined;
+  let ownsOpening = false;
+  try {
+    const current = [...runningSubagents.values()].find(r =>
+      r.name === name || (savedSession && resolve(r.sessionFile) === resolve(savedSession)));
+    if (current) {
+      if (!surfaceExists(current.surface)) throw new Error("The previous session is still closing. Try again shortly.");
+      focusSurface(current.surface);
+      return { ok: true };
+    }
+    if (!latestCtx) throw new Error("No active parent session.");
+    const artifactDir = getArtifactDir(latestCtx.sessionManager.getSessionDir(), latestCtx.sessionManager.getSessionId());
+    const entry = resolveNameInRegistry(artifactDir, name);
+    sessionPath = savedSession ?? entry?.sessionFile;
+    if (!sessionPath || !existsSync(sessionPath)) throw new Error("The original session file is unavailable.");
+    sessionPath = resolve(sessionPath);
+    if (openingSessions.has(sessionPath)) throw new Error("This session is already opening.");
+    openingSessions.add(sessionPath);
+    ownsOpening = true;
+    const external = readExternalSession(sessionPath);
+    if (external) {
+      if (!external.nativeId) throw new Error("The original native CLI session ID is unavailable.");
+      surface = createSurface(name);
+      const running = launchExternalSubagent({
+        id: randomUUID().slice(0, 8), name, task: "", prompt: "", sessionFile: sessionPath,
+        artifactDir, surface, startTime: Date.now(), session: { ...external, autoExit: false },
+        resume: true, interactive: true, noPrompt: true,
+      });
+      const controller = new AbortController();
+      running.abortController = controller;
+      void watchSubagent(running, controller.signal).finally(() => updateWidget());
+      startWidgetRefresh();
+      focusSurface(surface);
+      return { ok: true };
+    }
+    const loadout = readSubagentLoadout(sessionPath);
+    if (!loadout) throw new Error("The original sandbox snapshot is unavailable.");
+    surface = createSurface(name);
+    const id = randomUUID().slice(0, 8);
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    mkdirSync(dirname(activityFile), { recursive: true });
+    const parts = ["pi", "--session", shellEscape(sessionPath), "-e", shellEscape(join(SUBAGENTS_DIR, "subagent-done.ts"))];
+    applySandboxToParts(parts, loadout, { artifactDir, name });
+    // Explicitly clear inherited workflow contracts; viewing must stay interactive.
+    const env = ["env", "-u", "PI_SUBAGENT_AUTO_EXIT", "-u", "PI_SUBAGENT_SCHEMA_FILE", "-u", "PI_SUBAGENT_RESULT_FILE", "-u", "PI_SUBAGENT_AGENT",
+      `PI_SUBAGENT_NAME=${shellEscape(name)}`, `PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`,
+      `PI_SUBAGENT_ID=${shellEscape(id)}`, `PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`];
+    const agentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR;
+    if (agentDir) env.push(`PI_CODING_AGENT_DIR=${shellEscape(agentDir)}`);
+    env.push(`PI_SUBAGENT_ALLOWED=${shellEscape((loadout.spawnable ?? []).join(","))}`);
+    if (loadout.agent) env.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
+    const tree = currentTree();
+    if (tree) env.push(`PI_SUBAGENT_TREE=${shellEscape(tree)}`);
+    const command = finishCommand(`${loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : ""}${env.join(" ")} ${parts.join(" ")}`);
+    const scriptPath = join(artifactDir, "subagent-scripts", `${id}-focus.sh`);
+    mkdirSync(dirname(scriptPath), { recursive: true });
+    writeFileSync(scriptPath, `#!/bin/bash\n${command}\n`, { mode: 0o700 });
+    // respawn-pane starts the script directly, avoiding shell-startup input races.
+    startSurfaceProcess(surface, scriptPath);
+    const startTime = Date.now();
+    const running: RunningSubagent = {
+      id, name, task: "", agent: loadout.agent ?? undefined, surface, startTime, sessionFile: sessionPath,
+      launchScriptFile: scriptPath, activityFile, interactive: true,
+      statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+    };
+    runningSubagents.set(id, running);
+    const controller = new AbortController();
+    running.abortController = controller;
+    void watchSubagent(running, controller.signal).finally(() => updateWidget());
+    startWidgetRefresh();
+    focusSurface(surface);
+    return { ok: true };
+  } catch (error: any) {
+    if (surface && ![...runningSubagents.values()].some(r => r.surface === surface)) {
+      try { closeSurface(surface); } catch {}
+    }
+    return { error: `Cannot focus ${name}: ${error?.message ?? String(error)}` };
+  } finally {
+    if (ownsOpening && sessionPath) openingSessions.delete(sessionPath);
+  }
+}
+
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -1618,20 +1721,21 @@ function launchExternalSubagent(params: {
   id: string; name: string; task: string; prompt: string; agent?: string;
   sessionFile: string; artifactDir: string; surface: string; startTime: number;
   session: ExternalCliSession; resume: boolean; interactive: boolean;
+  noPrompt?: boolean;
 }): RunningSubagent {
   const runDir = join(params.artifactDir, "cli-runs", params.id);
   mkdirSync(runDir, { recursive: true });
   const taskFile = join(runDir, "task.md");
   const sentinelFile = join(runDir, "result.json");
   const launchScriptFile = join(runDir, "launch.sh");
-  const prompt = prepareExternalPrompt(params.session.kind, params.prompt);
+  const prompt = params.noPrompt ? "" : prepareExternalPrompt(params.session.kind, params.prompt);
   writeFileSync(taskFile, prompt, { mode: 0o600 });
-  writeFileSync(`${sentinelFile}.inputs.json`, JSON.stringify([prompt]), { mode: 0o600 });
-  appendUserMessage(params.sessionFile, params.task);
+  writeFileSync(`${sentinelFile}.inputs.json`, JSON.stringify(params.noPrompt ? [] : [prompt]), { mode: 0o600 });
+  if (!params.noPrompt) appendUserMessage(params.sessionFile, params.task);
   const command = prepareExternalLaunch({ session: params.session,
     sessionFile: params.sessionFile, resultFile: sentinelFile, taskFile,
     hookFile: join(SUBAGENTS_DIR, "cli-hook.mjs"),
-    settingsFile: join(runDir, "claude-settings.json"), resume: params.resume });
+    settingsFile: join(runDir, "claude-settings.json"), resume: params.resume, noPrompt: params.noPrompt });
   writeFileSync(launchScriptFile, "#!/bin/bash\n" + command + "\n", { mode: 0o700 });
   startSurfaceProcess(params.surface, launchScriptFile);
   const running: RunningSubagent = {
@@ -1810,6 +1914,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    latestCtx = null;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2501,10 +2606,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }),
       agentDir: getAgentConfigDir,
       cwd: () => latestCtx?.cwd ?? process.cwd(),
+      focus: focusSubagentSession,
     };
     const workflowService = createWorkflowSubagentService(surface);
     (globalThis as any).__pi_interactive_subagents.workflow = workflowService;
-    registerWorkflowExtension(pi, { service: workflowService });
+    registerWorkflowExtension(pi, {
+      service: workflowService,
+      widget: {
+        bind: (views, shortcut) => {
+          workflowViews = views;
+          workflowShortcut = shortcut.split("+").map(part => part === "ctrl" ? "Ctrl" : part === "alt" ? "Alt" : part.toUpperCase()).join("+");
+        },
+        refresh: () => { updateWidget(); startWidgetRefresh(); },
+      },
+    });
   } catch (error: any) {
     pi.on("session_start", (_event, ctx) => {
       ctx.ui.notify(

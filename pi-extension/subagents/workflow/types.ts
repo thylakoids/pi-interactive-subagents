@@ -270,7 +270,7 @@ export interface WorkflowSubagentService {
   /** Stop a running agent by its display name (closes its pane). */
   stop(name: string): void;
   /** Bring the agent's pane into view, running or finished. */
-  focus(name: string): { ok: true } | { error: string };
+  focus(name: string, sessionFile?: string): { ok: true } | { error: string } | Promise<{ ok: true } | { error: string }>;
   /** Live status line for a running agent, for the observability panel. */
   status(name: string): WorkflowSubagentLiveStatus | undefined;
   /** Names already taken in this session, so workflow names never collide. */

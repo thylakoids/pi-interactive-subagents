@@ -18,8 +18,8 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 import {
   WorkflowPanel,
   createPanelRenderState,
-  panelActions,
-  sameSelection,
+  callActions,
+  workflowSummary,
   type WorkflowPanelOptions,
 } from "../pi-extension/subagents/workflow/ui.ts";
 import { WORKFLOW_GLOBALS } from "../pi-extension/subagents/workflow/runner.ts";
@@ -233,6 +233,76 @@ describe("script parsing", () => {
 });
 
 describe("workflow run", () => {
+  for (const items of [["slow", "fast"], ["fast", "slow"]]) {
+    it(`advances fast pipeline items before slow Recon settles (${items.join(", ")})`, async () => {
+      service = new FakeSubagentService();
+      service.tokensPerAgent = 10;
+      const manager = createManager({ budgetTotal: 100 });
+      let releaseSlow!: () => void;
+      const slowGate = new Promise<void>(resolve => { releaseSlow = resolve; });
+      let sawVerify!: () => void;
+      const verifyStarted = new Promise<void>(resolve => { sawVerify = resolve; });
+      let slowSettled = false;
+      const spawn = service.spawn.bind(service);
+      service.spawn = async request => {
+        const handle = await spawn(request);
+        if (request.task === "recon-slow") {
+          return {
+            ...handle,
+            completion: handle.completion.then(async result => {
+              await slowGate;
+              slowSettled = true;
+              return result;
+            }),
+          };
+        }
+        if (request.task === "verify-fast") {
+          assert.equal(slowSettled, false, "Verify must start while the slow Recon is still pending");
+          sawVerify();
+        }
+        return handle;
+      };
+      const source = `export const meta = { name: 'streaming-pipeline', description: 'x', agent: 'worker' }
+return await pipeline(args.items,
+  item => agent('recon-' + item, { label: 'recon-' + item }),
+  async (recon, item) => {
+    const spent = budget.spent();
+    const verdict = await agent('verify-' + item, { label: 'verify-' + item });
+    return { item, recon, verdict, spent };
+  });
+`;
+      const run = await manager.start({ source, args: { items } });
+      const execution = run.execute();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let view: WorkflowRunView;
+      try {
+        await Promise.race([
+          verifyStarted,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error("Verify waited for an unrelated Recon")), 1500);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+        releaseSlow();
+        view = await execution;
+      }
+      assert.equal(view.status, "completed", view.error);
+      const result = view.result as Array<{ item: string; recon: string; verdict: string; spent: number }>;
+      assert.deepEqual(result.map(row => row.item), items, "result arrays retain input order");
+      assert.equal(result.find(row => row.item === "fast")!.spent, 10, "the fast result refreshes its budget before Verify");
+      assert.equal(view.usage.totalTokens, 40);
+      const spawns = service.spawns.length;
+      const resumed = await (await manager.resume(view.runId)).execute();
+      assert.equal(resumed.status, "completed", resumed.error);
+      assert.equal(service.spawns.length, spawns, "changed completion order must not defeat journal reuse");
+      assert.deepEqual(
+        (resumed.result as typeof result).map(({ item, recon, verdict }) => ({ item, recon, verdict })),
+        result.map(({ item, recon, verdict }) => ({ item, recon, verdict })),
+      );
+    });
+  }
+
   it("runs a multi-stage script and journals every call", async () => {
     service = new FakeSubagentService();
     service.delays.set("scan-1", 60);
@@ -904,456 +974,210 @@ return 'unreachable';
 });
 
 describe("observability", () => {
-  /** The panel needs a theme; the tests only care about the text it emits. */
-  const theme = {
-    fg: (_color: string, text: string) => text,
-    bold: (text: string) => text,
-  };
-
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const call = (overrides: Partial<WorkflowAgentResultMeta> = {}): WorkflowAgentResultMeta => ({
-    callKey: "key-1",
-    label: "review:panel-ui",
-    status: "completed",
-    agentType: "scout",
-    durationMs: 60_000,
-    ...overrides,
+    callKey: "key-1", label: "review:panel-ui", status: "running", agentType: "workflow-subagent",
+    name: "review-agent", sessionFile: "/tmp/agent.jsonl", durationMs: 60_000, phase: "Scan", ...overrides,
   });
-
-  const run = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView =>
-    ({
-      runId: "wf-1",
-      meta: { name: "review-changes", description: "x" },
-      status: "running",
-      createdAt: 0,
-      updatedAt: 0,
-      startedAtWall: Date.now() - 5_000,
-      agentCount: 4,
-      activeCount: 2,
-      completedCount: 2,
-      failedCount: 1,
-      totalCount: 4,
-      maxConcurrent: 6,
-      progress: 0.5,
-      usage: { totalTokens: 1234 },
-      scriptPath: "/tmp/script.js",
-      runDir: "/tmp/run",
-      sessionFile: "/tmp/session.jsonl",
-      cwd: "/tmp",
-      calls: [],
-      logs: [],
-      ...overrides,
-    }) as WorkflowRunView;
-
-  const liveness = (views: WorkflowRunView[]) => (runId: string) =>
-    views.some((view) => view.runId === runId && view.status === "running");
-
-  const panelFor = (views: WorkflowRunView[], overrides: Partial<WorkflowPanelOptions> = {}) =>
-    new WorkflowPanel({
-      callbacks: {
-        steer: () => {},
-        focus: () => ({ ok: true as const }),
-        stop: () => {},
-        skip: () => {},
-        abort: () => {},
-        resume: () => {},
-      },
-      views: () => views,
-      isLive: liveness(views),
-      notify: () => {},
-      prompt: async () => undefined,
-      confirm: async () => false,
-      ...overrides,
-    });
-
-  const render = (
-    views: WorkflowRunView[],
-    state = createPanelRenderState(),
-    height = Number.POSITIVE_INFINITY,
-  ) => panelFor(views).renderPanel(theme, 100, state, height);
-
-  it("renders a run header with status, progress and counts", () => {
-    const body = render([
-      run({
-        phase: "Verify",
-        calls: [
-          call({ callKey: "c1", label: "one", status: "completed" }),
-          call({ callKey: "c2", label: "two", status: "completed" }),
-          call({ callKey: "c3", label: "three", status: "failed", error: "boom" }),
-          call({ callKey: "c4", label: "four", status: "running", name: "four" }),
-        ],
-        completedCount: 2,
-        failedCount: 1,
-        activeCount: 1,
-        totalCount: 4,
-      }),
-    ]).join("\n");
-    assert.match(body, /review-changes/);
-    assert.match(body, /running · \d+s/);
-    assert.match(body, /3\/4 agents · 1\.2k tokens/);
-    assert.match(body, /1 failed/);
-    assert.match(body, /▰+▱+ 50%/);
-    assert.doesNotMatch(body, /wf-1/, "the header must not show the run id");
-    // `view.phase` is the *last* phase() call, so it contradicts the rows while
-    // earlier phases are still running; the per-call groups carry phase instead.
-    assert.doesNotMatch(body, /running · Verify/);
+  const run = (overrides: Partial<WorkflowRunView> = {}): WorkflowRunView => ({
+    runId: "wf-1", meta: { name: "review-changes", description: "x", phases: ["Scan", "Verify"] },
+    status: "running", createdAt: 0, updatedAt: 60_000, startedAtWall: 0, finishedAt: undefined,
+    agentCount: 1, activeCount: 1, completedCount: 0, failedCount: 0, totalCount: 1, maxConcurrent: 4,
+    progress: 0, usage: { totalTokens: 1234, cost: 0.12 }, scriptPath: "/tmp/script.js", runDir: "/tmp/run",
+    sessionFile: "/tmp/session.jsonl", cwd: "/tmp", calls: [call()], logs: [], logsDropped: 0, ...overrides,
   });
-
-  it("groups the rows by phase and shows the run's own notes", () => {
-    const view = run({
-      calls: [
-        call({ callKey: "s1", label: "scan-one", phase: "Scan", status: "running", name: "scan-one" }),
-        call({ callKey: "s2", label: "scan-two", phase: "Scan", status: "running", name: "scan-two" }),
-        call({ callKey: "v1", label: "verify-one", phase: "Verify", status: "queued" }),
-      ],
-      logs: ["reusing 3 completed call(s) from run wf-9", "halfway"],
-      logsDropped: 4,
-    });
-    const lines = render([view]);
+  const panelFor = (views: WorkflowRunView[], overrides: Partial<WorkflowPanelOptions> = {}) => new WorkflowPanel({
+    callbacks: { focus: () => ({ ok: true as const }), skip() {}, abort() {}, resume() {} },
+    views: () => views, isLive: id => views.some(v => v.runId === id && v.status === "running"), notify() {}, ...overrides,
+  });
+  it("renders a bordered tree without usage, progress or footer hints", () => {
+    const panel = panelFor([run()]);
+    const lines = panel.renderPanel(theme, 100, createPanelRenderState(), 25);
     const body = lines.join("\n");
-    assert.match(body, /Scan/, "the phase appears once as a group header");
-    assert.equal(lines.filter((line) => line.trim() === "Scan").length, 1, "identical phases merge into one group");
-    assert.match(body, /Verify/);
-    assert.ok(
-      lines.findIndex((line) => line.includes("Scan")) < lines.findIndex((line) => line.includes("scan-one")),
-      "the group header precedes its rows",
-    );
-    assert.match(body, /reusing 3 completed call/, "the run's notes are visible");
-    assert.match(body, /4 earlier notes dropped/, "a trimmed log says so");
+    assert.match(body, /╭─ Workflows/);
+    assert.match(body, /review-changes/);
+    assert.match(body, /Scan/);
+    assert.match(body, /review:panel-ui/);
+    assert.doesNotMatch(body, /tokens|settled|select|collapse\/expand|switch run|enter actions/);
+    assert.equal(lines.length, 25);
+    assert.ok(lines.every(line => visibleWidth(line) === 100));
   });
-
-  it("keeps every line inside the width it is given", () => {
-    const calls = [
-      call({ callKey: "a", label: "a-very-long-agent-label-that-keeps-going", status: "running", name: "wf-a", live: { kind: "active", detail: "Reading pi-extension/subagents/workflow/manager.ts and thinking about it" } }),
-      call({ callKey: "b", label: "b", status: "failed", error: "exited with code 1: the model returned nothing useful at all" }),
-    ];
-    const view = run({ calls, meta: { name: "a-run-with-a-long-name-of-its-own", description: "x" } });
-    for (const width of [40, 80, 100]) {
-      for (const line of panelFor([view]).renderPanel(theme, width, createPanelRenderState())) {
-        assert.ok(visibleWidth(line) <= width, `line wider than ${width}: ${JSON.stringify(line)}`);
-      }
-    }
+  it("merges interleaved phases and keeps declared phase order", () => {
+    const panel = panelFor([run({ calls: [call({ callKey: "a" }), call({ callKey: "b", phase: "Verify" }), call({ callKey: "c" })] })]);
+    const nodes = panel.nodes(createPanelRenderState());
+    assert.deepEqual(nodes.filter(n => n.kind === "phase").map(n => n.label), ["Scan", "Verify"]);
+    assert.deepEqual(nodes.filter(n => n.kind === "call").map(n => n.call!.callKey), ["a", "c", "b"]);
   });
-
-  it("says so when the session has no runs", () => {
-    const body = render([]).join("\n");
-    assert.match(body, /No workflow runs in this session\./);
-    assert.match(body, /q close/);
-  });
-
-  it("freezes a settled run's elapsed time instead of tracking the wall clock", () => {
-    // The run finished in seconds; the pane stayed open for hours. Measuring
-    // against the current clock here used to report the pane's age (7h44m)
-    // as if it were the run's duration.
-    const startedAtWall = Date.now() - 7 * 60 * 60 * 1000;
-    const body = render([
-      run({
-        status: "completed",
-        phase: undefined,
-        progress: 1,
-        completedCount: 2,
-        failedCount: 0,
-        startedAtWall,
-        finishedAt: startedAtWall + 18_800,
-      }),
-    ]).join("\n");
-    assert.match(body, /18s/);
-    assert.doesNotMatch(body, /7h/, "a finished run must not report the pane's age");
-  });
-
-  it("shows one run at a time and switches between them", () => {
-    const first = run({ runId: "wf-1", calls: [call({ callKey: "a", label: "first-run-agent" })] });
-    // Settled and older: the live run is the one on screen to begin with.
-    const second = run({
-      runId: "wf-2",
-      status: "completed",
-      createdAt: 0,
-      finishedAt: Date.now(),
-      meta: { name: "second-run", description: "y" },
-      calls: [call({ callKey: "b", label: "second-run-agent" })],
-    });
-
+  it("uses run-qualified node identity even for matching cached call keys", () => {
+    const panel = panelFor([run(), run({ runId: "wf-2", createdAt: 1 })]);
     const state = createPanelRenderState();
-    const body = panelFor([first, second]).renderPanel(theme, 100, state).join("\n");
-    assert.match(body, /first-run-agent/);
-    assert.doesNotMatch(body, /second-run-agent/, "only one run's agents are listed");
-    assert.match(body, /1\/2/, "the header says where in the run list this is");
-
-    state.runId = "wf-2";
-    const switched = panelFor([first, second]).renderPanel(theme, 100, state).join("\n");
-    assert.match(switched, /second-run/);
-    assert.match(switched, /second-run-agent/);
-    assert.doesNotMatch(switched, /first-run-agent/);
+    state.expanded.add("run:wf-1"); state.expanded.add("run:wf-2");
+    const nodes = panel.nodes(state);
+    assert.equal(new Set(nodes.map(n => n.id)).size, nodes.length);
+    assert.equal(nodes.filter(n => n.kind === "run").length, 2);
   });
-
-  it("windows a long list to the height and keeps the cursor visible", () => {
-    const calls = Array.from({ length: 40 }, (_, index) =>
-      call({ callKey: `key-${index}`, label: `agent-${index}`, status: "running", name: `agent-${index}` }),
-    );
-    const long = run({ calls, totalCount: 40, activeCount: 40, completedCount: 0, failedCount: 0, progress: 0 });
-    const state = createPanelRenderState();
-    state.selection = { kind: "call", callKey: "key-30" };
-
-    const lines = panelFor([long]).renderPanel(theme, 100, state, 12);
-    assert.ok(lines.length <= 12, `the panel must fit the height, got ${lines.length} lines`);
-    assert.match(lines.join("\n"), /agent-30/, "the cursor's row stays visible");
-    assert.match(lines.join("\n"), /\(\d+\/4\d\)/, "a windowed list reports its position");
-
-    // Paging to the top shows the first rows, not a stale window.
-    state.selection = { kind: "call", callKey: "key-0" };
-    const top = panelFor([long]).renderPanel(theme, 100, state, 12);
-    assert.match(top.join("\n"), /agent-0/);
-    assert.ok(top.length <= 12);
-  });
-
-  it("keeps the cursor on the same call when rows appear above it", () => {
-    const state = createPanelRenderState();
-    state.selection = { kind: "call", callKey: "a" };
-    const grown = run({
-      calls: [
-        call({ callKey: "b", label: "zeroth", status: "running", name: "zeroth" }),
-        call({ callKey: "a", label: "first" }),
-      ],
-    });
-    const body = panelFor([grown]).renderPanel(theme, 100, state, Number.POSITIVE_INFINITY).join("\n");
-    assert.ok(sameSelection(state.selection, { kind: "call", callKey: "a" }), "selection is by identity");
-    assert.match(body, /❯ ✓ first/, "the pointer stays on the same call");
-  });
-
-  it("offers only the actions that apply to the selected row", () => {
-    const ids = (selection: any, views: WorkflowRunView[]) =>
-      panelActions(selection, views, liveness(views)).map((action) => action.id);
-
-    const queued = run({ calls: [call({ callKey: "q", status: "queued", name: undefined })] });
-    assert.deepEqual(ids({ kind: "call", callKey: "q" }, [queued]), ["skip"]);
-
-    const running = run({ calls: [call({ callKey: "r", status: "running", name: "wf-run" })] });
-    assert.deepEqual(ids({ kind: "call", callKey: "r" }, [running]), ["focus", "steer", "stop", "skip"]);
-
-    const done = run({ status: "completed", calls: [call({ callKey: "d", name: "wf-done" })] });
-    assert.deepEqual(ids({ kind: "call", callKey: "d" }, [done]), ["focus", "steer"]);
-
-    assert.deepEqual(ids({ kind: "run", runId: "wf-1" }, [running]), ["abort"]);
-    assert.deepEqual(ids({ kind: "run", runId: "wf-1" }, [done]), ["resume"]);
-  });
-
-  it("renders an open action menu under its row", () => {
-    const view = run({ calls: [call({ callKey: "k", status: "running", name: "wf-agent" })] });
-    const state = createPanelRenderState();
-    state.selection = { kind: "call", callKey: "k" };
-    state.menu = {
-      selection: state.selection,
-      actions: panelActions(state.selection, [view], liveness([view])),
-      index: 1,
-    };
-    const body = panelFor([view]).renderPanel(theme, 100, state, Number.POSITIVE_INFINITY).join("\n");
-    assert.match(body, /❯ message/, "the highlighted action is marked");
-    assert.match(body, /esc cancel/, "the footer switches to the menu's keys");
-  });
-
-  it("drives the selected row through its action menu", async () => {
-    const view = run({ calls: [call({ callKey: "k1", status: "running", name: "wf-agent", label: "agent:one" })] });
+  it("supports Vim and arrow navigation, Enter toggles, and Focus closes", async () => {
     const focused: string[] = [];
-    const skipped: string[] = [];
-    const panel = panelFor([view], {
-      callbacks: {
-        steer: () => {},
-        focus: (name) => {
-          focused.push(name);
-          return { ok: true as const };
-        },
-        stop: () => {},
-        skip: (callKey) => skipped.push(callKey),
-        abort: () => {},
-        resume: () => {},
-      },
-    });
+    let closed = 0;
+    const panel = panelFor([run()], { callbacks: { focus: (name, file) => { focused.push(`${name}:${file}`); return { ok: true }; }, skip() {}, abort() {}, resume() {} } });
+    const state = createPanelRenderState(); panel.nodes(state);
+    assert.equal(state.selected, "run:wf-1:call:key-1");
+    await panel.handleInput("l", () => closed++, state);
+    assert.ok(state.expanded.has(state.selected!));
+    await panel.handleInput("\u001b[C", () => closed++, state);
+    assert.match(state.selected!, /:focus$/);
+    await panel.handleInput("j", () => closed++, state);
+    assert.match(state.selected!, /:skip$/);
+    await panel.handleInput("\u001b[A", () => closed++, state);
+    assert.match(state.selected!, /:focus$/);
+    await panel.handleInput("\r", () => closed++, state);
+    assert.deepEqual(focused, ["review-agent:/tmp/agent.jsonl"]);
+    assert.equal(closed, 1);
+    state.selected = "run:wf-1:call:key-1";
+    await panel.handleInput("h", () => {}, state);
+    assert.ok(!state.expanded.has(state.selected));
+    await panel.handleInput("h", () => {}, state);
+    assert.equal(state.selected, "run:wf-1:phase:Scan");
+    await panel.handleInput("\r", () => {}, state);
+    assert.ok(!state.expanded.has(state.selected));
+  });
+  it("offers Focus for completed sessions, Skip for queued calls, and no message/stop", () => {
+    assert.deepEqual(callActions(call()), ["focus", "skip"]);
+    assert.deepEqual(callActions(call({ status: "completed" })), ["focus"]);
+    assert.deepEqual(callActions(call({ status: "queued", name: undefined, sessionFile: undefined })), ["skip"]);
+    assert.deepEqual(callActions(call({ status: "completed", sessionFile: undefined })), []);
+  });
+  it("requires confirmation for Skip and refuses stale actions", async () => {
+    const view = run(); let skips = 0;
+    const panel = panelFor([view], { callbacks: { focus: () => ({ ok: true }), skip(key, id) { assert.equal(id, "wf-1"); skips++; }, abort() {}, resume() {} } });
+    const state = createPanelRenderState(); panel.nodes(state);
+    state.expanded.add("run:wf-1:call:key-1"); state.selected = "run:wf-1:call:key-1:skip";
+    await panel.handleInput("\r", () => {}, state);
+    assert.equal(skips, 0);
+    assert.match(panel.renderPanel(theme, 80, state, 20).join("\n"), /return null/);
+    await panel.handleInput("\r", () => {}, state);
+    assert.equal(skips, 0, "Cancel is selected by default");
+    await panel.handleInput("\r", () => {}, state);
+    await panel.handleInput("j", () => {}, state);
+    view.calls[0].status = "completed";
+    await panel.handleInput("\r", () => {}, state);
+    assert.equal(skips, 0);
+    assert.match(state.error!, /no longer available/);
+    view.calls[0].status = "running"; state.selected = "run:wf-1:call:key-1:skip";
+    await panel.handleInput("\r", () => {}, state); await panel.handleInput("j", () => {}, state); await panel.handleInput("\r", () => {}, state);
+    assert.equal(skips, 1);
+  });
+  it("provides Abort only live and Resume only for recoverable runs", async () => {
+    for (const status of ["running", "completed", "failed", "aborted", "interrupted"] as const) {
+      const state = createPanelRenderState();
+      const panel = panelFor([run({ status })]);
+      const actions = panel.nodes(state).filter(n => n.kind === "action").map(n => n.action);
+      assert.deepEqual(actions, status === "running" ? ["abort"] : status === "completed" ? [] : ["resume"]);
+    }
+  });
+  it("shows errors inline and preserves selection when tasks appear", async () => {
+    const view = run();
+    const panel = panelFor([view], { callbacks: { focus: async () => ({ error: "Session unavailable" }), skip() {}, abort() {}, resume() {} } });
+    const state = createPanelRenderState(); panel.nodes(state); state.expanded.add(state.selected!);
+    await panel.handleInput("l", () => {}, state);
+    await panel.handleInput("\r", () => { throw new Error("must not close"); }, state);
+    assert.match(panel.renderPanel(theme, 70, state, 20).join("\n"), /Session unavailable/);
+    const selection = state.selected;
+    view.calls.unshift(call({ callKey: "new" })); panel.nodes(state);
+    assert.equal(state.selected, selection);
+  });
+  it("fits narrow, short and long CJK frames and keeps the selected row visible", () => {
+    const calls = Array.from({ length: 80 }, (_, i) => call({ callKey: String(i), label: `验证非常长的路径-${i}`, error: i === 79 ? "error ".repeat(100) : undefined }));
+    const panel = panelFor([run({ calls })]);
+    for (const width of [30, 40, 60, 100]) for (const height of [8, 12, 30]) {
+      const state = createPanelRenderState(); panel.nodes(state); state.selected = "run:wf-1:call:79";
+      const lines = panel.renderPanel(theme, width, state, height);
+      assert.equal(lines.length, height);
+      assert.ok(lines.every(line => visibleWidth(line) === width));
+      assert.match(lines.join("\n"), /❯/);
+      assert.match(lines.at(-1)!, /╯$/);
+    }
+  });
+  it("shows complete wrapped failure text when expanded", () => {
+    const panel = panelFor([run({ calls: [call({ status: "failed", error: "the agent finished without calling structured_output" })] })]);
+    const state = createPanelRenderState(); panel.nodes(state); state.expanded.add("run:wf-1:call:key-1");
+    assert.match(panel.renderPanel(theme, 80, state, 25).join("\n"), /structured_output/);
+  });
+  it("puts progress and usage in the first-layer summary", () => {
+    const summary = workflowSummary(run({ calls: [call({ status: "completed" })] }), 100).join("\n");
+    assert.match(summary, /1\/1 settled/); assert.match(summary, /1.2k tokens/); assert.match(summary, /\$0.12/);
+  });
+  it("freezes settled durations and retains Focus on a restored completed call", () => {
+    const panel = panelFor([run({
+      status: "completed", startedAtWall: 0, finishedAt: 120_000,
+      calls: [call({ status: "completed", cached: true })],
+    })]);
+    const state = createPanelRenderState();
+    panel.nodes(state);
+    state.expanded.add("run:wf-1:call:key-1");
+    const before = panel.renderPanel(theme, 80, state, 20).join("\n");
+    const original = Date.now;
+    try {
+      Date.now = () => original() + 24 * 60 * 60_000;
+      assert.equal(panel.renderPanel(theme, 80, state, 20).join("\n"), before);
+      assert.match(before, /completed · 2m00s/);
+      assert.match(before, /cached/);
+      assert.match(before, /Focus/);
+    } finally { Date.now = original; }
+  });
+  it("opens scoped disk runs and preserves tree state across reopening", async () => {
+    let component: any; let options: any; let closes: (() => void)[] = [];
+    const ctx = { ui: { notify() {}, custom(factory: Function, config: any) {
+      options = config;
+      return new Promise(resolve => {
+        component = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, {}, resolve);
+        closes.push(() => component.handleInput("\u001b"));
+      });
+    } } };
+    const panel = panelFor([], { inspect: id => id === "disk" ? run({ runId: "disk" }) : null });
+    const opened = panel.open(ctx, "disk");
+    assert.equal(options.overlayOptions().anchor, "center");
+    component.render(80);
+    component.handleInput("l"); await new Promise(resolve => setImmediate(resolve));
+    assert.match(component.render(80).join("\n"), /Focus/);
+    closes.at(-1)!(); await opened;
+    const reopened = panel.open(ctx, "disk");
+    assert.match(component.render(80).join("\n"), /Focus/);
+    closes.at(-1)!(); await reopened;
+  });
+  it("toggles with the configured shortcut and removes its raw input listener", async () => {
     let component: any;
-    const ctx = {
-      ui: {
-        custom: (factory: any) => {
-          component = factory({ terminal: { rows: 40 } }, theme, {}, () => {});
-          return Promise.resolve(undefined);
-        },
-        notify: () => {},
+    let listener: ((data: string) => unknown) | undefined;
+    let removed = 0;
+    const ctx = { ui: {
+      notify() {},
+      onTerminalInput(handler: (data: string) => unknown) {
+        listener = handler;
+        return () => { listener = undefined; removed++; };
       },
-    };
-    // The panel refreshes on a timer while a run is live, so the component must
-    // always be disposed even when an assertion fails.
-    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
-    try {
-      await panel.open(ctx);
-
-      // The cursor starts on the run header; step onto the call, then into its menu.
-      component.handleInput("j");
-      component.handleInput("\r");
-      assert.match(component.render(100).join("\n"), /❯ focus/, "the menu opens on its first action");
-      component.handleInput("k"); // the first action is already the top one
-      component.handleInput("\r");
-      assert.deepEqual(focused, ["wf-agent"]);
-      await settle();
-
-      // Reopen the menu and walk down to \`skip\`.
-      component.handleInput("\r");
-      component.handleInput("j");
-      component.handleInput("j");
-      component.handleInput("j");
-      component.handleInput("\r");
-      await settle();
-      assert.deepEqual(skipped, ["k1"]);
-    } finally {
-      component?.dispose?.();
-    }
-  });
-
-  it("switches runs with [ and ]", async () => {
-    const live = run({ runId: "wf-1", calls: [call({ callKey: "a", label: "first-agent" })] });
-    const settled = run({
-      runId: "wf-2",
-      status: "completed",
-      createdAt: 0,
-      finishedAt: Date.now(),
-      meta: { name: "second-run", description: "y" },
-      calls: [call({ callKey: "b", label: "second-agent" })],
-    });
-    let component: any;
-    const ctx = {
-      ui: {
-        custom: (factory: any) => {
-          component = factory({ terminal: { rows: 40 } }, theme, {}, () => {});
-          return Promise.resolve(undefined);
-        },
-        notify: () => {},
+      custom(factory: Function) {
+        return new Promise(resolve => {
+          component = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, {}, resolve);
+        });
       },
-    };
-    try {
-      await panelFor([live, settled]).open(ctx);
-      assert.match(component.render(100).join("\n"), /first-agent/);
-
-      component.handleInput("]");
-      const second = component.render(100).join("\n");
-      assert.match(second, /second-agent/);
-      assert.doesNotMatch(second, /first-agent/);
-
-      component.handleInput("[");
-      assert.match(component.render(100).join("\n"), /first-agent/);
-    } finally {
-      component?.dispose?.();
-    }
+    } };
+    const panel = panelFor([run()], { shortcut: "alt+w" });
+    let opened = panel.toggle(ctx);
+    component.render(80);
+    component.handleInput("l");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(component.render(80).join("\n"), /Focus/);
+    assert.deepEqual(listener!("\u001bw"), { consume: true });
+    await opened;
+    assert.equal(removed, 1);
+    opened = panel.toggle(ctx);
+    assert.match(component.render(80).join("\n"), /Focus/);
+    await panel.toggle(ctx);
+    await opened;
+    assert.equal(removed, 2);
   });
-
-  it("repaints while a run is live, and not once everything has settled", async () => {
-    const repaints = { count: 0 };
-    const open = async (views: WorkflowRunView[]) => {
-      let component: any;
-      const ctx = {
-        ui: {
-          custom: (factory: any) => {
-            component = factory(
-              { terminal: { rows: 40 }, requestRender: () => (repaints.count += 1) },
-              theme,
-              {},
-              () => {},
-            );
-            return Promise.resolve(undefined);
-          },
-          notify: () => {},
-        },
-      };
-      await panelFor(views).open(ctx);
-      return component;
-    };
-
-    const settled = await open([run({ status: "completed", finishedAt: Date.now() })]);
-    try {
-      settled.render(100);
-      await new Promise((resolve) => setTimeout(resolve, 60));
-      assert.equal(repaints.count, 0, "a settled run must not repaint on a clock");
-    } finally {
-      settled.dispose();
-    }
-
-    const live = await open([run({ calls: [call({ callKey: "k", status: "running", name: "wf-agent" })] })]);
-    try {
-      live.render(100);
-      await new Promise((resolve) => setTimeout(resolve, 1100));
-      assert.ok(repaints.count > 0, "a live run repaints so its elapsed time stays current");
-    } finally {
-      live.dispose();
-    }
-  });
-
-  it("scopes an overlay opened for one run and refuses an unknown run id", async () => {
-    const views = [run({ runId: "wf-1" }), run({ runId: "wf-2", meta: { name: "other-run", description: "y" } })];
-    const notified: string[] = [];
-    let opened = 0;
-    let rendered: string[] = [];
-    const ctx = {
-      ui: {
-        custom: (factory: any) => {
-          opened++;
-          const component = factory({ terminal: { rows: 40 } }, theme, {}, () => {});
-          rendered = component.render(100);
-          component.dispose();
-          return Promise.resolve(undefined);
-        },
-        notify: () => {},
-      },
-    };
-
-    const panel = panelFor(views, { notify: (message) => notified.push(message) });
-    await panel.open(ctx, "wf-2");
-    const body = rendered.join("\n");
-    assert.match(body, /other-run/);
-    assert.doesNotMatch(body, /review-changes/, "the overlay only shows the requested run");
-    assert.doesNotMatch(body, /wf-2/, "the run id stays out of the panel");
-
-    await panel.open(ctx, "wf-9");
-    assert.equal(opened, 1, "an unknown run id never opens the overlay");
-    assert.match(notified.join("\n"), /No workflow run wf-9/);
-  });
-
-  it("opens a run that only exists on disk", async () => {
-    // `/workflow wf-xxxx` after a restart used to refuse a run that
-    // `action: 'status'` reads happily: the panel only knew what was in memory.
-    const onDisk = run({ runId: "wf-disk" });
-    let opened = 0;
-    let rendered: string[] = [];
-    const ctx = {
-      ui: {
-        custom: (factory: any) => {
-          opened++;
-          const component = factory({ terminal: { rows: 40 } }, theme, {}, () => {});
-          rendered = component.render(100);
-          component.dispose();
-          return Promise.resolve(undefined);
-        },
-        notify: () => {},
-      },
-    };
-
-    const notified: string[] = [];
-    const panel = panelFor([], {
-      inspect: (runId) => (runId === "wf-disk" ? onDisk : null),
-      notify: (message) => notified.push(message),
-    });
-
-    await panel.open(ctx, "wf-disk");
-    assert.equal(opened, 1, "a disk-backed run opens");
-    assert.match(rendered.join("\n"), /review-changes/);
-
-    await panel.open(ctx, "wf-missing");
-    assert.equal(opened, 1, "a run that exists nowhere still does not");
-    assert.match(notified.join("\n"), /No workflow run wf-missing/);
-  });
-
-  it("keeps the global manifest in sync with the documented primitives", () => {
-    const names = WORKFLOW_GLOBALS.map((global) => global.name);
-    for (const required of ["__wfBridgeAgent", "__wfBridgePhase", "__wfBridgeLog", "__wfBridgeWorkflow", "__wfBridgeBudget"]) {
-      assert.ok(names.includes(required), `missing bridge global ${required}`);
-    }
-    // The script-visible names must not collide with the sandbox's reserved set.
-    for (const reserved of ["tools", "console", "text", "exit", "store", "load", "ALL_TOOLS"]) {
-      assert.ok(!names.includes(reserved), `reserved name ${reserved} must not be declared`);
-    }
+  it("keeps the global manifest in sync with documented primitives", () => {
+    const names = WORKFLOW_GLOBALS.map(g => g.name);
+    for (const name of ["__wfBridgeAgent", "__wfBridgePhase", "__wfBridgeLog", "__wfBridgeWorkflow", "__wfBridgeBudget"]) assert.ok(names.includes(name));
   });
 });

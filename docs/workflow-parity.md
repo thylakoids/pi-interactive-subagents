@@ -69,7 +69,7 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 `runner.ts` 用 `@earendil-works/pi-codemode` 的 `CodemodeSandbox` 在 worker 线程里跑 QuickJS（wasm）。VM 没有文件系统、网络、定时器、`require`、`process`。宿主只暴露五个桥接全局（`__wfBridgeAgent/Phase/Log/Workflow/Budget`）；沙箱声明的全局不可写、调用桥每次只带一个参数，因此脚本里常见的 API（`agent`/`parallel`/`pipeline`/`phase`/`log`/`workflow`/`args`/`budget`）由一段 prelude 用 `const` 定义并遮蔽桥接名——`parallel` 和 `pipeline` 是纯 Promise 编排，留在 VM 里，`agent()` 是唯一真正跨到宿主的调用。`args` 以 JSON 字面量内联进 prelude。
 
-确定性：run 的 `seed` 与 `startedAt` 存进 snapshot，resume 时原样复用（脚本看到的时钟与随机数回放）。宿主按 `seq` 顺序把结果交付给 VM（完成顺序随意、交付按序）；宿主侧看门狗在脚本 `runTimeoutMs`（默认 30 分钟）无进展时中止；堆上限 256MB；VM 会给出指纹（含 prelude hash、引擎版本、限制）。pi-codemode 自身还会让“等待一个永远无法 settle 的 promise”的脚本立即失败，而不是挂死。
+确定性：run 的 `seed` 与 `startedAt` 存进 snapshot，resume 时原样复用（脚本看到的时钟与随机数回放）。宿主在答案返回时分配连续的 `seq`，按实际完成顺序交付给 VM，和调用 id/发出顺序分开；否则慢调用会阻塞其他项以及它们的预算刷新，意外把 pipeline 变成阶段屏障。resume 按内容键复用调用，不要求不同调用重现原来的完成先后顺序；宿主侧看门狗在脚本 `runTimeoutMs`（默认 30 分钟）无进展时中止；堆上限 256MB；VM 会给出指纹（含 prelude hash、引擎版本、限制）。pi-codemode 自身还会让“等待一个永远无法 settle 的 promise”的脚本立即失败，而不是挂死。
 
 ### 3.2 meta 与工具面
 
@@ -113,10 +113,10 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 
 可观测性（`ui.ts` + `index.ts`）：
 
-- 不设常驻 widget：早期版本在编辑器上方每秒重绘一行状态，既造成输入区域闪烁、又让已完成 run 的耗时随墙钟虚增；面板足够，已移除。
-- 快捷键（默认 `ctrl+alt+w`）或 `/workflow` 打开覆盖面板；非 TUI 会话退化为文本报告。
-- 面板一次显示一个 run（`[`/`]` 切换，标题右侧 `n/m`），排版照 Claude Code 的界面语言来：无边框、无分隔线、`❯` 指针选中、已完成行变暗、底部 dim 按键提示；不显示 runId。打开期间只要有活跃 run 就每秒重绘（内容没变则不重绘），已结束 run 的耗时按结束时刻冻结。
-- 逐行展示每个调用：状态字形、label、实时活动（子代理窗口的同一句 status）、耗时、cached 标记、错误；**按 phase 分组**（同一 phase 字符串合成一组，组头是 dim 的阶段名；`view.phase` 是最后一次 `phase()` 调用，会与还在跑的早期阶段矛盾，所以不再出现在标题里）；run 自己的 `log()` 与运行时提示显示在标题下方（最多 3 条，被截断时标出还有多少条）。运行中/已结束的行可 focus（跳到该 agent 的 tmux 窗格）、message（发消息）、stop、skip；run 可 abort / resume，都既有菜单（回车）也有直按键（`f`/`m`/`x`/`s`/`a`/`r`）。`/workflow <runId>` 也能打开磁盘上的旧 run（和 `action:'status'` 一致）。每个 agent 就是一个独立 tmux 窗格里的真实 pi 会话，人可以直接看和输入。
+- 不单独新增 workflow widget；既有 Subagents 状态框底部附运行中的 workflow 摘要、进度、用量和快捷键，仍展示所有运行子代理。
+- 快捷键（默认 `ctrl+alt+w`）或 `/workflow` 打开居中、有边框的树形覆盖面板；非 TUI 会话退化为文本报告。
+- 树层级为 workflow → phase → subagent → action；多个 run 并列，同名附启动时间。支持方向键和 `hjkl`，Enter 展开或执行，Esc 关闭，无底部按键提示。详情不重复进度和用量。选择与展开状态保留，已结束耗时冻结，内容变化时刷新。
+- 调用按 phase 真正合并，展示状态、label、实时活动、耗时、cached 和展开后的完整错误。Focus 切换到已有 pane，或在保持原沙箱配置的前提下重开原会话，不发新消息；queued/running 调用可 Skip，run 可 Abort/Resume，后三者需要确认。面板不提供 message/stop；用户直接在 pane 交互。`/workflow <runId>` 可打开磁盘旧 run。日志和完整数据保留在 status/journal/output。
 - transcript 一侧同样是这套语言：工具调用行 `● Workflow(<名字>)`（内联脚本取其 `meta.name`，取不到写 `inline`），结果是 `⎿ 状态 · n agents planned (ctrl+o to expand)`；run 落定消息渲染成 `● <名字> · completed in 2m04s` + `⎿ n agents · n done · tokens · $cost`，`ctrl+o` 展开 run id、脚本路径和脚本返回值。
 
 ## 4. 逐项对照表
@@ -135,7 +135,7 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 | 预算 | 来自用户 “+500k” 指令的共享池；硬上限，超限抛 `WorkflowBudgetExceededError` | `budget.total` 来自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 null）；`spent()`/`remaining()` 是**同步数字**、每次 `agent()` 后刷新；超限让 run 失败 | 本实现没有可共享的按轮预算池；单位是总 token（输入+输出）而非输出 token；同样强制中止 |
 | 取消 / 跳过 | 跳过 → `null`；死掉的 agent → `null`；kill/pause + 恢复提示；用量限额自动暂停等待 | 跳过 → `null`；**失败/死掉的 agent → `null`**（记 failed，面板显示错误，落定消息按名字列出）；参数写错则整 run 失败；abort 停止运行中 agent 并中止 VM；无暂停态 | 失败语义已对齐 CC；本实现无 rate-limit 暂停与 pause 恢复，多出逐 agent 的交互干预 |
 | 通知 | `<task-notification>` XML（task-id/status/summary/recovery/diagnostics/usage 等）+ “Dynamic workflow … completed/failed/was stopped” | `pi.sendMessage` 自定义消息（customType `workflow_result`），纯文本：状态、完成数、tokens、错误、按名字列出没有返回值的调用、run/script/journal 路径与各 agent 的 session 文件、查看/恢复提示；结果 JSON 截断到 4,000 字符并标出 output.json | 传输方式与结构不同；本实现也点名了每个“空结果”的调用，而不是只给计数 |
-| 可观测性 | `/workflows` 进度页、task 进度事件（phase/log/agent 状态）、transcript 目录与 journal；子代理无交互面板 | `/workflow` 覆盖面板 + 快捷键（无常驻 widget：轮询渲染会闪烁，已移除）：按 phase 分组、显示 run 日志、`[`/`]` 切 run、磁盘上的旧 run 也能打开；每个 agent 是独立 tmux 窗格里的真实 pi 会话，可 focus/steer/stop/skip | 本实现的可观测性与可操作性更强（正是本插件的取舍：更重、可看可接管） |
+| 可观测性 | `/workflows` 进度页、task 进度事件（phase/log/agent 状态）、transcript 目录与 journal；子代理无交互面板 | Subagents 框附 workflow 摘要；`/workflow` 与快捷键打开居中树形面板，按 workflow/phase/call/action 导航，可 Focus/Skip/Abort/Resume，磁盘旧 run 也能打开；交互直接在真实 tmux pane 中进行 | 本实现的可观测性与可操作性更强（正是本插件的取舍：更重、可看可接管） |
 | 脚本隔离 | 无 fs/Node API；AST 检查禁止 `Date.now()`/`Math.random()`/`new Date()`；在 Claude Code 进程内执行 | QuickJS WASM worker 线程；无 fs/网络/定时器/`require`/`process`；时钟与随机数由 run 的 `startedAt`/`seed` 决定；30 分钟无进展看门狗、256MB 堆上限 | 隔离更强、可强杀；两边都用“禁止非确定性 API”保证回放确定性 |
 
 ## 5. 已知差异与后续工作

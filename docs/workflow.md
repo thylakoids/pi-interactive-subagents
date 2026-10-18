@@ -67,7 +67,7 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 | `args` | 任意 JSON 值 | 启动时传入的数据。 |
 | `budget` | `{ total, spent(), remaining() }` | 运行 token 预算，单位是子代理的**总** token（输入+输出）。`spent()` / `remaining()` 返回**数字**（不是 Promise），并且在每次 `agent()` 结束后刷新，所以 `while (budget.total && budget.remaining() > 50_000)` 这种写法是对的。`total` 取自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 `null`，此时 `remaining()` 为 `Infinity`）。**超限会中止 run**：预算用完后下一个 `agent()` 直接让 run 失败，脚本自己按 `remaining()` 收敛才能优雅结束。 |
 
-**默认用 `pipeline`，不要用 `parallel`。** 除非下一步真的需要**全部**之前的结果（全量去重、跨项比较、发现“什么都没找到”后提前退出），否则让 pipeline 逐项推进——阶段之间没有 barrier。
+**默认用 `pipeline`，不要用 `parallel`。** 除非下一步真的需要**全部**之前的结果（全量去重、跨项比较、发现“什么都没找到”后提前退出），否则让 pipeline 逐项推进——阶段之间没有 barrier。宿主按实际完成顺序交付调用结果，单项完成后的预算刷新也不等待无关的慢调用；`pipeline` 最终返回的数组仍按输入项顺序排列，`parallel` 仍等待整组完成。
 
 **结构化结果必须用 `schema`。** `agent(prompt, { schema })` 返回的是子代理通过 `structured_output` 工具提交并被校验的对象，不是自由文本；要在结果上做分支就必须用它。子代理完成时若没有调用 `structured_output`，该调用判为失败（错误文本：`the agent finished without calling structured_output`）。schema 用常用 JSON Schema 子集：`type`（object / array / string / number / integer / boolean）、`properties`、`required`、`items`、`enum`、`description`。根必须是 `{ type: 'object', properties: {...} }`，且 `required` 里的字段必须在 `properties` 里——不满足的 schema 在任何子代理启动之前就报错，而不是等烧完模型调用才失败。运行时会给 prompt 自动附加一句“用 structured_output 返回结果”，prompt 里不用重复。
 
@@ -207,7 +207,7 @@ workflow({ action: 'start', name: 'migrate-files', args: {
 workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 ```
 
-面板上按 `r` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁自动回收（空锁超过几秒也算废弃）。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
+面板里展开 run 并选择 `Resume workflow` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁自动回收（空锁超过几秒也算废弃）。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
 
 **跳过的调用不会被当作已完成重放。** 只有 `completed` 进缓存；`skipped`（面板里手动跳过）和 `failed` 都不会在 resume 或重跑时“冒充”完成——它们会真正重新执行。被跳过时脚本拿到 `null` 并继续，这是用户的决定，不是错误。
 
@@ -216,37 +216,45 @@ workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 打开方式：
 
 - 命令 `/workflow`：TUI 下打开覆盖面板；非 TUI 会话打印文本报告，`/workflow <runId>` 查看指定 run。
-- 快捷键 **Ctrl+Alt+W**（默认绑定，见 `/hotkeys`）。
+- 快捷键 **Ctrl+Alt+W**（默认绑定，见 `/hotkeys`）：切换面板的打开/关闭。确认页中也可直接关闭，关闭不会执行尚未确认的动作；再次打开保留树的位置与展开状态。
 
-面板不常驻编辑器上方——早期版本有一个每秒刷新的 widget，既让编辑器区域闪烁，也让已完成 run 的耗时随时间虚增，已移除。面板是用户主动打开的 overlay，渲染不碰编辑器：
+主界面保留 `Subagents` 状态框，仍然展示运行中的所有子代理。默认定义名 `(workflow-subagent)` 不再重复显示；显式定义如 `(scout)` 仍显示。框底附上运行中 workflow 的名字、简单进度条、`settled/issued` 计数、running 数、累计 tokens、费用以及打开面板的快捷键。进度只反映脚本已发出的调用；脚本产生新调用时分母会增加，不代表预先知道整个脚本的任务总数。脚本仍在运行但没有活跃 agent 时，摘要继续保留。
 
-- 一次只显示一个 run（默认最新的活跃 run，没有活跃的就显示最新的），`[` / `]` 切换，标题右侧标 `n/m`；**面板里不出现 runId**——名字和在 run 列表里的位置足够定位。
-- 视觉是 Claude Code 的一套：无边框、无分隔线，靠明暗分层；选中行是强调色 `❯` 指针（不是反色块），已完成的 agent 整行变暗、进行中的最亮，底部按键提示是暗色且只列当前行真正能做的动作。
-- 内容按终端高度开窗，光标跟着可见区域走，末尾标出 `(光标行/总行数)`，所以 call 比屏幕多的 run 也能完整浏览；光标跟踪的是身份（callKey）而不是行号，重绘时新增或消失的行不会把光标挪到别的 agent 上。
-- 打开期间只要有 run 还在跑就每秒重绘一次，内容没变则不重绘；没有活跃 run 就停表。已结束 run 的耗时按结束时刻算，不会因为面板开着而虚增。
-- 面板铺满终端宽度、锚在顶部：overlay 是画在既有内容上的，居中的窄框会让两侧漏出会话的历史输出。
+详情是一个居中、有完整边框的 overlay，四周留出背景，框内完整覆盖；宽度适配窗格并设置上限，高度在打开期间随终端尺寸保持稳定。里面不再重复进度条和用量，也没有底部快捷键提示。使用 Pi 列表的 `❯` 光标、状态符号和主题颜色。
 
-面板里能看到（一次一个 run）：
+内容是一棵树：
 
-- 标题行：状态字形 + run 名字（`✻` running / `✓` completed / `✗` failed / `⊘` aborted、interrupted），右侧 dim 的 `状态 · 耗时`。
-- 元信息行：`已结算/总数` agents · 累计 token（有预算时写成 `已用 / 预算 tokens`）· 费用；有失败时补 `n failed`。
-- 进度行：`▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱ 43%`（暗条 + 亮数字）。
-- 最近几条 run 日志（脚本的 `log()` 和运行时的提示，如 `reusing 3 completed call(s)`），最多 3 条；被截断时标出还有多少条没显示。
-- agent 行按 **phase 分组**：同一 phase 字符串合成一组，组头是 dim 的阶段名。`view.phase`（最后一次 `phase()` 调用）不再出现在标题里——它会在早期阶段的 agent 还在跑时就翻到下一个阶段，和下面的行自相矛盾。
-- 每个 agent（call）一行：状态字形（`○` queued / `✻` running / `✓` completed / `✗` failed / `⊘` skipped、aborted）、label、右侧活动列——运行中是子代理窗口里同一句实时状态（如 `bash 19s`），结束的是耗时和 `cached` 标记，失败的行尾就是错误文本；run 自身的错误单独占一行。
-- 单个 agent 的 model 与 token 用量不在面板逐行显示（面板按「一行一件事」排版），看 `workflow({ action: 'status' })` 的返回或 journal 里的 `usage` 字段。
+```text
+Workflows
+  workflow name                       running · 2m10s
+    phase
+      subagent                        streaming 2s
+        Focus
+        Skip
+    Abort workflow
+```
 
-能做的事：
+- 多个 run 并列为根节点；同名 run 附启动日期和时间。默认展开最近的运行中 run，其他 run 收起。
+- phase 真正合并分组，优先按 `meta.phases` 顺序；无 phase 的调用放入 `Tasks`。空阶段保留名称，不推断已完成。
+- agent 右侧显示实时活动、耗时、`cached` 或结束状态；失败项展开后显示完整换行错误。run 本身的错误同样在展开后显示。
+- 选择和展开状态在关闭重开后保留，光标按 run + call 身份定位；新增任务或状态刷新不抢光标。长列表在框内滚动，已结束 run 的耗时冻结。
 
-- `↑`/`↓`（或 `j`/`k`）选择一行，`g`/`G` 到首/末，`PgDn`/`PgUp`（或 `Ctrl+D`/`Ctrl+U`）翻页。
-- `enter` 打开该行的动作菜单（`↑`/`↓` 选、回车执行、`Esc` 取消），菜单只列出该行当前可行的动作；同样的动作也可以直接按键完成：
-  - `f` —— **focus**：把该 agent 的 tmux 窗格切到前台；
-  - `m` —— **message**：给该 agent 发一条消息（已结束的会把它叫回原会话继续）；
-  - `x` —— **stop**：停掉该 agent（关窗格），脚本把这次调用当失败、该项为 `null`；
-  - `s` —— **skip**：跳过该调用——脚本立刻收到 `null` 继续跑（跳过不算完成，恢复时会重跑）；
-  - `a` / `r` —— 直接中止运行中的这个 run（先确认）/ 恢复已结束或中断的这个 run；
-  - `[` / `]` —— 本会话有多个 run 时，切换前一个 / 后一个；
-  - `q` / `Esc` —— 关闭。
+导航：
+
+- `↑`/`↓` 或 `k`/`j`：上一个/下一个可见节点。
+- `→` 或 `l`：展开当前节点；已展开时进入第一个子节点。
+- `←` 或 `h`：收起当前节点；叶子或已收起节点回到父节点。
+- `Enter`：展开/收起分支，或执行选中的动作。
+- `Esc`（也接受 `q`）：关闭面板，workflow 在后台继续。确认页的 `Esc` 返回树。
+
+动作直接位于树中，没有独立动作菜单：
+
+- **Focus**：运行中的 agent 切到原 tmux pane；已结束的 agent 重新打开原始会话及历史，不自动发送消息。有现存会话 pane 时复用，不创建重复进程。成功后关闭弹窗。Pi 会话沿用原模型、身份和工具权限，但保持交互模式；原生 CLI 会话按原 native session ID 打开。会话或权限快照缺失时明确报错。继续与单个 agent 交互不会替换 workflow 已记录的结果。
+- **Skip**：仅 queued/running 调用提供。确认后停止该调用，脚本立即收到 `null` 并继续；恢复时会重新执行。排队任务没有会话时不提供 Focus。
+- **Abort workflow**：仅运行中 run 提供。确认后中止脚本及运行中的 agents，保留完成记录。
+- **Resume workflow**：仅 failed/aborted/interrupted run 提供。确认后重放脚本，复用 completed 调用，其余调用重新执行；不是让原进程从停止的指令继续。
+
+Skip、Abort、Resume 使用同一框内的确认页，默认选中 `Cancel`。确认期间目标已结束时拒绝过期动作并显示原因。message/stop 操作不放入面板，用户可在真实 pane 中交互。日志、完整用量和返回值仍可通过 status、journal 与 output 文件查看。
 
 `/workflow <runId>` 打开的面板只显示这个 run；该 runId 不在本会话、磁盘上也找不到时给出提示，而不是一个空面板。进程重启之前的 run 也能这样打开——面板会从 artifacts 目录读回来，和 `workflow({ action: 'status' })` 看到的一致。
 
@@ -284,7 +292,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 
 定位失败：
 
-1. 面板 / `workflow({ action: 'status', runId })` 里哪一行是 `✗`，行尾就是错误文本。
+1. 面板里展开 `✗` 调用查看完整错误，或查询 `workflow({ action: 'status', runId })`。
 2. 在 journal 里翻这个调用的原文：
 
    ```sh

@@ -62,6 +62,8 @@ export function prepareExternalLaunch(params: {
   hookFile: string;
   settingsFile: string;
   resume: boolean;
+  /** Open an existing native conversation without submitting another turn. */
+  noPrompt?: boolean;
 }): string {
   const { session: s } = params;
   const parts = [shellEscape(resolveCliBinary(s.kind))];
@@ -103,7 +105,7 @@ export function prepareExternalLaunch(params: {
   }
   // Read prompt data from a file. The quoted substitution is never re-evaluated
   // as shell code, including backticks, dollars, quotes, and newlines.
-  parts.push(`"$(cat ${shellEscape(params.taskFile)})"`);
+  if (!params.noPrompt) parts.push(`"$(cat ${shellEscape(params.taskFile)})"`);
   const exitHook = [process.execPath, params.hookFile, "exit", params.sessionFile, params.resultFile].map(shellEscape).join(" ") + ' "$pi_cli_rc"';
   return `cd ${shellEscape(s.cwd)}\npi_cli_rc=$?\nif [ "$pi_cli_rc" -eq 0 ]; then\n${parts.join(" ")}\npi_cli_rc=$?\nfi\n${exitHook}\nexit "$pi_cli_rc"`;
 }

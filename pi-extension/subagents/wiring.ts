@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { getSessionId } from "./session.ts";
 import { classifyStatus, formatStatusDetail } from "./status.ts";
-import { isMuxAvailable, muxSetupHint, closeSurface, sendCommand } from "./tmux.ts";
+import { isMuxAvailable, muxSetupHint, closeSurface } from "./tmux.ts";
 import type { RunningSubagent, SubagentResult } from "./index.ts";
 import type {
   WorkflowSubagentCompletion,
@@ -65,6 +65,7 @@ export interface SubagentPluginSurface {
   sessionDefaults(): { model?: string; thinking?: string };
   agentDir(): string;
   cwd(): string;
+  focus(name: string, sessionFile?: string): Promise<{ ok: true } | { error: string }>;
 }
 
 /**
@@ -189,16 +190,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       }
     },
 
-    focus(name: string) {
-      const resolved = surface.resolveRunning(name);
-      if ("error" in resolved) return { error: resolved.error };
-      try {
-        sendCommand(resolved.running.surface, "");
-        return { ok: true };
-      } catch (error: any) {
-        return { error: `Cannot focus ${name}: ${error?.message ?? String(error)}` };
-      }
-    },
+    focus: (name, sessionFile) => surface.focus(name, sessionFile),
 
     status(name: string) {
       const resolved = surface.resolveRunning(name);

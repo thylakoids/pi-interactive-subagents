@@ -7,10 +7,9 @@
  * the globals we inject here.
  *
  * Every `agent()` call reaches the host through `onCall` and is answered with
- * `deliver(seq, now, id, outcome)`. The VM applies results in `seq` order and
- * is deterministic given the same script, seed, clock and results — which is
- * exactly what a resume needs: replay the journal's answers, and only the calls
- * that are new or changed actually run.
+ * `deliver(seq, now, id, outcome)`. `seq` numbers answers in completion order,
+ * independently of the call id, so a slow call cannot hold up another item's
+ * pipeline. Resume reuses journal answers by content key, not delivery order.
  */
 import type { CodemodeDeclaredGlobal, CodemodeHostCall, CodemodeOutcome, CodemodeRun } from "@earendil-works/pi-codemode";
 import { CodemodeSandbox } from "@earendil-works/pi-codemode";
@@ -229,11 +228,10 @@ export interface ScriptResult {
 /**
  * Run one workflow script to completion.
  *
- * Results may become available in any order, but the VM wants a contiguous
- * 1..N sequence and applies them strictly in that order, so settled calls are
- * buffered and flushed as the gaps fill. Every call is answered — a call the
- * user skips is delivered as a failed outcome, never dropped, or the VM would
- * wait forever.
+ * The VM wants a contiguous 1..N result sequence, not call-issuance order.
+ * Assign the sequence when an answer arrives, including budget/status calls:
+ * reserving it at issuance would make a slow agent block unrelated results
+ * and their budget refreshes. Buffer only while the VM is starting.
  */
 export async function runScript(options: StartScriptOptions): Promise<ScriptResult> {
   const code = prepareScriptSource(options.code, options.args, options.maxItemsPerBatch);
@@ -242,7 +240,7 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
 
   /** seq → the answer waiting to be delivered. */
   const pending = new Map<number, { id: number; outcome: CodemodeOutcome }>();
-  let nextSeq = 1;
+  let nextResultSeq = 1;
   let issuedCalls = 0;
   let fingerprint: string | undefined;
 
@@ -303,14 +301,13 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
       onCall: (call) => {
         lastActivity = Date.now();
         issuedCalls++;
-        const seq = nextSeq;
-        nextSeq++;
         let answered = false;
         // Single answer path: the host calls this at most once per call, but
         // the guard keeps a late second answer from overwriting the first.
         const deliver = (outcome: CodemodeOutcome) => {
           if (answered) return;
           answered = true;
+          const seq = nextResultSeq++;
           pending.set(seq, { id: call.id, outcome });
           lastActivity = Date.now();
           flush();

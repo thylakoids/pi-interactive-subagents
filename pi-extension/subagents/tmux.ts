@@ -411,6 +411,20 @@ export function sendCommand(surface: string, command: string): void {
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
 
+/** Select a pane and its window without submitting input to the child. */
+export function focusSurface(surface: string): void {
+  requireTmux();
+  runTmux(["select-window", "-t", surface, ";", "select-pane", "-t", surface]);
+}
+
+export function surfaceExists(surface: string): boolean {
+  try {
+    return runTmux(["display-message", "-p", "-t", surface, "#{pane_id}"]).trim() === surface;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Send a long command to a pane by writing it to a script file first.
  * This avoids terminal line-wrapping issues that break commands exceeding the

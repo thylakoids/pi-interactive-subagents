@@ -765,6 +765,8 @@ export class WorkflowRun {
       prompt: "",
       status: "skipped",
       name: live.name,
+      sessionFile: live.sessionFile,
+      sessionId: live.sessionId,
       startedAt: live.startedAt,
       finishedAt: this.now(),
       valueIsNull: true,
@@ -1354,4 +1356,3 @@ async function withRunAbort<T>(
 function wrapScript(source: string): string {
   return source;
 }
-

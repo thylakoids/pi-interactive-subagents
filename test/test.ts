@@ -2607,3 +2607,29 @@ describe("tmux.ts", () => {
     });
   });
 });
+
+describe("workflow summary in the subagent widget", () => {
+  it("keeps Subagents identity, hides the default agent tag, and includes usage and the configured shortcut", () => {
+    const api = (subagentsModule as any).__test__;
+    const agents = [{ id: "a", name: "workflow-probe", agent: "workflow-subagent", task: "", surface: "%1",
+      startTime: Date.now(), sessionFile: "/tmp/child.jsonl", statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }) },
+      { id: "b", name: "worker", agent: "scout", task: "", surface: "%2", startTime: Date.now(),
+        sessionFile: "/tmp/worker.jsonl", statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }) }];
+    const views = [{ meta: { name: "workflow" }, status: "running", activeCount: 1, totalCount: 2,
+      calls: [{ status: "completed" }, { status: "running" }], usage: { totalTokens: 310100, cost: 0.08 } }];
+    const body = api.renderSubagentWidgetLines(agents, 100, views, "Alt+W").join("\n");
+    assert.match(body, /Subagents/);
+    assert.match(body, /2 running/);
+    assert.doesNotMatch(body, /\(workflow-subagent\)/);
+    assert.match(body, /\(scout\)/);
+    assert.match(body, /1\/2 settled/);
+    assert.match(body, /310.1k tokens/);
+    assert.match(body, /\$0.08/);
+    assert.match(body, /Alt\+W details/);
+    for (const width of [20, 40, 60]) {
+      const lines = api.renderSubagentWidgetLines(agents, width, views);
+      assert.ok(lines.every((line: string) => visibleWidth(line) <= width));
+    }
+    assert.doesNotMatch(api.renderSubagentWidgetLines(agents, 100, [{ ...views[0], status: "completed" }]).join("\n"), /settled|details/);
+  });
+});

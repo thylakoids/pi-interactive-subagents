@@ -343,6 +343,29 @@ describe("native CLI command construction", () => {
     assert.equal(prepareExternalPrompt("claude", text), text);
   });
   for (const kind of ["codex", "claude"] as const) {
+    it(`${kind}: opens a saved conversation without a prompt`, () => fixture(kind, f => {
+      const bin = join(f.dir, "fake-cli");
+      const argsFile = join(f.dir, "focus-args.json");
+      writeFileSync(bin, `#!${process.execPath}\nrequire('fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)))\n`, { mode: 0o700 });
+      const key = kind === "codex" ? "PI_CODEX_BIN" : "PI_CLAUDE_BIN";
+      const previous = process.env[key];
+      process.env[key] = bin;
+      try {
+        f.session.nativeId = "original-conversation";
+        f.session.autoExit = false;
+        const command = prepareExternalLaunch({ session: f.session, sessionFile: f.sessionFile,
+          resultFile: f.resultFile, taskFile: join(f.dir, "missing-prompt.md"),
+          hookFile: join(f.dir, "absent-hook"), settingsFile: join(f.dir, "settings.json"),
+          resume: true, noPrompt: true });
+        execFileSync("bash", ["-c", command], { stdio: "ignore" });
+        const args = JSON.parse(readFileSync(argsFile, "utf8"));
+        assert.ok(args.includes("original-conversation"));
+        assert.ok(!args.includes(""), "no empty prompt argument");
+        assert.doesNotMatch(command, /\$\(cat/);
+      } finally {
+        if (previous === undefined) delete process.env[key]; else process.env[key] = previous;
+      }
+    }));
     it(`${kind}: executes literal multiline prompt data and resumes the saved ID`, () => fixture(kind, f => {
       const bin = join(f.dir, "fake-cli");
       const argsFile = join(f.dir, "args.json");

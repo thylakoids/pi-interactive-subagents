@@ -24,6 +24,7 @@ import type { WorkflowRunView, WorkflowSubagentService } from "./types.ts";
 
 export interface WorkflowExtensionOptions {
   service: WorkflowSubagentService;
+  widget?: { bind(views: () => WorkflowRunView[], shortcut: string): void; refresh(): void };
   /** Shortcut id, shown in /hotkeys. */
   shortcut?: string;
 }
@@ -155,31 +156,24 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       // the notification is the one call that cannot be made defensively: the
       // api throws on a stale session rather than failing quietly.
       onSettled: (view) => {
-        if (sessionLive) publishRunSettled(pi, view);
+        if (sessionLive) {
+          options.widget?.refresh();
+          publishRunSettled(pi, view);
+        }
       },
     });
 
     panel = new WorkflowPanel({
+      shortcut: options.shortcut,
       callbacks: {
-        steer: (name, message) => {
-          void service.steer(name, message).then((result) => {
-            if ("error" in result) latestCtx?.ui.notify(result.error, "error");
-          });
+        focus: (name, sessionFile) => service.focus(name, sessionFile),
+        skip: (callKey, runId) => {
+          if (!manager?.get(runId)?.skip(callKey)) throw new Error("That call already settled.");
         },
-        focus: (name) => service.focus(name),
-        stop: (name) => service.stop(name),
-        skip: (callKey) => {
-          for (const run of manager?.running() ?? []) {
-            if (run.skip(callKey)) return;
-          }
-          latestCtx?.ui.notify("That call already settled.", "warning");
+        abort: (runId) => {
+          if (!manager?.abort(runId)) throw new Error("That workflow already settled.");
         },
-        abort: (runId) => manager?.abort(runId),
-        resume: (runId) => {
-          void startRun({ action: "resume", runId }, latestCtx ?? ctx).catch((error) =>
-            latestCtx?.ui.notify(String(error?.message ?? error), "error"),
-          );
-        },
+        resume: async (runId) => { await startRun({ action: "resume", runId }, latestCtx ?? ctx); },
       },
       views: () => manager?.list() ?? [],
       // A run left by an earlier process is not in `list()`; the panel reads it
@@ -190,9 +184,8 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
         return Boolean(run && !run.isFinished());
       },
       notify: (message, type) => latestCtx?.ui.notify(message, type ?? "info"),
-      prompt: async (title, placeholder) => latestCtx?.ui.input(title, placeholder),
-      confirm: async (title, message) => (latestCtx ? latestCtx.ui.confirm(title, message) : false),
     });
+    options.widget?.bind(() => manager?.list() ?? [], options.shortcut ?? "ctrl+alt+w");
 
     return { manager, panel };
   };
@@ -241,6 +234,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
     }
 
     void run.execute();
+    options.widget?.refresh();
     return run.view();
   };
 
@@ -354,11 +348,11 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
   // `PI_BTW_FOCUS_KEYS` to re-bind itself; with `alt+/,super+/` set there
   // (see ~/.zshrc) this key is ours alone. Override per-install with `shortcut`.
   pi.registerShortcut((options.shortcut ?? "ctrl+alt+w") as Parameters<typeof pi.registerShortcut>[0], {
-    description: "Workflow panel (watch runs)",
+    description: "Toggle workflow panel",
     handler: async (ctx) => {
       const { panel: activePanel } = ensure(ctx as unknown as ExtensionContext);
       if (isTui(ctx)) {
-        await activePanel.open(ctx as any);
+        await activePanel.toggle(ctx as any);
         return;
       }
       ctx.ui.notify(activePanel.textReport(), "info");
