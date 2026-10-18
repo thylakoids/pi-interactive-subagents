@@ -127,7 +127,7 @@ export class WorkflowRun {
 
   status: WorkflowRunStatus = "running";
   phase?: string;
-  /** Script-side wall clock budget; overridable for tests. */
+  /** Script-side inactivity budget; overridable for tests. */
   scriptTimeoutMs = 30 * 60 * 1000;
   error?: string;
   result?: unknown;
@@ -139,6 +139,12 @@ export class WorkflowRun {
   private readonly cache: Map<string, CachedCall>;
   private readonly live = new Map<string, LiveCall>();
   private readonly running = new Map<string, WorkflowSubagentHandle>();
+  /**
+   * Names this run has handed out but the service has not seen yet: the service
+   * only learns a name once its pane launch resolves, so without a local claim
+   * a fan-out of same-label calls reads one taken-set and picks one name.
+   */
+  private readonly reservedNames = new Set<string>();
   private readonly waiters = new Map<string, Array<(outcome: WorkflowAgentOutcome) => void>>();
   private readonly queue: Array<() => void> = [];
   /**
@@ -239,16 +245,16 @@ export class WorkflowRun {
     return this.abortController.signal;
   }
 
-  /**
-   * Override the script's wall-clock budget. The default is generous (30 min)
-   * because a workflow legitimately waits on humans; tests and callers that
-   * want a tighter leash set it before `execute()`.
-   */
   /** The run's lock file, released when the run settles. */
   setLockPath(path: string): void {
     this.lockPath = path;
   }
 
+  /**
+   * Override the script's inactivity budget. The default is generous (30 min)
+   * because a workflow legitimately waits on agents and humans; tests and
+   * callers that want a tighter leash set it before `execute()`.
+   */
   setScriptTimeout(ms: number): void {
     this.scriptTimeoutMs = Math.max(100, Math.floor(ms));
   }
@@ -276,7 +282,10 @@ export class WorkflowRun {
         this.failRun(message);
         deliver({ ok: false, message });
       } else if (error instanceof WorkflowLimitError || error instanceof WorkflowScriptError) {
-        deliver({ ok: false, message });
+        // Tagged so the script prelude can tell an author mistake from a thunk's
+        // own throw: `parallel`/`pipeline` swallow rejections into null, which
+        // would turn "unknown agent" into "no result" and complete the run.
+        deliver({ ok: false, message, properties: { workflowAuthorError: true } });
       } else {
         deliver({ ok: false, message: `internal error in ${call.name}(): ${message}` });
       }
@@ -314,9 +323,11 @@ export class WorkflowRun {
   private async runAgentCall(raw: unknown): Promise<unknown> {
     const parsed = parseAgentArgs(raw);
     const defined = this.manager.service.allowedAgents();
-    const agentType =
-      parsed.opts.agent ??
-      this.meta.agent ??
+    const requestedAgent = parsed.opts.agent ?? this.meta.agent;
+    // Keep user-provided legacy definitions; only the removed bundled name is
+    // an alias. Authorization still checks the effective worker definition.
+    const legacyAlias = requestedAgent === "workflow-subagent" && defined.unknown(requestedAgent);
+    const agentType = legacyAlias ? "worker" : requestedAgent ??
       inferAgentType(defined.allowed, (name) => this.manager.service.agentKind(name));
     if (!agentType) {
       throw new WorkflowScriptError(
@@ -341,16 +352,25 @@ export class WorkflowRun {
       );
     }
 
-    const label = parsed.opts.label?.trim() || agentType;
-    const base = makeCallKey({
+    let label = parsed.opts.label?.trim() || (legacyAlias ? "workflow-subagent" : agentType);
+    const content = {
       kind: "agent",
       label,
       prompt: parsed.prompt,
       schema: parsed.opts.schema,
-      agent: agentType,
+      agent: legacyAlias ? "workflow-subagent" : agentType,
       model: parsed.opts.model,
       effort: parsed.opts.effort,
-    });
+    };
+    let base = makeCallKey(content);
+    if (!requestedAgent && agentType === "worker") {
+      const legacyLabel = parsed.opts.label?.trim() || "workflow-subagent";
+      const legacyBase = makeCallKey({ ...content, agent: "workflow-subagent", label: legacyLabel });
+      const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key.startsWith(prefix + "-"));
+      // Old default calls used the legacy agent (and sometimes its name as the
+      // label). Reuse that namespace across resume, including failed ordinal 0.
+      if (!hasNamespace(base) && hasNamespace(legacyBase)) { base = legacyBase; label = legacyLabel; }
+    }
     const occurrence = this.occurrences.get(base) ?? 0;
     this.occurrences.set(base, occurrence + 1);
     const key = occurrenceKey(base, occurrence);
@@ -524,6 +544,13 @@ export class WorkflowRun {
         error: "run aborted",
       });
     }
+    // A call the user skipped while it was still queued is settled: the script
+    // has already acted on that decision. Launching it now would open a pane
+    // nobody waits for and journal a second, "completed" line for the same
+    // call — which resume would replay as a real answer.
+    if (isCallSettled(liveCall.status)) {
+      return { ok: false, status: liveCall.status, value: null, error: liveCall.error };
+    }
 
     liveCall.status = "running";
     liveCall.startedAt = this.now();
@@ -688,12 +715,16 @@ export class WorkflowRun {
 
   private uniqueName(base: string): string {
     const taken = this.manager.service.takenNames();
+    // This run's own claims matter as much as the service's: a same-label
+    // fan-out resolves all its names before the first pane launch registers
+    // one, and duplicate names make stop/focus/message ambiguous.
+    for (const reserved of this.reservedNames) taken.add(reserved);
     const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "agent";
     const prefix = `${this.meta.name}-${slug}`.slice(0, 48);
     let candidate = prefix;
     let n = 2;
     while (taken.has(candidate)) candidate = `${prefix}-${n++}`;
-    taken.add(candidate);
+    this.reservedNames.add(candidate);
     return candidate;
   }
 
@@ -1061,15 +1092,17 @@ export class WorkflowManager {
    *
    * Args must match because the cache key does not include them: replaying a run
    * whose inputs changed would return answers to a different question.
+   *
+   * Age comes from the snapshot, not from the run ids: those are random, so
+   * directory order is unrelated to when a run happened.
    */
   private findResumablePredecessor(
     workflowName: string,
     args: unknown,
   ): { runId: string; cache: Map<string, CachedCall> } | null {
     const wanted = JSON.stringify(args ?? null);
-    const dirs = listRunDirs(this.options.baseDir);
-    for (let index = dirs.length - 1; index >= 0; index--) {
-      const runId = dirs[index];
+    const candidates: Array<{ runId: string; createdAt: number; cache: Map<string, CachedCall> }> = [];
+    for (const runId of listRunDirs(this.options.baseDir)) {
       if (this.runs.get(runId) && !this.runs.get(runId)!.isFinished()) continue;
       const runDir = join(runsRoot(this.options.baseDir), runId);
       const snapshot = loadSnapshot(runDir);
@@ -1082,9 +1115,12 @@ export class WorkflowManager {
         cache.set(key, { value: entry.value, isNull: entry.valueIsNull, entry });
       }
       if (cache.size === 0) continue;
-      return { runId, cache };
+      candidates.push({ runId, createdAt: snapshot.createdAt ?? snapshot.startedAt ?? 0, cache });
     }
-    return null;
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.createdAt - a.createdAt || a.runId.localeCompare(b.runId));
+    const { runId, cache } = candidates[0];
+    return { runId, cache };
   }
 
   /** Recover the call history of an interrupted run for display without resuming. */
@@ -1293,7 +1329,7 @@ function assertSatisfiableSchema(schema: Record<string, unknown>): void {
 }
 
 /** The bundled definition a call runs as when nothing names one. */
-const DEFAULT_WORKFLOW_AGENT = "workflow-subagent";
+const DEFAULT_WORKFLOW_AGENT = "worker";
 
 /**
  * The agent a call runs as when neither the call nor the meta names one.

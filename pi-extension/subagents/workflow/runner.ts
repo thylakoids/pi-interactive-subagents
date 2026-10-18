@@ -16,7 +16,11 @@ import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 import { availableParallelism } from "node:os";
 
 export type ScriptLimits = {
-  /** Hard deadline for the whole run, in ms. */
+  /**
+   * How long the script may go without progress, in ms. Not an absolute
+   * deadline: calls the script is waiting on, and every call/result/idle
+   * transition, count as progress.
+   */
   runTimeoutMs: number;
   /** VM heap cap. */
   memoryLimitBytes: number;
@@ -79,16 +83,22 @@ const scriptPrelude = (maxItemsPerBatch: number): string => `// \`budget.spent()
 // number, and a promise would make that comparison false forever — a loop that
 // silently does nothing. The values are as fresh as the last settled call.
 const __wfBudgetSnapshot = await __wfBridgeBudget("snapshot");
+// \`Infinity\` does not survive the JSON bridge (it arrives as null), so an
+// unbounded run has to be read back as Infinity here: the documented
+// \`budget.total === null\` case means "no ceiling", not "zero left".
+const __wfBudgetRemaining = (value) => (value == null ? Infinity : value);
 const __wfBudgetState = {
   total: __wfBudgetSnapshot && typeof __wfBudgetSnapshot === "object" ? __wfBudgetSnapshot.total : null,
   spent: __wfBudgetSnapshot && typeof __wfBudgetSnapshot === "object" ? __wfBudgetSnapshot.spent : 0,
-  remaining: __wfBudgetSnapshot && typeof __wfBudgetSnapshot === "object" ? __wfBudgetSnapshot.remaining : Infinity,
+  remaining: __wfBudgetSnapshot && typeof __wfBudgetSnapshot === "object"
+    ? __wfBudgetRemaining(__wfBudgetSnapshot.remaining)
+    : Infinity,
 };
 const __wfRefreshBudget = async () => {
   const fresh = await __wfBridgeBudget("snapshot");
   if (fresh && typeof fresh === "object") {
     __wfBudgetState.spent = fresh.spent;
-    __wfBudgetState.remaining = fresh.remaining;
+    __wfBudgetState.remaining = __wfBudgetRemaining(fresh.remaining);
   }
 };
 // \`agent(prompt, opts)\` is the documented form. A single object is passed
@@ -107,7 +117,17 @@ const agent = (prompt, opts) => {
     return value;
   });
 };
-const __wfSettled = (promise) => Promise.resolve(promise).then((value) => value, () => null);
+const __wfSettled = (promise) => Promise.resolve(promise).then(
+  (value) => value,
+  (error) => {
+    // A thunk's own throw means "this branch did not produce a result" and
+    // becomes null. An author error (unknown agent, typo'd option, schema that
+    // can never validate, a cap) is a mistake in the script itself: rethrowing
+    // fails the run instead of quietly dropping the call through filter(Boolean).
+    if (error && error.workflowAuthorError) throw error;
+    return null;
+  },
+);
 const __wfCheckBatch = (count, what) => {
   if (typeof count !== "number" || count < 0) throw new Error(what + " expects an array");
   if (count > ${maxItemsPerBatch}) throw new Error(what + " accepts at most ${maxItemsPerBatch} items, got " + count);
@@ -253,9 +273,17 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
   // an answer nobody sends would hang invisibly. The watchdog is host-side and
   // resets on any call, result, or idle transition.
   let lastActivity = Date.now();
-  // The interval only needs to be fine enough to notice a spinning script
-  // promptly; the deadline itself is `runTimeoutMs`.
+  /**
+   * Calls the script is still waiting on. The sandbox has no deadline of its
+   * own, so this is what keeps the watchdog honest: while the host owes the
+   * script an answer it is not stuck, and one healthy agent is allowed to
+   * outlast the whole inactivity budget.
+   */
+  let outstanding = 0;
+  // The interval only needs to be fine enough to notice a stuck script
+  // promptly; the budget itself is `runTimeoutMs`.
   const watchdog = setInterval(() => {
+    if (outstanding > 0) return;
     if (Date.now() - lastActivity >= limits.runTimeoutMs) {
       controller.abort(
         new Error(`workflow script made no progress for ${Math.round(limits.runTimeoutMs / 1000)}s`),
@@ -281,7 +309,11 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
       seed: options.seed,
       globals: WORKFLOW_GLOBALS,
       signal: controller.signal,
-      timeoutMs: limits.runTimeoutMs,
+      // No absolute deadline: `runTimeoutMs` is an inactivity budget (see the
+      // watchdog above), and a single agent session legitimately runs longer
+      // than any fixed cap. A script that computes without yielding is still
+      // bounded by the VM's interrupt budget.
+      timeoutMs: Number.POSITIVE_INFINITY,
       onStarted: (value) => {
         fingerprint = value;
         options.onStarted?.(value);
@@ -293,12 +325,14 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
       onCall: (call) => {
         lastActivity = Date.now();
         issuedCalls++;
+        outstanding++;
         let answered = false;
         // Single answer path: the host calls this at most once per call, but
         // the guard keeps a late second answer from overwriting the first.
         const deliver = (outcome: CodemodeOutcome) => {
           if (answered) return;
           answered = true;
+          outstanding--;
           lastActivity = Date.now();
           answer({ id: call.id, outcome });
         };

@@ -8,9 +8,9 @@
  */
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { WorkflowManager } from "../pi-extension/subagents/workflow/manager.ts";
 import {
@@ -686,6 +686,169 @@ return { fast, slow };
       resumedView.calls.every((call) => call.status === "completed"),
       "the retried call must end up completed, not skipped",
     );
+  });
+
+  it("does not launch a call that was skipped while it was still queued", async () => {
+    // Two slots, three slow calls: the third is still queued when the user
+    // skips it. When a slot frees up afterwards nothing may start — the call
+    // used to launch anyway and journal a second, "completed" line, which
+    // resume then replayed as a real answer.
+    const previous = process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS;
+    process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS = "2";
+    try {
+      service = new FakeSubagentService();
+      service.delays.set("work-", 250);
+      const manager = createManager();
+      const script = `export const meta = { name: 'skip-queued', description: 'x' }
+return await parallel([1, 2, 3].map((n) => async () => agent('work-' + n, { label: 'work-' + n })));
+`;
+      const run = await manager.start({ source: script, args: {} });
+      const execution = run.execute();
+
+      let queued = run.view().calls.find((call) => call.status === "queued");
+      for (let attempt = 0; attempt < 200 && !queued; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        queued = run.view().calls.find((call) => call.status === "queued");
+      }
+      assert.ok(queued, "a call must be queued behind the two slots");
+      const skipped = queued!;
+      assert.equal(run.skip(skipped.callKey), true);
+
+      const view = await execution;
+      assert.equal(view.status, "completed", view.error);
+      const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+        .filter((entry) => entry.callKey === skipped.callKey);
+      assert.deepEqual(journal.map((entry) => entry.status), ["skipped"], "one settled line per call");
+      assert.ok(
+        !service.spawns.some((spawn) => spawn.task === skipped.label),
+        "the skipped call must not start an agent when its slot frees up",
+      );
+      assert.equal(view.calls.find((call) => call.callKey === skipped.callKey)!.status, "skipped");
+
+      // A skip is a decision for this run only: resume retries the call.
+      const resumed = await (await manager.resume(view.runId)).execute();
+      assert.equal(resumed.status, "completed", resumed.error);
+      assert.equal(resumed.calls.find((call) => call.label === skipped.label)!.status, "completed");
+      assert.ok(
+        service.spawns.some((spawn) => spawn.task === skipped.label),
+        "resume must really run the skipped call",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS;
+      else process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS = previous;
+    }
+  });
+
+  it("keeps a run alive while an agent is still working past the inactivity budget", async () => {
+    // The budget measures progress, not wall clock: one agent that outlasts it
+    // is working normally, so the run must not be killed.
+    service = new FakeSubagentService();
+    service.delays.set("patient", 900);
+    const manager = createManager();
+    const script = `export const meta = { name: 'long-agent', description: 'x' }
+return await agent('patient', { label: 'p' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setScriptTimeout(400);
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, "echo:patient");
+  });
+
+  it("gives concurrent same-label calls distinct agent names", async () => {
+    // The real service only learns a name once the pane launch resolves, so a
+    // same-label fan-out reads the same taken-set for every call. The runtime
+    // must reserve what it hands out, or stop/focus/message answer with
+    // "Ambiguous subagent name".
+    service = new FakeSubagentService();
+    const spawn = service.spawn.bind(service);
+    const registered: string[] = [];
+    service.spawn = async (request) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      registered.push(request.name);
+      return spawn(request);
+    };
+    service.takenNames = () => new Set(registered);
+    const manager = createManager();
+    const script = `export const meta = { name: 'names-flow', description: 'x', agent: 'worker' }
+return await parallel([1, 2, 3].map((n) => async () => agent('check-' + n, { label: 'check' })));
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    const names = view.calls.map((call) => call.name);
+    assert.equal(new Set(names).size, 3, `names must be unique, got ${names.join(", ")}`);
+  });
+
+  it("fails the run on an author error inside parallel()", async () => {
+    // A dead agent is null; a typo is the author's mistake. parallel() swallows
+    // a thunk's own throw, so the runtime has to mark author errors as fatal or
+    // the run completes with a null and nobody learns about the typo.
+    service = new FakeSubagentService();
+    const manager = createManager();
+    const script = `export const meta = { name: 'typo-flow', description: 'x' }
+const results = await parallel([async () => agent('looks fine', { label: 'a' }), async () => agent('typo', { label: 'b', schemas: {} })]);
+return results.length;
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "failed");
+    assert.match(String(view.error), /unknown option/);
+  });
+
+  it("reports remaining() as Infinity when no token budget is set", async () => {
+    // Infinity does not survive the JSON bridge; the prelude has to read a null
+    // remaining back as Infinity, or `remaining() < 1000` compares null to 0.
+    service = new FakeSubagentService();
+    service.tokensPerAgent = 7;
+    const manager = createManager();
+    const script = `export const meta = { name: 'unbounded-flow', description: 'x', agent: 'worker' }
+const before = budget.remaining();
+await agent('scan', { label: 'a' });
+return {
+  total: budget.total,
+  beforeInfinite: before === Infinity,
+  afterInfinite: budget.remaining() === Infinity,
+  huge: budget.remaining() > 1e9,
+};
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.deepEqual(view.result, { total: null, beforeInfinite: true, afterInfinite: true, huge: true });
+  });
+
+  it("reuses the newest matching run, not whichever id sorts last", async () => {
+    // Run ids are random, so directory order says nothing about age. Renaming
+    // the two runs to invert their sort order makes the difference visible.
+    service = new FakeSubagentService();
+    const manager = createManager();
+    const script = `export const meta = { name: 'newest-flow', description: 'x', agent: 'worker' }
+return await agent('scan', { label: 'scan' });
+`;
+    service.replies.set("scan", "old-answer");
+    const first = await (await manager.start({ source: script, args: {} })).execute();
+    service.replies.set("scan", "new-answer");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    // `reuse: 'none'` makes the second run write its own journaled answer
+    // instead of replaying the first one's.
+    const second = await (await manager.start({ source: script, args: {}, reuse: "none" })).execute();
+    assert.ok(second.createdAt > first.createdAt, "the two runs must be distinguishable by age");
+
+    // The oldest run gets the id that sorts last, so directory order is the
+    // reverse of age.
+    const rename = (view: WorkflowRunView, runId: string) =>
+      renameSync(view.runDir, join(dirname(view.runDir), runId));
+    rename(first, "wf-zzzzzz000001");
+    rename(second, "wf-aaaaaa000002");
+
+    const third = await (await manager.start({ source: script, args: {} })).execute();
+    assert.equal(third.status, "completed", third.error);
+    assert.equal(third.resumedFrom, "wf-aaaaaa000002", "the newest run is the one to replay");
+    assert.equal(third.result, "new-answer");
   });
 
   it("aborts a run, stops its agents and marks the run aborted", async () => {
