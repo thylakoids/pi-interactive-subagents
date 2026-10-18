@@ -55,6 +55,10 @@ class FakeSubagentService implements WorkflowSubagentService {
   /** prompt substring → reply; everything else echoes the task. */
   replies = new Map<string, string>();
   delays = new Map<string, number>();
+  /** prompt substring → this agent never exits (a wedged agent). */
+  hangs = new Set<string>();
+  /** prompt substring → this agent reports "waiting" (parked on a question). */
+  waiting = new Set<string>();
   failures = new Set<string>();
   structured = new Map<string, unknown>();
   structuredMissing = new Set<string>();
@@ -94,7 +98,10 @@ class FakeSubagentService implements WorkflowSubagentService {
     this.inFlight++;
     this.peakConcurrency = Math.max(this.peakConcurrency, this.inFlight);
     const delay = this.delayFor(request.task);
+    const hang = [...this.hangs].some((needle) => request.task.includes(needle));
     const completion = new Promise<WorkflowSubagentCompletion>((resolve) => {
+      // An agent whose process never exits: no timer, no resolution.
+      if (hang) return;
       setTimeout(() => {
         this.inFlight--;
         const failed = [...this.failures].some((needle) => request.task.startsWith(needle) || request.task.includes(needle + "\n"));
@@ -146,7 +153,13 @@ class FakeSubagentService implements WorkflowSubagentService {
 
   status(name: string) {
     if (!this.permitted(name)) return undefined;
-    return { kind: "active" as const, elapsedMs: 10, label: "read" };
+    const parked = this.spawns.some(
+      (spawn) =>
+        spawn.name === name && [...this.waiting].some((needle) => spawn.task.includes(needle)),
+    );
+    return parked
+      ? { kind: "waiting" as const, elapsedMs: 10, label: null }
+      : { kind: "active" as const, elapsedMs: 10, label: "read" };
   }
 
   private permitted(name: string) {
@@ -756,6 +769,71 @@ return await agent('patient', { label: 'p' });
     const view = await run.execute();
     assert.equal(view.status, "completed", view.error);
     assert.equal(view.result, "echo:patient");
+  });
+
+  it("fails one wedged call instead of hanging the run forever", async () => {
+    // The script watchdog stays quiet while the host owes the script an answer,
+    // so an agent that never exits is bounded by the per-call ceiling: its call
+    // fails, the script continues with null, and the run still completes.
+    service = new FakeSubagentService();
+    service.hangs.add("wedged");
+    const manager = createManager();
+    const script = `export const meta = { name: 'wedged-agent', description: 'x' }
+const first = await agent('wedged', { label: 'wedged' });
+const second = await agent('healthy', { label: 'healthy' });
+return { first, second };
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(150);
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.deepEqual(view.result, { first: null, second: "echo:healthy" });
+    const wedged = view.calls.find((call) => call.label === "wedged");
+    assert.equal(wedged?.status, "failed");
+    assert.match(String(wedged?.error), /without finishing/);
+    // The agent is stopped, not left running in a pane that nobody waits for.
+    assert.deepEqual(service.stopped, [wedged?.name]);
+  });
+
+  it("keeps an intentional wait alive past the per-call ceiling", async () => {
+    // A step parked on ask_question reports "waiting": that is the run working
+    // as designed, not a dead agent, so the ceiling must never fire on it. Only
+    // work time counts.
+    service = new FakeSubagentService();
+    service.hangs.add("asking");
+    service.waiting.add("asking");
+    const manager = createManager();
+    const script = `export const meta = { name: 'waiting-step', description: 'x' }
+return await agent('asking', { label: 'asking' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(100);
+    const executing = run.execute();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    run.abort();
+    const view = await executing;
+    assert.equal(view.status, "aborted");
+    assert.equal(view.calls.find((call) => call.label === "asking")?.status, "aborted");
+    assert.equal(view.failedCount, 0, "a wait must not be reported as a failed call");
+  });
+
+  it("still fails a script that waits on a promise nobody answers", async () => {
+    // The per-call ceiling must not swallow the script-level net: with nothing
+    // outstanding, a script that never makes progress is still a broken script,
+    // and the run has to fail instead of waiting forever.
+    service = new FakeSubagentService();
+    const manager = createManager();
+    const script = `export const meta = { name: 'stuck-script', description: 'x' }
+await new Promise(() => {});
+return 'unreachable';
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setScriptTimeout(250);
+    const view = await run.execute();
+    assert.equal(view.status, "failed");
+    // Either net is acceptable: the VM reports the unanswerable promise, and
+    // the host watchdog reports the same stall as "no progress".
+    assert.match(String(view.error), /never settle|no progress/);
   });
 
   it("gives concurrent same-label calls distinct agent names", async () => {

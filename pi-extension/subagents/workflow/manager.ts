@@ -129,6 +129,15 @@ export class WorkflowRun {
   phase?: string;
   /** Script-side inactivity budget; overridable for tests. */
   scriptTimeoutMs = 30 * 60 * 1000;
+  /**
+   * How long one agent call may stay in flight before the run gives up on it.
+   * The script watchdog deliberately stays quiet while the host still owes the
+   * script an answer, so a wedged agent would otherwise hold the run open
+   * forever: this ceiling turns "dead agent" into "failed call" (the script
+   * continues with null) instead of a run that never ends. It only has to
+   * catch a dead agent, never a slow one, so it is generous.
+   */
+  callTimeoutMs = callCeilingFromEnv();
   error?: string;
   result?: unknown;
 
@@ -257,6 +266,11 @@ export class WorkflowRun {
    */
   setScriptTimeout(ms: number): void {
     this.scriptTimeoutMs = Math.max(100, Math.floor(ms));
+  }
+
+  /** Override the per-call ceiling; tests use it to reach the timeout quickly. */
+  setCallTimeout(ms: number): void {
+    this.callTimeoutMs = ms === Number.POSITIVE_INFINITY ? ms : Math.max(50, Math.floor(ms));
   }
 
   private get maxConcurrent(): number {
@@ -603,8 +617,13 @@ export class WorkflowRun {
       liveCall.sessionFile = handle.sessionFile;
       this.running.set(liveCall.callKey, handle);
 
-      const completion = await withRunAbort(handle.completion, this.abortController.signal);
-      if (completion.aborted) {
+      const completion = await withRunAbort(
+        handle.completion,
+        this.abortController.signal,
+        this.callTimeoutMs,
+        () => this.manager.service.status(handle.name)?.kind === "waiting",
+      );
+      if (completion.ended === "aborted") {
         this.manager.service.stop(handle.name);
         return this.recordOutcome(liveCall, {
           ok: false,
@@ -613,8 +632,24 @@ export class WorkflowRun {
           error: "run aborted while the agent was running",
         });
       }
+      if (completion.ended === "timeout") {
+        // The run is healthy and every other call is unaffected: stop this one
+        // agent, journal the call as failed, and let the script see null.
+        // Killing the whole run for one wedged agent is what makes a hung agent
+        // look like an infrastructure error.
+        this.manager.service.stop(handle.name);
+        return this.recordOutcome(liveCall, {
+          ok: false,
+          status: "failed",
+          value: null,
+          error:
+            `agent ran for ${formatMinutes(this.callTimeoutMs)} without finishing and was stopped; ` +
+            "the call limit is the run's per-call ceiling, not a script deadline. " +
+            "Split the task or run it outside the workflow if it needs longer.",
+        });
+      }
 
-      const result = completion.value!;
+      const result = completion.value;
       const structured = parsed.opts.schema ? readStructuredResult(resultFile) : undefined;
       if (parsed.opts.schema && structured?.error) {
         return this.recordOutcome(liveCall, {
@@ -1360,20 +1395,85 @@ function readStructuredResult(path?: string): { value?: unknown; error?: string 
   }
 }
 
-/** Await a completion promise, but stop waiting when the run is aborted. */
+/**
+ * Await a completion promise, but stop waiting when the run is aborted or the
+ * call spends too long *working*. Whichever happens first wins; the other
+ * callback is detached, so a later exit cannot resolve twice or keep a timer
+ * alive.
+ *
+ * `isLegitimateWait` marks the time that must not count against the ceiling: a
+ * step parked on ask_question, or idling at its own prompt waiting for the
+ * orchestrator, is doing exactly what the run asked of it. The ceiling is a
+ * dead-agent detector, so it measures work, never wall clock.
+ */
 async function withRunAbort<T>(
   promise: Promise<T>,
   signal: AbortSignal,
-): Promise<{ aborted: true } | { aborted: false; value: T }> {
-  if (signal.aborted) return { aborted: true };
-  return new Promise((resolve) => {
-    const onAbort = () => resolve({ aborted: true });
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then((value) => {
+  timeoutMs: number,
+  isLegitimateWait: () => boolean = () => false,
+): Promise<{ ended: "aborted" } | { ended: "timeout" } | { ended: "done"; value: T }> {
+  if (signal.aborted) return { ended: "aborted" };
+  type CallEnd = { ended: "aborted" } | { ended: "timeout" } | { ended: "done"; value: T };
+  return new Promise<CallEnd>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finished = false;
+    let busyMs = 0;
+    const settle = (result: CallEnd) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
-      resolve({ aborted: false, value });
-    });
+      resolve(result);
+    };
+    const onAbort = () => settle({ ended: "aborted" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then((value) => settle({ ended: "done", value }));
+    // setTimeout turns an infinite delay into ~1 ms, so "no ceiling" must skip
+    // the timer rather than pass it through.
+    if (!Number.isFinite(timeoutMs)) return;
+    // Fine enough to notice a question being answered, coarse enough to stay
+    // free on the hour-long default.
+    const tickMs = Math.max(25, Math.min(timeoutMs / 20, 15_000));
+    const tick = () => {
+      if (finished) return;
+      let waiting = false;
+      try {
+        waiting = isLegitimateWait();
+      } catch {
+        // An unreadable status is not evidence of a wait.
+      }
+      if (!waiting) busyMs += tickMs;
+      if (busyMs >= timeoutMs) {
+        settle({ ended: "timeout" });
+        return;
+      }
+      timer = setTimeout(tick, tickMs);
+      timer.unref?.();
+    };
+    timer = setTimeout(tick, tickMs);
+    timer.unref?.();
   });
+}
+
+/**
+ * The per-call ceiling, overridable at runtime. A step that waits on a human
+ * answer (ask_question) can legitimately take longer than the default, and an
+ * operator may prefer a different bound; `0` or a non-positive value disables
+ * the ceiling entirely.
+ */
+function callCeilingFromEnv(): number {
+  const raw = process.env.PI_WORKFLOW_CALL_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return 60 * 60 * 1000;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms)) return 60 * 60 * 1000;
+  return ms <= 0 ? Number.POSITIVE_INFINITY : Math.floor(ms);
+}
+
+/** A limit named in an error message, in the unit a reader expects. */
+function formatMinutes(ms: number): string {
+  if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  const minutes = Math.round(ms / 60_000);
+  return minutes === 1 ? "1 min" : `${minutes} min`;
 }
 
 /**

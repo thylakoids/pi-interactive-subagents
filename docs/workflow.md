@@ -314,7 +314,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 - 不支持嵌套：`workflow()` 调用直接报错；子步骤写进当前脚本。
 - 需要 tmux；pi 会话必须有持久化 session 文件，否则 start 直接以 `Cannot run a workflow: …` 拒绝。
 - `agent()` 只能使用当前会话允许的 agent 定义（与 `subagent` 工具同一套 allowlist），都不满足时会报错。
-- 脚本 30 分钟无任何进展会被中止（默认值，偏宽松；agent 正常工作会不断重置）。
+- 超时是两层的，都不按整轮的墙钟算：脚本自身 30 分钟没有任何进展、且没有未结算的调用，才中止整轮；单个 `agent()` 调用累计运行 60 分钟仍未结束则以 `failed` 结算，脚本拿到 `null` 继续，其他调用和整轮都不受影响。等待 `ask_question` 回复（状态 `waiting`）的时间不计入这个上限。`PI_WORKFLOW_CALL_TIMEOUT_MS` 可以改单调用上限，设为 `0` 关闭。
 - 沙箱无文件系统/网络/计时器，堆上限 256MB；脚本卡死不会拖住 pi 主界面。
 - 每个 `agent()` 都是完整模型调用，成本按 agent 数量线性增长。
 
