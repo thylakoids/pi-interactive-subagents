@@ -362,6 +362,7 @@ function createSurfaceFor(anchor: string): string {
   }
   // Layout-neutral, so it renders no frame; see the mark's role in layout.ts.
   runTmux(["set-option", "-p", "-t", pane, "@pi_subagent", tree], true);
+  runTmux(["set-option", "-p", "-t", pane, "@pi_subagent_parent", anchor], true);
   surfaceWindows.set(pane, { window, tree });
   return pane;
 }
@@ -488,6 +489,21 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     { encoding: "utf8" },
   );
   return stdout;
+}
+
+/** Close only this pane and its delegated descendants, including overflow windows. */
+export function closeSurfaceTree(root: string): void {
+  requireTmux();
+  const rows = runTmux(["list-panes", "-a", "-F", "#{pane_id}|#{@pi_subagent_parent}"], true)
+    .trim().split("\n").map(line => line.split("|"));
+  const owned = new Set([root]);
+  const order = [root];
+  for (let i = 0; i < order.length; i++) {
+    for (const [pane, parent] of rows) {
+      if (parent === order[i] && pane && !owned.has(pane)) { owned.add(pane); order.push(pane); }
+    }
+  }
+  for (const pane of order.reverse()) closeSurface(pane);
 }
 
 /**

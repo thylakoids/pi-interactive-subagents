@@ -65,21 +65,21 @@ it('legacy alias still enforces worker authorization', async t => {
   assert.equal(f.calls.length, 0);
 });
 
-it('runtime workflow policy disables control tools without weakening normal worker permissions', () => {
+it('workflow policy restores questions and declared delegation without granting undeclared agents', () => {
   const worker = __test__.loadAgentDefaults('worker')!;
-  const normal = __test__.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true })!;
-  assert.match(normal, /subagent/);
-  assert.match(normal, /ask_question/);
-  const policy = workflowExecution({ ...worker, tools: worker.tools + ',subagent,subagents_list,subagent_message,workflow,ask_question,*' });
-  for (const blocked of ['subagent', 'subagents_list', 'subagent_message', 'workflow', 'ask_question', '*']) {
-    assert.ok(!policy.toolAllowlist.split(',').includes(blocked), blocked);
+  const policy = workflowExecution({ ...worker, tools: worker.tools + ',workflow,*' });
+  for (const restored of ['subagent', 'subagents_list', 'subagent_message', 'ask_question']) {
+    assert.ok(policy.toolAllowlist.split(',').includes(restored), restored);
   }
+  for (const blocked of ['workflow', '*']) assert.ok(!policy.toolAllowlist.split(',').includes(blocked));
+  assert.deepEqual(policy.spawnable, ['scout', 'researcher']);
   assert.ok(policy.identity.endsWith(WORKFLOW_EXECUTION_CONTRACT));
-  assert.equal(policy.spawnable, null);
   assert.equal(policy.interactive, false);
   assert.equal(policy.autoExit, true);
   assert.equal(policy.sessionMode, 'lineage-only');
-  assert.throws(() => workflowExecution({ tools: 'subagent,ask_question,*' }), /no permitted step tools/);
+  const unprivileged = workflowExecution({ tools: 'read,subagent,subagent_message,subagents_list' });
+  assert.deepEqual(unprivileged.toolAllowlist.split(','), ['read', 'ask_question']);
+  assert.equal(unprivileged.spawnable, null);
 });
 
 it('production workflow adapter always enables the runtime contract, even with legacy false flags', async () => {

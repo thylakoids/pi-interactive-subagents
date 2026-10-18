@@ -180,8 +180,8 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
   // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
+  // lands through `input`, including replies steered into the current run.
+  // A new agent turn alone may just be a delegated child result, not an answer.
   let awaitingAnswer = false;
 
   // Show widget + status bar on session start
@@ -217,9 +217,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // Notifications from delegated children also start turns. Only actual
+    // parent/human input acknowledges an outstanding clarification question.
     recorder.agentStart();
   });
 
@@ -301,6 +300,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", (event) => {
+    if (awaitingAnswer) return { block: true, reason: "Waiting for the parent orchestrator to reply to ask_question. Stop and wait; do not guess or continue." };
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
   });
 

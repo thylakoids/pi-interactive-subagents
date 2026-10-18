@@ -88,9 +88,13 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
 Workflows default to the same `worker` definition. The runtime enforces single-step
-execution: no delegation or question tools, no conversation fork, automatic termination,
-and direct result output (or `structured_output`). Normal workers retain their delegation
-capabilities. The old `workflow-subagent` name remains a workflow-only compatibility
+execution: no conversation fork, automatic termination after completion, and direct
+result output (or `structured_output`). Workflow workers may ask the parent for a
+clarification and delegate to agents in their definition's allowlist. A question parks
+the same session until the parent replies with `subagent_message`; delegated results
+do not acknowledge an outstanding question. Abort also closes delegated descendants,
+and delayed replies cannot restart an aborted step (explicit Focus or workflow
+Resume is required). Nested workflow orchestration remains unsupported. The old `workflow-subagent` name remains a workflow-only compatibility
 alias when no user definition of that name exists; old completed calls remain reusable
 on resume. No separate bundled definition is installed.
 

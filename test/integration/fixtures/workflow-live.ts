@@ -49,12 +49,13 @@ export default function liveFixture(pi: any) {
           assert.ok(call.sessionFile && existsSync(call.sessionFile), 'Real child session must exist');
           const loadout = readSubagentLoadout(call.sessionFile!)!;
           assert.ok(loadout, 'Real workflow loadout must be persisted');
-          assert.equal(loadout.spawnable, null, 'Worker delegation must be removed for workflow steps');
+          assert.ok(loadout.toolAllowlist!.split(',').includes('ask_question'));
+          if (call.agentType === 'worker') assert.deepEqual(loadout.spawnable, ['scout', 'researcher']);
           assert.equal(loadout.autoExit, true);
           assert.match(loadout.identity!, /Workflow execution contract/);
           assert.equal(loadout.model, process.env.PI_TEST_MODEL, 'Unpinned worker inherits the parent model');
           const tools = loadout.toolAllowlist!.split(',');
-          for (const denied of ['subagent', 'subagents_list', 'subagent_message', 'workflow', 'ask_question']) assert.ok(!tools.includes(denied), denied + ' must be unavailable');
+          for (const denied of ['workflow']) assert.ok(!tools.includes(denied), denied + ' must be unavailable');
           const rows = readFileSync(call.sessionFile!, 'utf8').trim().split('\n').map(line => JSON.parse(line));
           const responses = rows.filter(row => row.type === 'message' && row.message?.role === 'assistant');
           assert.ok(responses.some(row => row.message.usage?.input > 0 || row.message.usage?.output > 0), 'Must contain billed provider response, not a scripted reply');

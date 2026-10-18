@@ -1213,6 +1213,10 @@ async function handleSubagentSteer(
     return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
   }
   const running = resolved.running;
+  if (existsSync(`${running.sessionFile}.workflow-aborted`)) {
+    const error = "This workflow step was aborted. Resume the workflow or explicitly Focus the session before continuing it.";
+    return { content: [{ type: "text" as const, text: error }], details: { error } };
+  }
   observeRunningSubagent(running, Date.now());
   const steer = await steerSubagent(running, message, send);
   if ("error" in steer) {
@@ -1304,6 +1308,7 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
+  deliverPendingQuestion,
   getToolExtensionPath,
   resolveRunningByName,
   uniqueRunningName,
@@ -1340,7 +1345,7 @@ function startWidgetRefresh() {
  * print the sentinel the watcher polls for.
  */
 function finishCommand(command: string): string {
-  return `${command}; status=$?; tmux set-option -p -t "$TMUX_PANE" -u @pi_subagent 2>/dev/null; echo '__SUBAGENT_DONE_'$status'__'`;
+  return `${command}; status=$?; tmux set-option -p -t "$TMUX_PANE" -u @pi_subagent 2>/dev/null; tmux set-option -p -t "$TMUX_PANE" -u @pi_subagent_parent 2>/dev/null; echo '__SUBAGENT_DONE_'$status'__'`;
 }
 
 const openingSessions = new Set<string>();
@@ -1364,6 +1369,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     sessionPath = savedSession ?? entry?.sessionFile;
     if (!sessionPath || !existsSync(sessionPath)) throw new Error("The original session file is unavailable.");
     sessionPath = resolve(sessionPath);
+    try { unlinkSync(`${sessionPath}.workflow-aborted`); } catch {}
     if (openingSessions.has(sessionPath)) throw new Error("This session is already opening.");
     openingSessions.add(sessionPath);
     ownsOpening = true;
@@ -1541,7 +1547,7 @@ async function launchSubagent(
         : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
     // An agent with a non-empty subagent_agents list is granted the spawning
     // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-    const grantSpawning = !policy && !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+    const grantSpawning = policy ? !!policy.spawnable?.length : !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
     const identity = policy?.identity ?? agentDefs?.body ?? null;
     const systemPromptMode = policy?.systemPromptMode ?? agentDefs?.systemPromptMode;
     const identityInSystemPrompt = systemPromptMode && identity;
@@ -1604,7 +1610,7 @@ async function launchSubagent(
       thinking: effectiveThinking ?? null,
       systemPromptMode: systemPromptMode ?? null,
       identity: identityInSystemPrompt ? identity : null,
-      spawnable: policy ? null : agentDefs?.subagentAgents ?? null,
+      spawnable: policy ? policy.spawnable : agentDefs?.subagentAgents ?? null,
       autoExit: effectiveAutoExit,
       cwd: effectiveCwd ?? null,
       agentDir: resolvedAgentDir,
@@ -1770,32 +1776,32 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    // A partial write is retried on the next watcher tick.
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  if (!payload?.question || !latestPi || existsSync(`${running.sessionFile}.workflow-aborted`)) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
+  try {
+    latestPi.sendMessage(
+      {
+        customType: "subagent_question",
+        content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+        display: true,
+        details: {
+          name,
+          agent: running.agent,
+          question: payload.question,
+          ...(sessionId ? { sessionId } : {}),
+        },
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch { return; } // Retry on the next watcher tick if delivery is unavailable.
+  try { unlinkSync(askFile); } catch {}
 }
 
 /**
@@ -2353,6 +2359,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Subagent "${requestedName}" is registered but its session file is gone ` +
             `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (existsSync(`${sessionPath}.workflow-aborted`)) {
+          const error = "This workflow step was aborted. Resume the workflow or explicitly Focus the session before continuing it.";
+          return { content: [{ type: "text" as const, text: error }], details: { error } };
         }
 
         // Guard: never resume a session that is still running — two processes

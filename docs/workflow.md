@@ -83,7 +83,7 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 子代理看不到本次对话，每个 prompt 都要自包含。
 
-**默认子代理。** `agent()` 没点名时使用普通 `worker`，`meta.agent` 和 `opts.agent` 照常覆盖。workflow 是执行模式，不是专用 agent 定义：运行时禁用委派、嵌套 workflow 和提问工具，强制非交互、自动退出、仅保留父会话 lineage，并将“直接返回步骤结果 / schema 最后调用 structured_output”的约束追加到系统提示。普通 worker 仍可委派。旧脚本的 `workflow-subagent` 名称在没有用户同名定义时映射到 worker；用户同名定义保留。旧默认调用的 journal 缓存键也兼容，resume 不会因此重跑已完成步骤。
+**默认子代理。** `agent()` 没点名时使用普通 `worker`，`meta.agent` 和 `opts.agent` 照常覆盖。workflow 是执行模式，不是专用 agent 定义：运行时保留提问能力及定义中允许的自行委派，仅禁用嵌套 workflow；步骤不依赖用户手动操作，但可通过 ask_question 等待主模型回复，完成后自动退出、仅保留父会话 lineage，并将“直接返回步骤结果 / schema 最后调用 structured_output”的约束追加到系统提示。主模型收到问题后用 subagent_message 回复，子代理在同一会话继续；委派结果通知不会误清除待回答问题。等待期间可 Abort，同时关闭派生子窗格；迟到回复不会重新启动已中止步骤，需显式 Focus 或 Resume。并发与 agent 数上限只统计脚本直接发出的 agent() 调用，自行委派的调用属于子代理，不能将直接调用上限当作整棵委派树的上限。旧脚本的 `workflow-subagent` 名称在没有用户同名定义时映射到 worker；用户同名定义保留。旧默认调用的 journal 缓存键也兼容，resume 不会因此重跑已完成步骤。
 
 ## 编写指导与渐进披露
 

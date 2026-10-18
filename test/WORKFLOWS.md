@@ -57,8 +57,8 @@ runs. It uses the production subagent service and real provider-backed Pi sessio
 not a replacement service. Temporary project-local definitions select the requested
 parent model through ordinary bundled agent definitions (with reduced thinking for
 the billed test); both old template scripts run unchanged. Every child loadout is
-checked for the runtime workflow contract, no delegation/question tools, no spawning
-grant, and automatic exit. The recovery probe uses the legacy workflow-subagent
+checked for the runtime workflow contract, question tools, definition-based spawning
+grants, and automatic exit after completion. The recovery probe uses the legacy workflow-subagent
 name and verifies that it launches worker and reuses its completed result.
 
 The suite independently checks:
@@ -79,3 +79,24 @@ on both success and failure. Its tmux session is stopped during teardown.
 user legacy definitions, old journal replay (including repeated calls whose first
 occurrence failed), authorization, mandatory workflow adapter flags and execution
 policy. Model inheritance tests also ensure native CLI profiles do not pin models.
+
+## Live model collaboration
+
+```sh
+PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model \
+  node --test test/integration/workflow-collaboration-live.test.ts
+```
+
+This billed test uses a real root model, real workflow workers and a delegated scout.
+Only the root receives a random token. A worker asks for it, the real root model
+observes the waiting state and invokes subagent_message, and the same worker
+continues, delegates file reading, consumes the scout result and writes the token.
+A second real worker asks another question, parks, and is aborted while waiting;
+its pane closes and its journal/disk state is terminal. Delayed replies are rejected.
+Artifacts and transcripts are retained and their directory is printed.
+
+workflow-questions.test.ts exercises the actual question tool, retryable parent
+notification and reply router. Delegated notifications cannot clear an outstanding
+question, and tools remain blocked until a real parent input arrives.
+workflow-descendants.test.ts checks real tmux cancellation ancestry without model
+calls, including preservation of unrelated sibling/parent panes.

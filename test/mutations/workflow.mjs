@@ -7,10 +7,23 @@ import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
-const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts'];
+const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
-  ['workflow control tools re-enabled', 'pi-extension/subagents/workflow/execution.ts',
+  ['delegated result incorrectly answers pending question', 'pi-extension/subagents/subagent-done.ts',
+    '    recorder.agentStart();', '    awaitingAnswer = false;\n    recorder.agentStart();'],
+  ['working continues before parent reply', 'pi-extension/subagents/subagent-done.ts',
+    'if (awaitingAnswer) return { block: true,', 'if (false) return { block: true,'],
+  ['notification lost when parent delivery fails', 'pi-extension/subagents/index.ts',
+    '} catch { return; } // Retry on the next watcher tick if delivery is unavailable.',
+    '} catch { unlinkSync(askFile); return; } // Regression'],
+  ['late reply accepted after workflow Abort', 'pi-extension/subagents/index.ts',
+    'if (existsSync(`${running.sessionFile}.workflow-aborted`)) {', 'if (false) {'],
+  ['undeclared workflow delegation enabled', 'pi-extension/subagents/workflow/execution.ts',
     '!BLOCKED_TOOLS.has(tool)', 'true'],
+  ['workflow questions hidden again', 'pi-extension/subagents/workflow/execution.ts',
+    "  tools.push('ask_question');", ''],
+  ['declared workflow delegation disabled', 'pi-extension/subagents/workflow/execution.ts',
+    'if (spawnable) tools.push(...SPAWNING_TOOLS);', ''],
   ['workflow policy not passed to launcher', 'pi-extension/subagents/wiring.ts',
     '          workflow: true,', '          workflow: false,'],
   ['old default journal reuse disabled', 'pi-extension/subagents/workflow/manager.ts',

@@ -1,0 +1,76 @@
+/** Real question tool, notification delivery and reply routing; transport is injected. */
+import { it } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import extension, { __test__ } from '../pi-extension/subagents/index.ts';
+import childExtension from '../pi-extension/subagents/subagent-done.ts';
+import { createStatusState } from '../pi-extension/subagents/status.ts';
+
+it('question waits across delegated notifications, retries failed delivery, and resumes on a routed parent reply', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'workflow-question-'));
+  const sessionFile = join(dir, 'child.jsonl');
+  const keys = ['PI_SUBAGENT_SESSION', 'PI_SUBAGENT_NAME', 'PI_SUBAGENT_AGENT', 'PI_SUBAGENT_AUTO_EXIT'];
+  const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  const countKey = Symbol.for('pi-subagents/running-children-count');
+  const oldCount = (globalThis as any)[countKey];
+  t.after(() => {
+    for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
+    __test__.runningSubagents.delete('question-test');
+    (globalThis as any)[countKey] = oldCount;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const delivered: any[] = [];
+  let unavailable = true;
+  extension({ on() {}, registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
+    getAllTools: () => [], getThinkingLevel: () => 'off', sendMessage(message: any, options: any) {
+      if (unavailable) throw new Error('Parent temporarily unavailable');
+      delivered.push({ message, options });
+    },
+  } as any);
+  (globalThis as any)[countKey] = () => 0;
+  Object.assign(process.env, { PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_NAME: 'waiting-worker', PI_SUBAGENT_AGENT: 'worker', PI_SUBAGENT_AUTO_EXIT: '1' });
+  const events = new Map<string, Function[]>();
+  const tools = new Map<string, any>();
+  childExtension({ on(name: string, handler: Function) { events.set(name, [...(events.get(name) ?? []), handler]); },
+    registerTool(tool: any) { tools.set(tool.name, tool); }, registerShortcut() {}, getAllTools: () => [],
+  } as any);
+  const emit = (name: string, event: any = {}, ctx: any = {}) => (events.get(name) ?? []).map(handler => handler(event, ctx));
+  let exits = 0;
+  const end = () => emit('agent_end', { messages: [{ role: 'assistant', stopReason: 'stop' }] }, { shutdown() { exits++; } });
+  const running: any = { id: 'question-test', name: 'waiting-worker', agent: 'worker', task: 'task', surface: '%unit-test', startTime: Date.now(), sessionFile, statusState: createStatusState({ source: 'pi', startTimeMs: Date.now() }) };
+  __test__.runningSubagents.set(running.id, running);
+  emit('agent_start');
+  await tools.get('ask_question').execute('ask', { question: 'Which token?' });
+  assert.equal(JSON.parse(readFileSync(sessionFile + '.ask', 'utf8')).question, 'Which token?');
+  end(); assert.equal(exits, 0);
+  __test__.deliverPendingQuestion(running);
+  assert.ok(existsSync(sessionFile + '.ask'), 'Failed notification must remain retryable');
+  unavailable = false;
+  __test__.deliverPendingQuestion(running);
+  __test__.deliverPendingQuestion(running);
+  assert.equal(delivered.length, 1, 'One notification per question');
+  assert.deepEqual(delivered[0].options, { triggerTurn: true, deliverAs: 'steer' });
+  assert.match(delivered[0].message.content, /subagent_message/);
+  assert.equal(existsSync(sessionFile + '.ask'), false);
+  // A delegated child result can start a turn, but it is not the parent's answer.
+  emit('agent_start');
+  assert.equal(emit('tool_call', { toolName: 'bash' })[0]?.block, true);
+  end(); assert.equal(exits, 0);
+  let reply = '';
+  const result = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'secret-token' }, (_surface: string, message: string) => {
+    reply = message; emit('input', { text: message }); emit('agent_start');
+  });
+  assert.equal(result.details.status, 'steered');
+  assert.equal(reply, 'secret-token');
+  assert.notEqual(emit('tool_call', { toolName: 'bash' })[0]?.block, true);
+  end(); assert.equal(exits, 1, 'Reply completes the same child rather than leaving it parked');
+  // A question/reply already queued before Abort must not resurrect the step.
+  await tools.get('ask_question').execute('ask-after', { question: 'Another question?' });
+  writeFileSync(sessionFile + '.workflow-aborted', 'aborted');
+  __test__.deliverPendingQuestion(running);
+  assert.equal(delivered.length, 1, 'No stale question notification after Abort');
+  const late = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'late answer' }, () => assert.fail('Aborted child must not receive a reply'));
+  assert.match(late.details.error!, /aborted/);
+});

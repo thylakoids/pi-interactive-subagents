@@ -1626,7 +1626,7 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
+    it("exits when the reply arrives as a new turn through input", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {

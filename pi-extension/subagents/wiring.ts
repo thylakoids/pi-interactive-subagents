@@ -8,11 +8,12 @@
  * the `workflow` tool, the `/workflow` command, the shortcut and the panel.
  */
 import { join as joinPath, dirname } from "node:path";
+import { writeFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { getSessionId } from "./session.ts";
 import { classifyStatus, formatStatusDetail } from "./status.ts";
-import { isMuxAvailable, muxSetupHint, closeSurface } from "./tmux.ts";
+import { isMuxAvailable, muxSetupHint, closeSurfaceTree } from "./tmux.ts";
 import type { RunningSubagent, SubagentResult } from "./index.ts";
 import type {
   WorkflowSubagentCompletion,
@@ -185,8 +186,10 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       // reported as an abort of the watcher.
       const resolved = surface.resolveRunning(name);
       if ("error" in resolved) return;
+      try { writeFileSync(`${resolved.running.sessionFile}.workflow-aborted`, "aborted"); } catch {}
+      try { unlinkSync(`${resolved.running.sessionFile}.ask`); } catch {}
       try {
-        closeSurface(resolved.running.surface);
+        closeSurfaceTree(resolved.running.surface);
       } catch {
         // Pane already gone.
       }
