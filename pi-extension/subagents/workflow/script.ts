@@ -15,12 +15,59 @@
  * the source is left byte-identical so line numbers in errors still match the
  * script the user wrote.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isValidMeta } from "./journal.ts";
 import type { WorkflowMeta } from "./types.ts";
 
 export class WorkflowScriptError extends Error {}
+
+export const BUNDLED_WORKFLOWS_DIR = fileURLToPath(new URL("../../../examples/workflows/", import.meta.url));
+
+export interface SavedWorkflow {
+  name: string;
+  meta: WorkflowMeta;
+  path: string;
+  source: "project" | "global" | "bundled";
+}
+
+/** Use the same precedence as name resolution, including invalid local overrides. */
+export function listSavedWorkflows(opts: { cwd: string; agentDir: string }): {
+  workflows: SavedWorkflow[];
+  errors: Array<{ path: string; error: string }>;
+} {
+  const workflows: SavedWorkflow[] = [];
+  const errors: Array<{ path: string; error: string }> = [];
+  const seen = new Set<string>();
+  const roots = [
+    { dir: join(opts.cwd, ".pi", "workflows"), source: "project" as const },
+    { dir: join(opts.agentDir, "workflows"), source: "global" as const },
+    { dir: BUNDLED_WORKFLOWS_DIR, source: "bundled" as const },
+  ];
+  for (const { dir, source } of roots) {
+    let names: string[];
+    try { names = readdirSync(dir).sort(); }
+    catch (error: any) {
+      if (error.code !== "ENOENT") errors.push({ path: dir, error: error.message });
+      continue;
+    }
+    for (const filename of names) {
+      if (!/^[A-Za-z0-9._-]{1,64}\.js$/.test(filename)) continue;
+      const name = filename.slice(0, -3);
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const path = join(dir, filename);
+      try {
+        const { meta } = parseScript(readScriptFile(path), path);
+        workflows.push({ name, meta, path, source });
+      } catch (error: any) {
+        errors.push({ path, error: error.message });
+      }
+    }
+  }
+  return { workflows, errors };
+}
 
 export interface ParsedScript {
   /** Script text with the meta export rewritten; safe to run in the sandbox. */
@@ -51,6 +98,7 @@ export function resolveSavedScriptPath(
   const candidates = [
     join(opts.cwd, ".pi", "workflows", `${trimmed}.js`),
     join(opts.agentDir, "workflows", `${trimmed}.js`),
+    join(BUNDLED_WORKFLOWS_DIR, `${trimmed}.js`),
   ];
   return candidates.find((path) => existsSync(path)) ?? null;
 }

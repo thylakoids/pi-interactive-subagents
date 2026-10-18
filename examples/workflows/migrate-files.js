@@ -1,4 +1,9 @@
-export const meta = { name: 'migrate-files', description: '逐文件：一个 agent 出迁移计划，另一个按计划执行，第三个验证；按计划的 risky 标记选择验证强度', phases: ['Plan', 'Apply', 'Verify'] }
+export const meta = {
+  name: 'migrate-files',
+  description: '逐文件：一个 agent 出迁移计划，另一个按计划执行，第三个验证；按计划的 risky 标记选择验证强度',
+  whenToUse: '当迁移可以按文件拆分，并且每个文件都要独立经历 plan → apply → verify 时',
+  phases: ['Plan', 'Apply', 'Verify'],
+}
 
 // 计划与验证结论都用 schema：脚本要按 risky / ok 分支，只能消费结构化结果
 const PLAN_SCHEMA = {
@@ -44,7 +49,6 @@ await phase('Plan')
 await log('迁移 ' + files.length + ' 个文件：' + task)
 
 // pipeline 无屏障：文件 A 的 apply/verify 不必等文件 B 的 plan 做完
-// 所以 stage 之间不要再 await 中间状态日志：结果按调用序号回传，会拖慢后面 stage 的发起
 const results = await pipeline(
   files,
   async (file) => {

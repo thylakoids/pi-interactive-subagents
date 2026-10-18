@@ -75,7 +75,11 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 `script.ts` 要求首句 `export const meta = {...}`，把 `export` 改写成 `const` 后交给沙箱（其余字节不动，报错行号与用户脚本一致）；meta 按 JSON 值严格解析（接受单引号、无引号键、尾逗号；拒绝模板串、标识符、调用），字段为 `name`（1-64 位 `[A-Za-z0-9._-]`）、非空 `description`、可选 `phases: string[]`、可选默认 `agent`。
 
-模型侧工具名 `workflow`，参数 `action: start|resume|status` + `script | name | args | runId`。已保存工作流按 `.pi/workflows/<name>.js`、`$PI_CODING_AGENT_DIR/workflows/<name>.js` 顺序查找。工具描述内嵌 `WORKFLOW_GLOBAL_DECLARATIONS`，保证文档与运行时同源。
+模型侧工具名 `workflow`，参数 `action: start|resume|status|list|guide` + `script | name | args | runId`。已保存工作流按 `.pi/workflows/<name>.js`、`$PI_CODING_AGENT_DIR/workflows/<name>.js`、随包 `examples/workflows/<name>.js` 顺序查找。`list` 和 `guide` 只读，不需要 tmux、持久化会话或子代理配置，也不会启动模型调用；`list` 展示 description、`whenToUse`、phases 和路径，`guide` 返回完整指南或某个可运行模板。
+
+工具描述由 `authoring.ts` 生成，包含 opt-in 门槛、pipeline-first 规则、一个完整 `meta` + `pipeline` 范例、错误/恢复语义和规模建议；完整 runtime 声明由 `guide` 或 skill 按需提供。`PI_WORKFLOW_SIZE=small|medium|large|unrestricted` 控制约 5/10/50 次调用的规划后缀，默认 medium，`unrestricted` 省略数字；它不是运行时配额。`package.json` 注册随包 `workflow-authoring` skill，skill 再按需引用长文和模板。
+
+**与 Claude Code 2.1.302 的模型可见编写面。** 一次只读二进制探针测得：基础工具模板 3,088 字符；authoring reference 17,607 字符；另有 small/medium/large = 5/10/50、默认 medium 的规模后缀；唯一内置 `deep-research` 脚本为 24,272 字节。所谓“skill 可用时只挂指针、不可用时内联”来自文档结论，探针没有直接读到完整分发函数，因此这里把它记为较弱的证据。该设计的关键不是固定字数，而是“短工具面 + 可按需取到的长参考 + 可运行脚本”三层同时存在。本实现采用相同的信息架构，但脚本、模板、示例和权限模型均独立实现，不复制 CC 提示词。
 
 ### 3.3 调度与上限
 
@@ -123,7 +127,7 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 
 | 行为 | Claude Code | 本实现 | 差异说明 |
 |---|---|---|---|
-| 脚本语言与 meta | 纯 JS（非 TS）；`export const meta = {name, description, phases:[{title, detail?}], whenToUse?, ...}`（纯字面量） | 纯 JS；`export const meta = {name, description, phases: Array<string \| {title, detail?, model?}>, whenToUse?, agent?}`（纯 JSON 字面量，`export` 被改写为 `const`） | phases 两种写法都接受；本实现多一个默认 agent 字段；`whenToUse` 已接受但还没有展示列表；校验方式不同（JSON 字面量解析 vs 专用 validator） |
+| 脚本语言与 meta | 纯 JS（非 TS）；`export const meta = {name, description, phases:[{title, detail?}], whenToUse?, ...}`（纯字面量） | 纯 JS；`export const meta = {name, description, phases: Array<string \| {title, detail?, model?}>, whenToUse?, agent?}`（纯 JSON 字面量，`export` 被改写为 `const`） | phases 两种写法都接受；本实现多一个默认 agent 字段；`list` 展示 `whenToUse`；校验方式不同（JSON 字面量解析 vs 专用 validator） |
 | `agent()` 参数 | label、phase、schema、model、effort、isolation:`worktree`、agentType | label、phase、schema、agent / agentType（同名）、model、effort | 本实现无 worktree 隔离（传 `isolation` 明确报“未实现”，不静默忽略）；`effort` 与 `model` 分开下传，因此 `{ effort: 'low' }` 单独可用；未知选项一律报错 |
 | parallel / pipeline | 宿主提供的原语；pipeline 无 barrier、抛错项变 null；文档默认 pipeline | 同一语义，在脚本 prelude 内实现（纯 Promise 编排），`agent()` 是唯一跨宿主调用 | 语义一致，实现位置不同；两边都把 pipeline 作为默认写法 |
 | 结构化输出 | 强制调用 `StructuredOutput` 工具，ajv 在工具层校验并在不匹配时重试；`agent()` 返回校验后的对象 | 子代理加载 `structured-output` 扩展，把结果写入 sidecar `result.json`；JSON Schema 子集转 TypeBox | 本实现没有 ajv 级全量校验与“模型重试纠正”；缺结果/写失败时该次调用记为 failed；schema 转换有损（未覆盖的类型退化为 Unknown） |
@@ -145,9 +149,9 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 - **预算强制但单位自定**：`PI_WORKFLOW_TOKEN_BUDGET` 超限会让 run 失败。单位是子代理的**总** token（输入+输出），不是 CC 的输出 token——CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。差异是刻意的，已写进 `docs/workflow.md`。
 - **resume 语义与 CC 不同**：本实现按键全局回放，脚本若有文本之外的副作用（写文件、外部状态），回放的等价性与 CC 的“前缀”模型不同。这是刻意的取舍（按键回放才能跨进程 resume），已文档化；键里现在包含 model/effort 与出现次序。
 - **无用量限额暂停**：CC 在 rate limit 时暂停工作流、限额恢复后重跑等待中的 agent；本实现下这是一次普通失败（子代理内部的自动重试不受影响）。**在 pi 里做不到**：`WorkflowSubagentCompletion` 只暴露 exitCode/summary/error/usage，没有限额信号，得先把信号从子会话里传出来。
-- **无保存工作流/内置工作流/运行前审批**：CC 有 `.claude/workflows/`、内置 `deep-research`、`/workflows` 保存与展示 `meta.phases` 的权限对话框；本实现只有 `.pi/workflows` 查找与 subagent 的既有权限模型。审批这一条是刻意的——本插件靠子代理既有的权限模型加上人盯着窗格。
+- **内置模板与运行前审批**：CC 有特殊内置 `deep-research` 和展示阶段/权限的运行前对话框；本实现有六个普通、可覆盖的随包脚本，没有独立的内置执行特权或启动前审批。模板使用既有 agent allowlist 与子代理权限模型，`deep-research` 还要求可用的 `researcher` 类 agent。
 - **无 worktree 隔离**：并行改文件的 agent 会互相踩；CC 的 `isolation:'worktree'` 没有对应实现。传 `isolation` 会被明确拒绝（“未实现”），而不是静默忽略。
-- **无 `whenToUse` 展示列表 / 无 `list` 动作**：`meta.whenToUse` 已被接受并保存，但还没有一个“列出可用 workflow”的入口来展示它。
+- **指导仍是启发式而非固定场景表**：六种形状、默认 pipeline、schema 条件和规模建议降低选择空间，但模型仍可能在明确不适用的任务上误用 workflow；opt-in 门槛、实际输入约束和测试中的模板契约用于限制这一点。
 
 ## 如何自行复核
 

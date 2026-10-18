@@ -98,9 +98,21 @@ reviewers is twelve real pi sessions in twelve panes you can watch, message, or 
 export const meta = { name: "review-changes", description: "Review changed files", phases: ["Review", "Verify"] };
 
 const REVIEWERS = [{ key: "bugs", prompt: "..." }, { key: "perf", prompt: "..." }];
-const reviews = await parallel(REVIEWERS.map((r) => () => agent(r.prompt, { label: r.key, phase: "Review" })));
+const reviews = await pipeline(REVIEWERS,
+  (reviewer) => agent(reviewer.prompt, { label: reviewer.key, phase: "Review" }));
 ```
 
+- **Discoverable authoring.** The tool description includes a complete example and the
+  pipeline-first selection rules. For deeper work it points to the bundled
+  `workflow-authoring` skill; when skills are unavailable, `workflow({ action: "guide" })`
+  returns the same guidance without executing anything. `workflow({ action: "list" })`
+  shows project, global and bundled scripts with their descriptions and `whenToUse`;
+  `workflow({ action: "guide", name })` reads a full runnable template.
+- **Six composable templates.** `compare-options` demonstrates fan-out plus a real barrier,
+  `migrate-files` per-item pipelines, `review-changes` per-finding expansion,
+  `verify-claims` adversarial voting, `deep-research` a full search/fetch/verify/synthesis
+  chain, and `iterative-refinement` bounded budget-aware iteration. Project and global
+  scripts override bundled templates of the same name.
 - **Deterministic replay.** Calls are journaled by content hash — label, prompt, schema, agent,
   model and effort — so re-running the same script with the same args replays finished calls
   instead of redoing them, and editing a call re-runs exactly that call. Three identical calls
@@ -124,6 +136,9 @@ const reviews = await parallel(REVIEWERS.map((r) => () => agent(r.prompt, { labe
 
 Scripts see `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget` and
 `workflow` — nothing else: no filesystem, network, timers, or `Date.now()`.
+`PI_WORKFLOW_SIZE=small|medium|large|unrestricted` adjusts the tool's planning target
+(about 5/10/50 calls; medium by default) without changing runtime limits. It is read when
+the extension registers, so `/reload` after changing it.
 
 See [dynamic workflows](docs/workflow.md) for the script contract, saved workflows,
 resume semantics and limits, and [examples/workflows](examples/workflows) for runnable

@@ -18,10 +18,11 @@ Workflow 是一段 JavaScript 脚本，用确定的控制流（并发、分阶�
 
 ## 运行一个 workflow
 
-启动由 pi 完成，你把任务说清楚即可。脚本有两种来源：
+启动由 pi 完成，你把任务说清楚即可。脚本有三种来源：
 
 1. **保存的脚本**：`<cwd>/.pi/workflows/<name>.js`（项目）或 `~/.pi/agent/workflows/<name>.js`（全局，`$PI_CODING_AGENT_DIR` 可覆盖）。`<name>` 只允许 `[A-Za-z0-9._-]`、1–64 字符；也可以直接给路径（含 `/` 或以 `.js` 结尾）。
 2. **内联脚本**：把源码直接交给 pi。
+3. **随包模板**：`examples/workflows/` 下的脚本。项目或全局同名脚本优先，所以可以直接覆盖内置模板。
 
 pi 实际发出的工具调用形态如下（便于你读日志或自己指定）：
 
@@ -30,9 +31,14 @@ workflow({ name: 'migrate-imports', args: { files: ['src/a.ts', 'src/b.ts'] } })
 workflow({ script: '...脚本源码...', args: { files: ['src/a.ts'] } })              // 内联
 workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })                          // 恢复
 workflow({ action: 'status', runId: 'wf-1a2b3c4d5e6f' })                          // 查询（不带 runId 看最近一个）
+workflow({ action: 'list' })                                                       // 列出项目、全局和内置 workflow
+workflow({ action: 'guide' })                                                      // 读取编写指南和当前运行时 API
+workflow({ action: 'guide', name: 'deep-research' })                               // 读取完整模板，不执行
 ```
 
 `args` 必须是 JSON 可序列化的值，脚本里以 `args` 直接读到。
+
+`list` 和 `guide` 是只读动作：不需要 tmux、持久化会话或可用的子代理配置，不会启动模型调用。`list` 展示每个 workflow 的 description、`whenToUse`、phases 和路径；`guide <name>` 返回完整脚本，适合在 skill 或文件读取不可用时参考。
 
 工具立即返回 run id（形如 `wf-1a2b3c4d5e6f`）和 run 目录位置；run 在后台执行，落定（完成/失败/中止）时主会话收到一条消息：状态、完成数、token 用量、`runId`、`script:` 路径，以及脚本 `return` 值的 JSON（超长截断到 4000 字符，完整值在 run 目录的 `output.json`）。中途不需要轮询。
 
@@ -78,6 +84,27 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 子代理看不到本次对话，每个 prompt 都要自包含。
 
 **默认子代理。** `agent()` 没点名时，用本仓库自带的 `workflow-subagent`（一个普通 pi 子代理）。这一点是刻意的：`agents/` 目录里还有 `cli:` 型定义（外部 coding CLI），它们带自己的工具集和模型、也没有 pi 的工具层，不该被当成“随手跑个 prompt”的默认值。`meta.agent` 和 `opts.agent` 照常覆盖。
+
+## 编写指导与渐进披露
+
+模型可见的 workflow 指导分三层，避免把长文档常驻在每次请求里：
+
+1. `workflow` 工具描述保留 opt-in 门槛、形状选择规则、一个完整小范例、契约、错误/恢复语义和规模指导。
+2. 随包提供 `workflow-authoring` skill。工具描述告诉模型在写脚本前加载它；加载后模型读到形状目录和详细参考，只在真正编写 workflow 时付这份上下文成本。
+3. skills 或文件读取不可用时，`workflow({ action: 'guide' })` 返回同一份指南、参考和当前运行时声明，保证指导始终可达。
+
+指导不提供“场景 → 固定脚本”的映射表，而是提供可组合骨架和默认约束：
+
+| 依赖形状 | 写法 | 可运行模板 |
+| --- | --- | --- |
+| 独立调查，最终统一比较 | `parallel` + synthesis | `compare-options` |
+| 每项独立推进下一阶段 | `pipeline`（默认） | `migrate-files` |
+| 结果发现可变数量的子问题 | 审查后按 finding fan-out | `review-changes` |
+| 同一 claim 的独立对抗验证 | 三次相同调用 + 结果分类 | `verify-claims` |
+| 搜索、取证、核验、综合 | 复合 pipeline + voting + synthesis | `deep-research` |
+| 根据验收条件反复改进 | 有轮数和预算上限的循环 | `iterative-refinement` |
+
+`PI_WORKFLOW_SIZE=small|medium|large|unrestricted` 选择工具描述中的规划建议：约 5 / 10 / 50 次 agent 调用，默认 `medium`；`unrestricted` 省略数字后缀。它在扩展注册时读取，改变后需要 `/reload`。这个变量只影响规划建议，不改变运行时并发、单批 4096 项或单 run 1000 次启动的硬上限。模板接受的 `maxCalls` 也是模板自行计算和查询预算用的参数，不是内核配额。
 
 ## 完整例子：逐文件迁移 + 独立验证
 
@@ -146,17 +173,16 @@ workflow({ name: 'migrate-imports', args: { files: ['src/a.ts', 'src/b.ts'] } })
 
 ## 示例工作流
 
-`examples/workflows/` 下有两个可直接运行的例子。它们是纯 JavaScript，只用沙箱提供的全局（`agent`、`parallel`、`pipeline`、`phase`、`log`、`args`、`budget`）——脚本本身不做文件操作，所有工作都交给子会话，每个子会话有自己的终端 pane。
+`examples/workflows/` 下有六个可直接运行的例子。它们是纯 JavaScript，只用沙箱提供的全局（`agent`、`parallel`、`pipeline`、`phase`、`log`、`args`、`budget`）——脚本本身不做文件操作，工作都交给子会话，每个子会话有自己的终端 pane。
 
-保存的工作流按名字查找：先 `<项目>/.pi/workflows/<name>.js`，再 `~/.pi/agent/workflows/<name>.js`。复制（或软链）过去即可按名字自动发现：
+保存的工作流按名字查找：先 `<项目>/.pi/workflows/<name>.js`，再 `~/.pi/agent/workflows/<name>.js`，最后随包模板。直接使用内置模板不需要复制：
 
 ```sh
-# 在 pi-interactive-subagents 仓库根目录执行
-mkdir -p <你的项目>/.pi/workflows
-cp examples/workflows/review-changes.js examples/workflows/migrate-files.js <你的项目>/.pi/workflows/
+# 先看每个模板的用途、阶段和路径
+workflow({ action: 'list' })
 ```
 
-不复制也可以：`name` 接受相对项目根的路径或绝对路径，例如 `name: 'examples/workflows/review-changes.js'`。
+覆盖内置模板时，把同名 `.js` 放到项目的 `.pi/workflows/` 或全局 workflows 目录即可。`name` 也接受相对项目根的路径或绝对路径。
 
 ### review-changes
 
@@ -192,6 +218,22 @@ workflow({ action: 'start', name: 'migrate-files', args: {
   files: ['src/loader.ts', 'src/writer.ts'],
 } })
 ```
+
+### compare-options
+
+独立调查多个选项，全部完成后做一次比较。`args`：`question`（必填）、`options`（必填字符串数组）、可选 `maxCalls`（默认 10，包含综合）、`inspectAgent`、`synthesisAgent`。输入超过调用预算时会截断，并在结果中列出未纳入的选项。
+
+### verify-claims
+
+每条 claim 由三个独立 agent 对抗核验，结果区分 supported、refuted、disputed、incomplete 和 unverified。`args`：`claims`（必填）、可选 `context`、`maxCalls`（默认 10）、`verifierAgent`。它保留分歧和缺失票，不会把“没有人能反驳”当成支持。
+
+### deep-research
+
+Scope → 每查询 Search → Fetch → 对高优先级 claim 做三票 Verify → Synthesize。`args`：`question`（必填）、可选 `context`、`maxCalls`（默认 10）、`researchAgent`（默认 `researcher`）。模板会显式报告失败分支、未核验 claim 和因预算省略的证据。`researcher` 必须可用并具备搜索/抓取能力；也可指定其他等价 agent。
+
+### iterative-refinement
+
+Critique → Revise，直到验收或轮数/调用/token guard 触顶。`args`：`task`、`initial`（均必填）、可选 `maxRounds`（默认 3）、`maxCalls`（默认 10）、`minRemainingTokens`、`criticAgent`、`editorAgent`。即使没有 token budget，也有轮数和调用上限。
 
 ## 恢复与缓存
 

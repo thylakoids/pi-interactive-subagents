@@ -1,4 +1,9 @@
-export const meta = { name: 'review-changes', description: '按维度并行审查改动，每条发现再由独立 agent 对抗性验证，只保留确认的问题', phases: ['Review', 'Verify'] }
+export const meta = {
+  name: 'review-changes',
+  description: '按维度并行审查改动，每条发现再由独立 agent 对抗性验证，只保留确认的问题',
+  whenToUse: '当一组改动需要多个独立审查维度，并且每条发现都应由新的 agent 尝试反驳时',
+  phases: ['Review', 'Verify'],
+}
 
 // 脚本要程序化地过滤 findings/verdict，所以结果必须走 schema，不能靠解析自由文本
 const AUDIT_SCHEMA = {
@@ -60,7 +65,6 @@ await phase('Review')
 await log('审查范围：' + target + '；维度：' + dimensions.map((dimension) => dimension.name).join('、'))
 
 // pipeline 无屏障：先审完的维度立刻进入验证，不必等最慢的维度（parallel 要收齐全部审计才能开始）
-// 所以 stage 之间不要再 await 中间状态日志：结果按调用序号应用，一个 log 就会把该维度卡在更早的慢调用后面
 const reviewed = await pipeline(
   dimensions,
   async (dimension) => {

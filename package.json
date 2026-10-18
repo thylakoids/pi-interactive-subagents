@@ -25,6 +25,9 @@
   "pi": {
     "extensions": [
       "./pi-extension/subagents/index.ts"
+    ],
+    "skills": [
+      "./skills/workflow-authoring"
     ]
   },
   "devDependencies": {

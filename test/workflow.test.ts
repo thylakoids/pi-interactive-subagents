@@ -8,13 +8,28 @@
  */
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { WorkflowManager } from "../pi-extension/subagents/workflow/manager.ts";
-import { parseScript, WorkflowScriptError } from "../pi-extension/subagents/workflow/script.ts";
+import {
+  BUNDLED_WORKFLOWS_DIR,
+  listSavedWorkflows,
+  parseScript,
+  readScriptFile,
+  WorkflowScriptError,
+} from "../pi-extension/subagents/workflow/script.ts";
+import {
+  buildWorkflowDescription,
+  CANONICAL_WORKFLOW,
+  readAuthoringGuide,
+  sizeGuideline,
+  workflowSize,
+} from "../pi-extension/subagents/workflow/authoring.ts";
+import { registerWorkflowExtension } from "../pi-extension/subagents/workflow/index.ts";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { loadSkillsFromDir } from "@mariozechner/pi-coding-agent";
 import {
   WorkflowPanel,
   createPanelRenderState,
@@ -229,6 +244,207 @@ describe("script parsing", () => {
       () => parseScript(`export const meta = { name: \`t\${x}\`, description: 'y' }\nreturn 1;`, "inline"),
       WorkflowScriptError,
     );
+  });
+});
+
+describe("workflow authoring discovery", () => {
+  it("keeps a complete example and shape guidance in the compact tool description", () => {
+    const description = buildWorkflowDescription("medium");
+    assert.match(description, /COMPLETE EXAMPLE/);
+    assert.match(description, /export const meta/);
+    assert.match(description, /pipeline\(args\.items/);
+    assert.match(description, /about 10 total agent calls/);
+    assert.match(description, /Mere benefit from parallelism is not opt-in/);
+    assert.match(description, /workflow\(\{ action: 'guide' \}\)/);
+    assert.match(description, /returns null, including bare await agent\(\)/);
+    assert.doesNotMatch(description, /direct `await agent\(\.\.\.\)` rejects/);
+    assert.ok(description.length < 6_000, "the always-loaded surface must stay compact");
+    assert.doesNotMatch(buildWorkflowDescription("unrestricted"), /SIZE GUIDELINE/);
+    assert.equal(workflowSize("large"), "large");
+    assert.equal(workflowSize("bogus"), "medium");
+    assert.match(sizeGuideline("small"), /about 5/);
+  });
+
+  it("exposes the skill and reference as a read-only fallback guide", () => {
+    const guide = readAuthoringGuide("large");
+    assert.match(guide, /# Workflow authoring/);
+    assert.doesNotMatch(guide, /^---/);
+    assert.match(guide, /## Shapes and executable templates/);
+    assert.match(guide, /## Runtime API/);
+    assert.match(guide, /declare function pipeline/);
+    assert.match(guide, /about 50 total agent calls/);
+    assert.ok(guide.length > buildWorkflowDescription("medium").length * 2, "the detailed guide is on demand");
+  });
+
+  it("registers a valid package skill", () => {
+    const pkg = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8"));
+    assert.deepEqual(pkg.pi.skills, ["./skills/workflow-authoring"]);
+    const loaded = loadSkillsFromDir({ dir: join(process.cwd(), "skills/workflow-authoring"), source: "package" });
+    assert.equal(loaded.diagnostics.length, 0);
+    assert.equal(loaded.skills.length, 1);
+    assert.equal(loaded.skills[0].name, "workflow-authoring");
+    assert.match(loaded.skills[0].description, /authoring a workflow/i);
+  });
+
+  it("lists every bundled runnable template and parses all of them", () => {
+    const empty = mkdtempSync(join(tmpdir(), "wf-list-"));
+    caseDirs.push(empty);
+    const { workflows, errors } = listSavedWorkflows({ cwd: empty, agentDir: empty });
+    assert.deepEqual(errors, []);
+    assert.deepEqual(workflows.map((workflow) => workflow.name), [
+      "compare-options",
+      "deep-research",
+      "iterative-refinement",
+      "migrate-files",
+      "review-changes",
+      "verify-claims",
+    ]);
+    assert.ok(workflows.every((workflow) => workflow.source === "bundled"));
+    assert.ok(workflows.every((workflow) => workflow.meta.description.length > 0));
+    for (const workflow of workflows) parseScript(readScriptFile(workflow.path), workflow.path);
+
+    mkdirSync(join(empty, ".pi", "workflows"), { recursive: true });
+    writeFileSync(
+      join(empty, ".pi", "workflows", "deep-research.js"),
+      "export const meta = { name: 'deep-research', description: 'project override' }\nreturn 'local';",
+    );
+    const overridden = listSavedWorkflows({ cwd: empty, agentDir: empty });
+    const local = overridden.workflows.find((workflow) => workflow.name === "deep-research")!;
+    assert.equal(local.source, "project");
+    assert.equal(local.meta.description, "project override");
+    assert.equal(overridden.workflows.filter((workflow) => workflow.name === "deep-research").length, 1);
+  });
+
+  it("runs the canonical authoring example end to end", async () => {
+    service = new FakeSubagentService();
+    service.structured.set("Inspect this item", { needsCheck: true, evidence: "checked" });
+    const manager = createManager();
+    const view = await (await manager.start({
+      source: CANONICAL_WORKFLOW,
+      args: { items: ["one", "two"] },
+    })).execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.totalCount, 4);
+    assert.equal((view.result as unknown[]).length, 2);
+  });
+
+  it("keeps the bundled templates runnable and within their declared call budgets", async () => {
+    const runTemplate = async (
+      name: string,
+      templateArgs: Record<string, unknown>,
+      setup?: (fake: FakeSubagentService) => void,
+    ) => {
+      service = new FakeSubagentService();
+      setup?.(service);
+      const manager = createManager();
+      const view = await (await manager.start({
+        source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, `${name}.js`)),
+        args: templateArgs,
+      })).execute();
+      assert.equal(view.status, "completed", view.error);
+      return view;
+    };
+
+    service = new FakeSubagentService();
+    service.structured.set("Investigate one option", {
+      option: "x", summary: "summary", strengths: [], weaknesses: [], evidenceGaps: [],
+    });
+    const compare = await (await createManager().start({
+      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "compare-options.js")),
+      args: { question: "Which option?", options: ["a", "b", "c"], maxCalls: 5 },
+    })).execute();
+    assert.equal(compare.status, "completed", compare.error);
+    assert.equal(compare.totalCount, 4);
+
+    service = new FakeSubagentService();
+    service.structured.set("Adversarially verify", { verdict: "supported", evidence: "source" });
+    const votes = await (await createManager().start({
+      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "verify-claims.js")),
+      args: { claims: ["a", "b", "c", "d"], maxCalls: 10 },
+    })).execute();
+    assert.equal(votes.status, "completed", votes.error);
+    assert.equal(votes.totalCount, 9, "three claims x three votes; the fourth is omitted");
+    assert.equal((votes.result as any).omitted.length, 1);
+
+    service = new FakeSubagentService();
+    service.structured.set("Define the research plan", {
+      queries: [{ query: "q1", reason: "r1" }, { query: "q2", reason: "r2" }],
+      scopeNotes: ["note"],
+    });
+    service.structured.set("Find candidate authoritative sources", {
+      sources: [{ url: "https://a.example", title: "A", relevance: "primary" }],
+    });
+    service.structured.set("Fetch and extract evidence", {
+      findings: ["finding"],
+      claims: [
+        { claim: "c1", source: "https://a.example/1", priority: "high" },
+        { claim: "c2", source: "https://a.example/2", priority: "medium" },
+      ],
+      gaps: [],
+    });
+    service.structured.set("Adversarially verify", { verdict: "supported", evidence: "source" });
+    const research = await (await createManager().start({
+      source: readScriptFile(join(BUNDLED_WORKFLOWS_DIR, "deep-research.js")),
+      args: { question: "Research this", maxCalls: 10, researchAgent: "scout" },
+    })).execute();
+    assert.equal(research.status, "completed", research.error);
+    assert.equal(research.totalCount, 9);
+    assert.equal((research.result as any).status, "incomplete");
+    assert.ok((research.result as any).omittedClaims.length > 0);
+
+    const refined = await runTemplate("iterative-refinement", {
+      task: "Improve it", initial: "draft", maxCalls: 10,
+    }, (fake) => {
+      fake.structured.set("Critique a draft", { accepted: true, issues: [], feedback: "" });
+    });
+    assert.equal(refined.totalCount, 1);
+    assert.equal((refined.result as any).reason, "accepted");
+  });
+
+  it("provides list and guide actions without tmux or a persistent session", async () => {
+    service = new FakeSubagentService();
+    let tool: any;
+    const pi = {
+      registerTool(value: any) { tool = value; },
+      registerCommand() {},
+      registerShortcut() {},
+      registerMessageRenderer() {},
+      on() {},
+    };
+    const dir = mkdtempSync(join(tmpdir(), "wf-guide-"));
+    caseDirs.push(dir);
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    const previousSize = process.env.PI_WORKFLOW_SIZE;
+    process.env.PI_CODING_AGENT_DIR = dir;
+    process.env.PI_WORKFLOW_SIZE = "medium";
+    registerWorkflowExtension(pi as any, { service });
+    assert.match(tool.description, /workflow-authoring skill/);
+    assert.match(tool.description, /about 10 total agent calls/);
+    const ctx = { cwd: dir, ui: { notify() {} } };
+    try {
+      const list = await tool.execute("list", { action: "list" }, undefined, undefined, ctx);
+      assert.equal(list.details.action, "list");
+      assert.match(list.content[0].text, /deep-research \[bundled\]/);
+      assert.match(list.content[0].text, /review-changes/);
+      assert.doesNotMatch(list.content[0].text, /tokens/i);
+
+      const guide = await tool.execute("guide", { action: "guide", name: "deep-research" }, undefined, undefined, ctx);
+      assert.equal(guide.details.action, "guide");
+      assert.match(guide.content[0].text, /Workflow template: deep-research/);
+      assert.match(guide.content[0].text, /No agents were started/);
+      assert.match(guide.content[0].text, /Scope/);
+      assert.match(guide.content[0].text, /Synthesize/);
+
+      const authoring = await tool.execute("authoring", { action: "guide" }, undefined, undefined, ctx);
+      assert.match(authoring.content[0].text, /# Workflow authoring/);
+      assert.match(authoring.content[0].text, /## Shapes and executable templates/);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previous;
+      if (previousSize === undefined) delete process.env.PI_WORKFLOW_SIZE;
+      else process.env.PI_WORKFLOW_SIZE = previousSize;
+    }
+    assert.equal(service.spawns.length, 0);
   });
 });
 

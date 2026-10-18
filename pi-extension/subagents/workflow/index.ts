@@ -17,8 +17,8 @@ import { Text } from "@mariozechner/pi-tui";
 import { join } from "node:path";
 import { WorkflowManager } from "./manager.ts";
 import { WorkflowPanel, formatElapsed, formatTokens } from "./ui.ts";
-import { WorkflowScriptError, readScriptFile, resolveSavedScriptPath } from "./script.ts";
-import { WORKFLOW_GLOBAL_DECLARATIONS } from "./runner.ts";
+import { WorkflowScriptError, listSavedWorkflows, parseScript, readScriptFile, resolveSavedScriptPath } from "./script.ts";
+import { buildWorkflowDescription, readAuthoringGuide, workflowSize } from "./authoring.ts";
 import { STRUCTURED_OUTPUT_EXTENSION } from "../wiring.ts";
 import type { WorkflowRunView, WorkflowSubagentService } from "./types.ts";
 
@@ -29,74 +29,19 @@ export interface WorkflowExtensionOptions {
   shortcut?: string;
 }
 
-const TOOL_DESCRIPTION = `Run a workflow: a JavaScript program that orchestrates subagents deterministically.
-
-Each \`agent()\` call starts a real interactive subagent in its own terminal pane, so you can watch, message, or stop any of them while the workflow runs. The workflow executes in the background in a sandboxed QuickJS VM: this tool returns immediately with a run id, and you are woken with a notification when the run settles. Progress is visible in the main window (\`/workflow\`).
-
-WHEN TO USE
-- Work that decomposes into many independent sub-tasks (reviews across dimensions, per-file migrations, multi-source research).
-- Work whose next step depends on what earlier subagents found, but the *shape* of that dependency is knowable in advance.
-- Long fan-outs where the main context should not hold every intermediate result.
-
-WHEN NOT TO USE
-- A single subagent, or a handful whose results you will read yourself: use the \`subagent\` tool.
-- Exploratory work where you cannot yet describe the control flow.
-- Tasks where a scripted fan-out would burn far more tokens than doing the work inline — the user pays for every agent.
-
-Only reach for this tool when the user has opted in: they asked for a workflow, orchestration or a
-fan-out in their own words, a skill or slash command says to use it, or a workflow is already
-running. Otherwise describe what a workflow would do and let the user decide. Each agent is a real
-pi session the user pays for, so keep a script to roughly ten agents unless the task genuinely
-needs more.
-
-THE SCRIPT
-Plain JavaScript (not TypeScript), executed as an async function body — \`await\` and \`return\` work. It must start with a pure literal:
-
-  export const meta = { name: 'review-changes', description: 'Review changed files, verify findings', phases: ['Review', 'Verify'] }
-
-The script sees exactly these globals:
-
-${WORKFLOW_GLOBAL_DECLARATIONS}
-
-There is no filesystem, network, timers, \`require\`, \`process\`, \`Date.now()\` or \`Math.random()\` — the run must be replayable, so time and randomness come from the run, not from the script. Use \`agent({ schema })\` for structured results (the subagent must return them through the structured_output tool) and \`args\` for everything the run needs to know.
-
-DEFAULT TO pipeline
-\`pipeline(items, stage1, stage2, ...)\` runs each item through all stages independently — no barrier between stages, so a fast item starts stage 2 while a slow one is still in stage 1. Reach for \`parallel\` only when the next step genuinely needs *all* previous results (dedup across the whole set, a cross-item comparison, an early exit on "nothing found").
-
-Errors: a failed or throwing item in \`parallel\`/\`pipeline\` resolves to \`null\` for that item only, and the other items keep running. A direct \`await agent(...)\` rejects, so wrap it in \`try/catch\` or \`.catch()\` when a failure is tolerable.
-
-RESUME
-The run's calls are journaled by content, so re-running the same script with the same
-args replays completed calls instead of redoing them: launch again with
-\`workflow({ action: 'resume', runId })\`, or just start the same workflow again — a \`start\`
-already reuses completed calls from the previous run of the same workflow *with the same
-args*. Edit a call (its label, prompt, schema, agent, model or effort) and only that call
-re-runs; identical calls are told apart, so three identical refuters are three samples.
-Pass \`reuse: 'none'\` to force a run that shares nothing. Every run writes its script and
-journal under \`<sessionDir>/artifacts/<sessionId>/workflows/<runId>/\`; the returned
-\`scriptPath\` is a real file you can edit and run again with \`name: <that path>\`.
-
-LIMITS
-- Concurrent agents: min(16, CPUs − 2) per run, overridable with
-  \`PI_WORKFLOW_MAX_CONCURRENT_AGENTS\`.
-- One parallel/pipeline call: at most 4096 items. One run: at most 1000 agents.
-- With \`PI_WORKFLOW_TOKEN_BUDGET\` set, the run stops once that many tokens are spent.
-
-A failed or dead agent resolves to \`null\` for that call only — \`parallel\` and \`pipeline\`
-already do this, and a bare \`await agent(...)\` behaves the same way, so a script that needs
-to react to a failure tests the value rather than wrapping every call in try/catch. A
-*malformed* call (unknown agent, bad option, unsatisfiable schema) still throws.
-
-Nested workflows are not supported: \`workflow()\` is declared but always throws, so express
-child steps inline instead.
-
-Both inline scripts (\`script\`) and saved ones (\`name\`) are supported; a saved workflow is looked up in \`.pi/workflows/<name>.js\` and then \`$PI_CODING_AGENT_DIR/workflows/<name>.js\`.`;
-
 const WorkflowParams = Type.Object({
-  action: Type.Union([Type.Literal("start"), Type.Literal("resume"), Type.Literal("status")], {
-    description:
-      "start a new run (default), resume a previous run from its journal, or report run status without changing anything",
-  }),
+  action: Type.Optional(
+    Type.Union([
+      Type.Literal("start"),
+      Type.Literal("resume"),
+      Type.Literal("status"),
+      Type.Literal("list"),
+      Type.Literal("guide"),
+    ], {
+      description:
+        "start a run (default), resume from its journal, report status, list available workflows, or read authoring guidance/templates without executing anything",
+    }),
+  ),
   script: Type.Optional(
     Type.String({
       description:
@@ -104,7 +49,10 @@ const WorkflowParams = Type.Object({
     }),
   ),
   name: Type.Optional(
-    Type.String({ description: "Saved workflow name or path (alternative to `script` for action=start)." }),
+    Type.String({
+      description:
+        "Saved workflow name or path: selects the script for action=start; selects a full template for action=guide.",
+    }),
   ),
   args: Type.Optional(
     Type.Record(Type.String(), Type.Unknown(), {
@@ -125,6 +73,7 @@ const WorkflowParams = Type.Object({
 
 export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExtensionOptions): void {
   const { service } = options;
+  const size = workflowSize(process.env.PI_WORKFLOW_SIZE);
   let manager: WorkflowManager | null = null;
   let panel: WorkflowPanel | null = null;
   let latestCtx: ExtensionContext | null = null;
@@ -258,11 +207,12 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
-    description: TOOL_DESCRIPTION,
+    description: buildWorkflowDescription(size),
     promptSnippet:
-      "Run a JavaScript workflow that orchestrates subagents in parallel/pipeline stages; returns immediately with a run id and notifies on completion.",
+      "Run or author JavaScript workflows that orchestrate subagents; use list/guide to discover composable shapes and runnable templates without executing them.",
     promptGuidelines: [
       "Prefer pipeline() over parallel() unless the next stage genuinely needs every prior result.",
+      "Use workflow({ action: 'list' }) and workflow({ action: 'guide' }) to discover templates and authoring guidance; those actions do not authorize starting agents.",
       "Give each agent() a short `label`; it is the panel's row title and part of the resume key.",
       "Use `schema` when you will branch on the result; free text cannot be parsed reliably.",
       "Keep per-agent prompts self-contained: subagents do not see this conversation.",
@@ -270,11 +220,18 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
     parameters: WorkflowParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       try {
-        const view = await startRun(params, ctx);
+        const action = params.action ?? "start";
+        if (action === "list") {
+          return readonlyResult("list", formatWorkflowList(ctx));
+        }
+        if (action === "guide") {
+          return readonlyResult("guide", formatWorkflowGuide(params.name, ctx, size));
+        }
+        const view = await startRun({ ...params, action }, ctx);
         return {
-          content: [{ type: "text" as const, text: formatStartMessage(params.action, view) }],
+          content: [{ type: "text" as const, text: formatStartMessage(action, view) }],
           details: {
-            action: params.action,
+            action,
             runId: view.runId,
             status: view.status,
             progress: view.progress,
@@ -302,6 +259,20 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       const details = result.details as WorkflowToolDetails | undefined;
       if (details?.error) {
         return new Text(`${INDENT}${theme.fg("dim", "⎿")}  ${theme.fg("error", String(details.error))}`, 0, 0);
+      }
+      if (details?.action === "list" || details?.action === "guide") {
+        const text = result.content
+          .filter((item): item is { type: "text"; text: string } => item.type === "text")
+          .map((item) => item.text)
+          .join("\n");
+        if (expanded) return new Text(text, 0, 0);
+        const first = text.split("\n").find((line) => line.trim()) ?? "No guidance available.";
+        return new Text(
+          `${INDENT}${theme.fg("dim", "⎿")}  ${theme.fg("dim", firstLine(first, 90))}` +
+            theme.fg("muted", "  (ctrl+o to expand)"),
+          0,
+          0,
+        );
       }
       const summary = `${details?.status ?? "started"} · ${details?.agents ?? 0} agents planned`;
       const head =
@@ -437,6 +408,67 @@ function formatStartMessage(action: string, view: WorkflowRunView): string {
   );
 }
 
+function agentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? "", ".pi", "agent");
+}
+
+function formatWorkflowList(ctx: ExtensionContext): string {
+  const { workflows, errors } = listSavedWorkflows({ cwd: ctx.cwd, agentDir: agentDir() });
+  const lines = [`Available workflows (${workflows.length})`];
+  for (const workflow of workflows) {
+    lines.push(
+      "",
+      `${workflow.name} [${workflow.source}]`,
+      `  ${workflow.meta.description}`,
+    );
+    if (workflow.meta.whenToUse) lines.push(`  when: ${workflow.meta.whenToUse}`);
+    if (workflow.meta.phases?.length) {
+      lines.push(`  phases: ${workflow.meta.phases.map((phase) => typeof phase === "string" ? phase : phase.title).join(" -> ")}`);
+    }
+    lines.push(`  path: ${workflow.path}`);
+  }
+  if (workflows.length === 0) lines.push("", "No saved or bundled workflows found.");
+  if (errors.length > 0) {
+    lines.push("", `Ignored ${errors.length} invalid workflow file(s):`);
+    for (const error of errors) lines.push(`  ${error.path}: ${error.error}`);
+  }
+  lines.push(
+    "",
+    "Read one without executing it: workflow({ action: 'guide', name: '<name>' }).",
+    "Read the general authoring guide: workflow({ action: 'guide' }).",
+  );
+  return lines.join("\n");
+}
+
+function formatWorkflowGuide(name: string | undefined, ctx: ExtensionContext, size: ReturnType<typeof workflowSize>): string {
+  if (!name?.trim()) return readAuthoringGuide(size);
+  const path = resolveSavedScriptPath(name, { cwd: ctx.cwd, agentDir: agentDir() });
+  if (!path) {
+    throw new WorkflowScriptError(`No workflow template "${name}". Use workflow({ action: 'list' }) to see available names.`);
+  }
+  const source = readScriptFile(path);
+  const { meta } = parseScript(source, path);
+  return [
+    `Workflow template: ${meta.name}`,
+    `path: ${path}`,
+    `description: ${meta.description}`,
+    ...(meta.whenToUse ? [`when to use: ${meta.whenToUse}`] : []),
+    "",
+    "This is a complete runnable script. No agents were started.",
+    "",
+    "```js",
+    source.trimEnd(),
+    "```",
+  ].join("\n");
+}
+
+function readonlyResult(action: string, text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+    details: { action },
+  };
+}
+
 function summarise(view: WorkflowRunView): string {
   const lines = [`${view.meta.name} — ${view.status} (${Math.round(view.progress * 100)}%)`];
   for (const call of view.calls) {
@@ -458,6 +490,7 @@ function firstLine(text: string, limit = 60): string {
 interface WorkflowToolDetails {
   error?: string;
   action?: string;
+  name?: string;
   runId?: string;
   status?: string;
   progress?: number;
@@ -503,6 +536,8 @@ function renderWorkflowCall(args: { action?: string; script?: string; name?: str
   const head = `${theme.fg("accent", "●")} ${theme.fg("toolTitle", theme.bold("Workflow"))}`;
   if (args.action === "resume") return `${head}${theme.fg("dim", `(${args.runId ?? "resume"})`)}`;
   if (args.action === "status") return `${head}${theme.fg("dim", "(status)")}`;
+  if (args.action === "list") return `${head}${theme.fg("dim", "(list)")}`;
+  if (args.action === "guide") return `${head}${theme.fg("dim", `(guide${args.name ? `: ${args.name}` : ""})`)}`;
   return `${head}${theme.fg("dim", `(${args.name?.trim() || inlineName(args.script) || "inline"})`)}`;
 }
 
