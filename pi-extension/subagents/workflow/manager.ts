@@ -138,6 +138,14 @@ export class WorkflowRun {
    * catch a dead agent, never a slow one, so it is generous.
    */
   callTimeoutMs = callCeilingFromEnv();
+  /**
+   * How much waiting on an answer stays exempt from the call ceiling. Infinite
+   * by default: waiting is the state the run asked for, and a process that
+   * exited is settled by its watcher, so the runtime never guesses that a
+   * silent wait is a dead one. An explicit budget (env or test hook) trades
+   * that safety for a bound.
+   */
+  waitAllowanceMs = waitAllowanceFromEnv();
   error?: string;
   result?: unknown;
 
@@ -148,6 +156,15 @@ export class WorkflowRun {
   private readonly cache: Map<string, CachedCall>;
   private readonly live = new Map<string, LiveCall>();
   private readonly running = new Map<string, WorkflowSubagentHandle>();
+  /**
+   * Releases a call's scheduling slot the moment the call is decided as
+   * abandoned (skipped) while its launch task waits on the agent. The slot is a
+   * runtime resource: a watcher that never settles must not hold it until the
+   * call ceiling. A skip that lands before the spawn returns is covered too, but
+   * the spawn itself is not cancelled — the slot comes back when it returns and
+   * the late handle is stopped.
+   */
+  private readonly abandonment = new Map<string, AbortController>();
   /**
    * Names this run has handed out but the service has not seen yet: the service
    * only learns a name once its pane launch resolves, so without a local claim
@@ -271,6 +288,11 @@ export class WorkflowRun {
   /** Override the per-call ceiling; tests use it to reach the timeout quickly. */
   setCallTimeout(ms: number): void {
     this.callTimeoutMs = ms === Number.POSITIVE_INFINITY ? ms : Math.max(50, Math.floor(ms));
+  }
+
+  /** Override the wait allowance; tests use it to bound a parked agent quickly. */
+  setWaitAllowance(ms: number): void {
+    this.waitAllowanceMs = Math.max(0, Math.floor(ms));
   }
 
   private get maxConcurrent(): number {
@@ -521,6 +543,11 @@ export class WorkflowRun {
     this.snapshot.error = message;
     this.snapshot.finishedAt = this.now();
     this.teardown(message);
+    // Every other snapshot write is throttled to once a second, and execute()
+    // only force-persists while it still owns a "running" snapshot — which this
+    // method just changed. Without this the run's terminal state never reaches
+    // snapshot.json, and a restart shows it as still running.
+    this.persistSnapshot(true);
   }
 
   /**
@@ -596,6 +623,12 @@ export class WorkflowRun {
     const name = this.uniqueName(liveCall.label);
     liveCall.name = name;
 
+    // Registered before the spawn so a skip that lands while the pane is still
+    // launching is recorded as well; that slot returns when the spawn does and
+    // the late handle is stopped, not before.
+    const abandonment = new AbortController();
+    this.abandonment.set(liveCall.callKey, abandonment);
+
     try {
       const handle = await this.manager.service.spawn({
         agentType: liveCall.agentType,
@@ -614,16 +647,37 @@ export class WorkflowRun {
             : undefined,
         cwd: this.manager.cwd,
       });
+      // Own the completion before any branch can walk away from it. Every path
+      // below (a settled call, a timeout, an abort) stops waiting at some point,
+      // and a watcher that throws after its pane is closed must not surface as
+      // an unhandled rejection. One handler here covers all of them.
+      const completion = settleCompletion(handle.completion);
       liveCall.sessionFile = handle.sessionFile;
+      // A skip (or an abort) can land while the pane is still launching: the
+      // call is then already settled and has no handle to stop, so the handle
+      // that arrives late must be closed here. Otherwise a call the user
+      // declined keeps a live pane and keeps writing files, and its journal
+      // line would be written over the decision that was already acted on.
+      if (isCallSettled(liveCall.status)) {
+        this.manager.service.stop(handle.name);
+        return {
+          ok: false,
+          status: liveCall.status,
+          value: null,
+          ...(liveCall.error ? { error: liveCall.error } : {}),
+        };
+      }
       this.running.set(liveCall.callKey, handle);
 
-      const completion = await withRunAbort(
-        handle.completion,
+      const ended = await withRunAbort(
+        completion,
         this.abortController.signal,
         this.callTimeoutMs,
         () => this.manager.service.status(handle.name)?.kind === "waiting",
+        this.waitAllowanceMs,
+        abandonment.signal,
       );
-      if (completion.ended === "aborted") {
+      if (ended.ended === "aborted") {
         this.manager.service.stop(handle.name);
         return this.recordOutcome(liveCall, {
           ok: false,
@@ -632,7 +686,22 @@ export class WorkflowRun {
           error: "run aborted while the agent was running",
         });
       }
-      if (completion.ended === "timeout") {
+      if (ended.ended === "abandoned") {
+        // skip() already stopped the agent and resolved the script's waiter, so
+        // there is nothing to journal and nothing to stop: returning here is
+        // what releases the scheduling slot the launch task was holding.
+        return {
+          ok: false,
+          status: liveCall.status,
+          value: null,
+          ...(liveCall.error ? { error: liveCall.error } : {}),
+        };
+      }
+      if (ended.ended === "rejected") {
+        this.manager.service.stop(handle.name);
+        throw ended.error;
+      }
+      if (ended.ended === "timeout") {
         // The run is healthy and every other call is unaffected: stop this one
         // agent, journal the call as failed, and let the script see null.
         // Killing the whole run for one wedged agent is what makes a hung agent
@@ -643,13 +712,35 @@ export class WorkflowRun {
           status: "failed",
           value: null,
           error:
-            `agent ran for ${formatMinutes(this.callTimeoutMs)} without finishing and was stopped; ` +
-            "the call limit is the run's per-call ceiling, not a script deadline. " +
-            "Split the task or run it outside the workflow if it needs longer.",
+            `agent ran for ${formatMinutes(this.callTimeoutMs)} of work without finishing and was stopped` +
+            waitBudgetHint(this.waitAllowanceMs) +
+            "; the call limit is the run's per-call ceiling, not a script deadline. " +
+            "Split the task, raise PI_WORKFLOW_CALL_TIMEOUT_MS, or run it outside the workflow.",
         });
       }
 
-      const result = completion.value;
+      // The completion never rejects by now: its rejection became this value at
+      // the point the handle arrived, so it is reported like any other failure.
+      if (!ended.value.ok) {
+        this.manager.service.stop(handle.name);
+        throw ended.value.error;
+      }
+      const result = ended.value.value;
+      // A non-zero exit is a failure whatever the agent left behind, and the
+      // watcher does not always explain it (the "closed" reason path omits the
+      // error text). Decide it before reading the sidecar: a stale structured
+      // result or a half-finished summary must never turn a dead agent into a
+      // successful answer.
+      if (result.exitCode !== 0) {
+        return this.recordOutcome(liveCall, {
+          ok: false,
+          status: "failed",
+          value: null,
+          error: result.error ?? `agent exited with code ${result.exitCode}`,
+          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
+          completion: result,
+        });
+      }
       const structured = parsed.opts.schema ? readStructuredResult(resultFile) : undefined;
       if (parsed.opts.schema && structured?.error) {
         return this.recordOutcome(liveCall, {
@@ -657,16 +748,6 @@ export class WorkflowRun {
           status: "failed",
           value: null,
           error: structured.error,
-          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
-          completion: result,
-        });
-      }
-      if (result.error && result.exitCode !== 0) {
-        return this.recordOutcome(liveCall, {
-          ok: false,
-          status: "failed",
-          value: null,
-          error: result.error,
           session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
           completion: result,
         });
@@ -688,6 +769,7 @@ export class WorkflowRun {
         error: error?.message ?? String(error),
       });
     } finally {
+      this.abandonment.delete(liveCall.callKey);
       this.running.delete(liveCall.callKey);
     }
   }
@@ -785,7 +867,17 @@ export class WorkflowRun {
     });
 
     if (this.snapshot.status === "running") {
-      if (result.ok) {
+      const aborted = this.abortController.signal.aborted;
+      if (aborted) {
+        // An abort is a decision, not an outcome. The script can still finish
+        // afterwards — an aborted or skipped call resolves to null — and that
+        // must not turn a run the user cancelled into a completed one.
+        this.status = "aborted";
+        this.error = this.abortController.signal.reason instanceof Error
+          ? (this.abortController.signal.reason as Error).message
+          : this.error ?? "aborted by user";
+        this.snapshot.error = this.error;
+      } else if (result.ok) {
         this.status = "completed";
         this.result = result.value;
         this.snapshot.result = result.value ?? null;
@@ -795,16 +887,13 @@ export class WorkflowRun {
           // The run result is also in the snapshot; a missing output file is not fatal.
         }
       } else {
-        const aborted = this.abortController.signal.aborted;
-        this.status = aborted ? "aborted" : "failed";
-        this.error = aborted && this.abortController.signal.reason instanceof Error
-          ? (this.abortController.signal.reason as Error).message
-          : result.error?.message ?? "workflow failed";
+        this.status = "failed";
+        this.error = result.error?.message ?? "workflow failed";
         this.snapshot.error = this.error;
         // A script that failed on its own (syntax error, thrown error, the
         // watchdog) has not stopped its agents or its queue: they would keep
         // opening panes and spending tokens after the run is already over.
-        if (!aborted) this.teardown(this.error);
+        this.teardown(this.error);
       }
       this.snapshot.status = this.status;
       this.snapshot.finishedAt = this.now();
@@ -845,6 +934,9 @@ export class WorkflowRun {
     appendJournal(this.journalFile, entry);
     const handle = this.running.get(callKey);
     if (handle) this.manager.service.stop(handle.name);
+    // Stop the launch task from waiting on a watcher that may never settle: the
+    // call is decided, and its slot has to go back to the queue now.
+    this.abandonment.get(callKey)?.abort();
     const waiters = this.waiters.get(callKey);
     this.waiters.delete(callKey);
     if (waiters) for (const resolve of waiters) resolve({ ok: false, status: "skipped", value: null, error: "skipped by user" });
@@ -1395,6 +1487,25 @@ function readStructuredResult(path?: string): { value?: unknown; error?: string 
   }
 }
 
+/** A completion whose rejection has already been turned into a value. */
+type SettledCompletion<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+/**
+ * Take ownership of a subagent completion the moment its handle exists.
+ *
+ * Every branch afterwards may stop waiting (a settled call, a timeout, an
+ * abort, a closed pane), and a watcher that throws when its pane disappears
+ * must not become an unhandled rejection. This is the only place that turns a
+ * completion rejection into a value; the caller still decides whether it is
+ * reported as a failed call, so no error is swallowed silently.
+ */
+function settleCompletion<T>(promise: Promise<T>): Promise<SettledCompletion<T>> {
+  return promise.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+}
+
 /**
  * Await a completion promise, but stop waiting when the run is aborted or the
  * call spends too long *working*. Whichever happens first wins; the other
@@ -1411,23 +1522,47 @@ async function withRunAbort<T>(
   signal: AbortSignal,
   timeoutMs: number,
   isLegitimateWait: () => boolean = () => false,
-): Promise<{ ended: "aborted" } | { ended: "timeout" } | { ended: "done"; value: T }> {
+  waitAllowanceMs: number = Number.POSITIVE_INFINITY,
+  abandonSignal?: AbortSignal,
+): Promise<
+  | { ended: "aborted" }
+  | { ended: "timeout" }
+  | { ended: "rejected"; error: unknown }
+  | { ended: "abandoned" }
+  | { ended: "done"; value: T }
+> {
   if (signal.aborted) return { ended: "aborted" };
-  type CallEnd = { ended: "aborted" } | { ended: "timeout" } | { ended: "done"; value: T };
+  if (abandonSignal?.aborted) return { ended: "abandoned" };
+  type CallEnd =
+    | { ended: "aborted" }
+    | { ended: "timeout" }
+    | { ended: "rejected"; error: unknown }
+    | { ended: "abandoned" }
+    | { ended: "done"; value: T };
   return new Promise<CallEnd>((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let finished = false;
     let busyMs = 0;
+    let waitedMs = 0;
     const settle = (result: CallEnd) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
+      abandonSignal?.removeEventListener("abort", onAbandon);
       resolve(result);
     };
     const onAbort = () => settle({ ended: "aborted" });
     signal.addEventListener("abort", onAbort, { once: true });
-    promise.then((value) => settle({ ended: "done", value }));
+    const onAbandon = () => settle({ ended: "abandoned" });
+    abandonSignal?.addEventListener("abort", onAbandon, { once: true });
+    // The interface says the completion never rejects, but a watcher that
+    // throws would otherwise leave this promise pending forever *and* surface
+    // as an unhandled rejection. Settle it as a call failure instead.
+    promise.then(
+      (value) => settle({ ended: "done", value }),
+      (error: unknown) => settle({ ended: "rejected", error }),
+    );
     // setTimeout turns an infinite delay into ~1 ms, so "no ceiling" must skip
     // the timer rather than pass it through.
     if (!Number.isFinite(timeoutMs)) return;
@@ -1442,7 +1577,10 @@ async function withRunAbort<T>(
       } catch {
         // An unreadable status is not evidence of a wait.
       }
-      if (!waiting) busyMs += tickMs;
+      // Waiting is exempt only while the allowance lasts: a parked agent that
+      // never gets an answer must eventually be treated as stuck.
+      if (waiting && waitedMs < waitAllowanceMs) waitedMs += tickMs;
+      else busyMs += tickMs;
       if (busyMs >= timeoutMs) {
         settle({ ended: "timeout" });
         return;
@@ -1467,6 +1605,29 @@ function callCeilingFromEnv(): number {
   const ms = Number(raw);
   if (!Number.isFinite(ms)) return 60 * 60 * 1000;
   return ms <= 0 ? Number.POSITIVE_INFINITY : Math.floor(ms);
+}
+
+/**
+ * How long waiting on an answer stays exempt, from the environment. Waiting is
+ * a state the run asked for, so by default it is exempt without limit: a step
+ * blocked on its orchestrator is not a dead agent, and without proof that the
+ * agent is gone the runtime must not guess. An operator who wants a bound sets
+ * `PI_WORKFLOW_WAIT_TIMEOUT_MS`; `0` turns that bound off, the same way `0`
+ * turns off the call ceiling.
+ */
+function waitAllowanceFromEnv(): number {
+  const raw = process.env.PI_WORKFLOW_WAIT_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return Number.POSITIVE_INFINITY;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms) || ms <= 0) return Number.POSITIVE_INFINITY;
+  return Math.floor(ms);
+}
+
+/** Names the wait budget only when it could have mattered. */
+function waitBudgetHint(waitAllowanceMs: number): string {
+  if (waitAllowanceMs === Number.POSITIVE_INFINITY) return " (waiting on an answer is exempt)";
+  if (waitAllowanceMs <= 0) return "";
+  return ` (waiting on an answer is exempt for ${formatMinutes(waitAllowanceMs)}, then it counts)`;
 }
 
 /** A limit named in an error message, in the unit a reader expects. */

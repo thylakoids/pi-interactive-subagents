@@ -59,6 +59,21 @@ class FakeSubagentService implements WorkflowSubagentService {
   hangs = new Set<string>();
   /** prompt substring → this agent reports "waiting" (parked on a question). */
   waiting = new Set<string>();
+  /** prompt substring → the completion promise rejects (a broken watcher). */
+  rejects = new Set<string>();
+  /** prompt substring → closing its pane makes the watcher reject. */
+  rejectOnStop = new Set<string>();
+  /** prompt substring → non-zero exit with no error text (the watcher's closed path). */
+  silentFailures = new Set<string>();
+  /** Agents that actually finished (a gate for "the late answer arrived"). */
+  finished = 0;
+  /** Status reads that reported waiting / active, so a test can gate on them. */
+  waitingServed = 0;
+  activeServed = 0;
+  /** Watcher rejections triggered by a pane teardown. */
+  rejectedOnStop = 0;
+  /** name → the reject function of that agent's completion. */
+  private completions = new Map<string, (error: Error) => void>();
   failures = new Set<string>();
   structured = new Map<string, unknown>();
   structuredMissing = new Set<string>();
@@ -99,7 +114,18 @@ class FakeSubagentService implements WorkflowSubagentService {
     this.peakConcurrency = Math.max(this.peakConcurrency, this.inFlight);
     const delay = this.delayFor(request.task);
     const hang = [...this.hangs].some((needle) => request.task.includes(needle));
-    const completion = new Promise<WorkflowSubagentCompletion>((resolve) => {
+    const reject = [...this.rejects].some((needle) => request.task.includes(needle));
+    const completion = new Promise<WorkflowSubagentCompletion>((resolve, rejectPromise) => {
+      this.completions.set(request.name, (error) => rejectPromise(error));
+      // Reject on a later turn so the manager has attached its handler first,
+      // exactly like a watcher that throws mid-run.
+      if (reject) {
+        setTimeout(() => {
+          this.inFlight--;
+          rejectPromise(new Error("watcher exploded"));
+        }, 5);
+        return;
+      }
       // An agent whose process never exits: no timer, no resolution.
       if (hang) return;
       setTimeout(() => {
@@ -118,9 +144,11 @@ class FakeSubagentService implements WorkflowSubagentService {
             writeFileSync(request.resultFile, JSON.stringify({ ok: true, value }));
           }
         }
+        this.finished++;
+        const silent = [...this.silentFailures].some((needle) => request.task.includes(needle));
         resolve({
-          exitCode: failed ? 1 : 0,
-          summary: failed ? "" : this.replyFor(request.task),
+          exitCode: failed || silent ? 1 : 0,
+          summary: silent ? "half-finished work that looks fine" : failed ? "" : this.replyFor(request.task),
           elapsedMs: delay,
           ...(failed ? { error: "synthetic failure" } : {}),
           ...(request.resultFile ? { structured: undefined } : {}),
@@ -145,6 +173,16 @@ class FakeSubagentService implements WorkflowSubagentService {
 
   stop(name: string) {
     this.stopped.push(name);
+    // A real pane teardown can make the watcher throw; tests opt in per task.
+    const targeted = this.spawns.some(
+      (spawn) =>
+        spawn.name === name &&
+        [...this.rejectOnStop].some((needle) => spawn.task.includes(needle)),
+    );
+    if (targeted) {
+      this.rejectedOnStop++;
+      this.completions.get(name)?.(new Error("watcher rejected after stop"));
+    }
   }
 
   focus(name: string) {
@@ -157,6 +195,8 @@ class FakeSubagentService implements WorkflowSubagentService {
       (spawn) =>
         spawn.name === name && [...this.waiting].some((needle) => spawn.task.includes(needle)),
     );
+    if (parked) this.waitingServed++;
+    else this.activeServed++;
     return parked
       ? { kind: "waiting" as const, elapsedMs: 10, label: null }
       : { kind: "active" as const, elapsedMs: 10, label: "read" };
@@ -174,6 +214,38 @@ class FakeSubagentService implements WorkflowSubagentService {
   private replyFor(task: string): string {
     for (const [needle, reply] of this.replies) if (task.includes(needle)) return reply;
     return `echo:${task}`;
+  }
+}
+
+/** A promise a test resolves by hand, so it never depends on timing luck. */
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Poll for a state the test needs, instead of sleeping and hoping. */
+async function waitFor(
+  predicate: () => boolean,
+  what: string,
+  timeoutMs = 2000,
+): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/** Let the microtask/tick queue drain so unhandled rejections would surface. */
+async function drainTicks(turns = 3): Promise<void> {
+  for (let turn = 0; turn < turns; turn++) {
+    await new Promise((resolve) => setImmediate(resolve));
   }
 }
 
@@ -646,6 +718,63 @@ return out;
     // the schema protocol, so only the sidecar paths are asserted here.
   });
 
+  it("fails a non-zero exit that carries no error text, and resume retries it", async () => {
+    // The watcher's "closed" path reports exit code without an error message.
+    // That is still a failure, and the agent's last text is not an answer.
+    service = new FakeSubagentService();
+    service.silentFailures.add("half-dead");
+    const manager = createManager();
+    const script = `export const meta = { name: 'silent-exit', description: 'x' }
+return await agent('half-dead', { label: 'half-dead' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null, "a non-zero exit must not return the agent's text");
+    const call = view.calls.find((entry) => entry.label === "half-dead")!;
+    assert.equal(call.status, "failed");
+    assert.match(String(call.error), /agent exited with code 1/);
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === call.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
+
+    // A failed line is never replayed as an answer: resume runs it again.
+    const spawnedBefore = service.spawns.length;
+    const resumed = await (await manager.resume(view.runId)).execute();
+    assert.equal(resumed.status, "completed", resumed.error);
+    assert.equal(resumed.result, null);
+    assert.ok(service.spawns.length > spawnedBefore, "a failed call must be retried on resume");
+    assert.equal(resumed.calls.find((entry) => entry.label === "half-dead")?.status, "failed");
+  });
+
+  it("ignores a structured sidecar when the agent exited non-zero", async () => {
+    // The child wrote a valid-looking sidecar before dying. Exit status decides,
+    // not the artefact it left behind.
+    service = new FakeSubagentService();
+    service.silentFailures.add("half-dead-schema");
+    service.structured.set("half-dead-schema", { verdict: "looks valid" });
+    const manager = createManager();
+    const script = `export const meta = { name: 'silent-exit-schema', description: 'x' }
+return await agent('half-dead-schema', { label: 'sidecar', schema: { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] } });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null, "the sidecar must not stand in for a dead agent");
+    const call = view.calls.find((entry) => entry.label === "sidecar")!;
+    assert.equal(call.status, "failed");
+    assert.match(String(call.error), /agent exited with code 1/);
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === call.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
+  });
+
   it("fails the call when a schema-driven agent returns no structured output", async () => {
     service = new FakeSubagentService();
     service.structuredMissing.add("analyse");
@@ -815,6 +944,366 @@ return await agent('asking', { label: 'asking' });
     assert.equal(view.status, "aborted");
     assert.equal(view.calls.find((call) => call.label === "asking")?.status, "aborted");
     assert.equal(view.failedCount, 0, "a wait must not be reported as a failed call");
+  });
+
+  it("fails the call when the agent watcher rejects instead of hanging", async () => {
+    // The completion interface says it never rejects, but the wiring awaits a
+    // watcher that can throw. A missing rejection handler would leave the call
+    // pending forever and surface as an unhandled rejection.
+    service = new FakeSubagentService();
+    service.rejects.add("explode");
+    const manager = createManager();
+    const script = `export const meta = { name: 'reject', description: 'x' }
+return await agent('explode', { label: 'explode' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null);
+    const call = view.calls.find((entry) => entry.label === "explode");
+    assert.equal(call?.status, "failed");
+    assert.match(String(call?.error), /watcher exploded/);
+  });
+
+  it("stops exempting a wait once the allowance is spent", async () => {
+    // "waiting" is only a snapshot phase: a process alive but wedged there, or a
+    // watcher that stopped reporting, keeps claiming it forever. An explicitly
+    // configured allowance is the bound for exactly that case.
+    service = new FakeSubagentService();
+    service.hangs.add("parked");
+    service.waiting.add("parked");
+    const manager = createManager();
+    const script = `export const meta = { name: 'dead-wait', description: 'x' }
+return await agent('parked', { label: 'parked' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(100);
+    run.setWaitAllowance(100);
+    const view = await run.execute();
+    assert.ok(service.waitingServed > 0, "the ceiling must have observed the wait");
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null);
+    const call = view.calls.find((entry) => entry.label === "parked");
+    assert.equal(call?.status, "failed");
+    assert.match(String(call?.error), /waiting on an answer is exempt/);
+  });
+
+  it("starts counting work again when a wait ends", async () => {
+    // First prove the point of the test: the call outlives its ceiling while it
+    // waits, so surviving is the exemption working, not a ceiling that never
+    // fired. Only then answer, and require the failure to come after the flip.
+    service = new FakeSubagentService();
+    service.hangs.add("flip");
+    service.waiting.add("flip");
+    const manager = createManager();
+    const script = `export const meta = { name: 'wait-flip', description: 'x' }
+return await agent('flip', { label: 'flip' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(100);
+    const executing = run.execute();
+    // Start the clock only once the agent has launched: VM start-up time must
+    // not be counted as the call outliving its ceiling.
+    await waitFor(() => service.spawns.length === 1, "the agent to launch");
+    const startedAt = Date.now();
+    // Wall clock measured by the test: 3x the ceiling, not a counter the test's
+    // own view() polls could satisfy.
+    await waitFor(() => Date.now() - startedAt >= 350, "the call to outlive its ceiling while waiting");
+    assert.equal(
+      run.view().calls.find((entry) => entry.label === "flip")?.status,
+      "running",
+      "a waiting call must outlive its ceiling",
+    );
+    service.waiting.delete("flip");
+    const view = await executing;
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.calls.find((entry) => entry.label === "flip")?.status, "failed");
+  });
+
+  it("frees a skipped call's slot instead of waiting for the ceiling", async (t) => {
+    // The skipped call's pane is closed, but its launch task used to keep the
+    // scheduling slot until the ceiling fired — forever when the ceiling is off.
+    // The ceiling here is far past the assertion window, so only the skip can
+    // free the slot in time.
+    const previous = process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS;
+    process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS = "1";
+    try {
+      service = new FakeSubagentService();
+      service.hangs.add("first");
+      service.hangs.add("second");
+      const manager = createManager();
+      const script = `export const meta = { name: 'skip-slot', description: 'x' }
+return await parallel([
+  () => agent('first', { label: 'first' }),
+  () => agent('second', { label: 'second' }),
+]);
+`;
+      const run = await manager.start({ source: script, args: {} });
+      // A failed assertion must still release the hung agents and the 60s
+      // ceiling timer, or the process outlives the test.
+      t.after(() => run.abort());
+      run.setCallTimeout(60_000);
+      const executing = run.execute();
+      await waitFor(() => service.spawns.length === 1, "the first call to start");
+      const first = run.view().calls.find((entry) => entry.label === "first")!;
+      assert.equal(run.skip(first.callKey), true);
+
+      // Bounded observation, then a plain assertion: a regression must fail the
+      // test with ERR_ASSERTION, not with an opaque timeout error.
+      await waitFor(
+        () => service.spawns.length === 2,
+        "the freed slot to start the second call",
+        800,
+      ).catch(() => undefined);
+      assert.equal(
+        service.spawns.length,
+        2,
+        "the freed slot must start the second call without waiting for the ceiling",
+      );
+      await waitFor(() => service.stopped.length === 1, "the skipped pane to be closed");
+      assert.equal(
+        run.view().calls.find((entry) => entry.label === "first")?.status,
+        "skipped",
+      );
+      run.abort();
+      const view = await executing;
+      assert.equal(view.status, "aborted");
+    } finally {
+      if (previous === undefined) delete process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS;
+      else process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS = previous;
+    }
+  });
+
+  it("writes a fatal run failure to disk even when nothing is in flight", async () => {
+    // failRun() flips the snapshot's status, which makes execute() skip its only
+    // forced persist; every other write is throttled. The terminal state used to
+    // stay "running" on disk.
+    service = new FakeSubagentService();
+    service.tokensPerAgent = 40;
+    const manager = createManager({ budgetTotal: 30 });
+    const script = `export const meta = { name: 'budget-persist', description: 'x', agent: 'worker' }
+await agent('a', { label: 'a' });
+await agent('b', { label: 'b' });
+return 'done';
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const view = await run.execute();
+    assert.equal(view.status, "failed");
+    assert.match(String(view.error), /budget exhausted/);
+    const onDisk = JSON.parse(readFileSync(join(view.runDir, "snapshot.json"), "utf8"));
+    assert.equal(onDisk.status, "failed", "the terminal state must reach disk");
+    assert.match(String(onDisk.error), /budget exhausted/);
+    assert.ok(onDisk.finishedAt, "a finished run records when it finished");
+  });
+
+  it("keeps a timed-out call failed when its agent finishes later", async () => {
+    // Gate on the agent actually finishing instead of sleeping past it.
+    service = new FakeSubagentService();
+    service.delays.set("slow-finish", 120);
+    const manager = createManager();
+    const script = `export const meta = { name: 'late-finish', description: 'x' }
+return await agent('slow-finish', { label: 'slow-finish' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(40);
+    const view = await run.execute();
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null);
+    const call = view.calls.find((entry) => entry.label === "slow-finish")!;
+    assert.equal(call.status, "failed");
+    await waitFor(() => service.finished >= 1, "the late answer to arrive");
+    await drainTicks();
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === call.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
+    assert.equal(run.view().calls.find((entry) => entry.label === "slow-finish")?.status, "failed");
+  });
+
+  it("lets abort win when it lands before the ceiling", async () => {
+    service = new FakeSubagentService();
+    service.hangs.add("parked");
+    const manager = createManager();
+    const script = `export const meta = { name: 'abort-first', description: 'x' }
+return await agent('parked', { label: 'parked' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(5000);
+    const executing = run.execute();
+    await waitFor(
+      () => service.activeServed > 0 && run.view().calls.some((call) => call.status === "running"),
+      "the call to be live before aborting",
+    );
+    run.abort();
+    const view = await executing;
+    assert.equal(view.status, "aborted");
+    assert.equal(view.calls.find((entry) => entry.label === "parked")?.status, "aborted");
+    assert.equal(view.failedCount, 0);
+  });
+
+  it("keeps the timeout failure when abort lands after it", async () => {
+    // Gate on both halves of the state this race needs: the first call has
+    // failed, and the second one is already in flight. Aborting after the first
+    // failure alone can land before the second call exists, which asserts on a
+    // call that was never created.
+    service = new FakeSubagentService();
+    service.hangs.add("wedged");
+    service.hangs.add("answering");
+    service.waiting.add("answering");
+    const manager = createManager();
+    const script = `export const meta = { name: 'abort-second', description: 'x' }
+const first = await agent('wedged', { label: 'first' });
+const second = await agent('answering', { label: 'second' });
+return [first, second];
+`;
+    const run = await manager.start({ source: script, args: {} });
+    run.setCallTimeout(50);
+    const executing = run.execute();
+    await waitFor(
+      () => {
+        const calls = run.view().calls;
+        return (
+          calls.find((entry) => entry.label === "first")?.status === "failed" &&
+          calls.find((entry) => entry.label === "second")?.status === "running"
+        );
+      },
+      "the first call to fail and the second to be in flight",
+    );
+    run.abort();
+    const view = await executing;
+    assert.equal(view.status, "aborted");
+    const first = view.calls.find((entry) => entry.label === "first")!;
+    assert.equal(first.status, "failed");
+    assert.equal(view.calls.find((entry) => entry.label === "second")?.status, "aborted");
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === first.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
+  });
+
+  it("closes a pane that a skip raced with its spawn", async () => {
+    // The launch gate holds spawn open, so the skip lands in the exact window:
+    // the call is live, the pane exists, and the handle has not returned yet.
+    service = new FakeSubagentService();
+    const spawn = service.spawn.bind(service);
+    const launch = deferred();
+    const entered = deferred();
+    service.spawn = async (request) => {
+      entered.resolve();
+      await launch.promise;
+      return spawn(request);
+    };
+    const manager = createManager();
+    const script = `export const meta = { name: 'skip-race', description: 'x' }
+return await agent('slow-start', { label: 'slow-start' });
+`;
+    const run = await manager.start({ source: script, args: {} });
+    const executing = run.execute();
+    await entered.promise;
+    const live = run.view().calls.find((call) => call.status === "running");
+    assert.ok(live, "the call must be live while its pane is still launching");
+    assert.equal(run.skip(live!.callKey), true);
+    launch.resolve();
+
+    const view = await executing;
+    assert.equal(view.status, "completed", view.error);
+    assert.equal(view.result, null);
+    assert.equal(view.calls.find((call) => call.callKey === live!.callKey)?.status, "skipped");
+    await waitFor(() => service.stopped.length === 1, "the late handle to be closed");
+    assert.equal(service.spawns.length, 1, "the pane had launched by the time the skip landed");
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === live!.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["skipped"]);
+  });
+
+  it("handles a watcher that throws when a skipped pane is closed", async () => {
+    // The handle arrives after the skip, is stopped, and that teardown makes
+    // the watcher throw. The rejection belongs to a call that already settled:
+    // it must be consumed, not leak.
+    const leaked: unknown[] = [];
+    const onRejection = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      service = new FakeSubagentService();
+      const spawn = service.spawn.bind(service);
+      const launch = deferred();
+      const entered = deferred();
+      service.spawn = async (request) => {
+        entered.resolve();
+        await launch.promise;
+        return spawn(request);
+      };
+      service.rejectOnStop.add("slow-start");
+      const manager = createManager();
+      const script = `export const meta = { name: 'skip-reject', description: 'x' }
+return await agent('slow-start', { label: 'slow-start' });
+`;
+      const run = await manager.start({ source: script, args: {} });
+      const executing = run.execute();
+      await entered.promise;
+      const live = run.view().calls.find((call) => call.status === "running");
+      assert.ok(live, "the call must be live while its pane is still launching");
+      assert.equal(run.skip(live!.callKey), true);
+      launch.resolve();
+
+      const view = await executing;
+      await waitFor(() => service.rejectedOnStop === 1, "the watcher to reject after the stop");
+      await drainTicks();
+      assert.equal(view.status, "completed", view.error);
+      assert.equal(view.calls.find((call) => call.callKey === live!.callKey)?.status, "skipped");
+      assert.equal(service.stopped.length, 1, "the late handle must be closed exactly once");
+      assert.deepEqual(leaked, [], "a watcher rejection must not leak");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  it("handles a watcher that throws when an aborted run closes its pane", async () => {
+    const leaked: unknown[] = [];
+    const onRejection = (reason: unknown) => leaked.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      service = new FakeSubagentService();
+      const spawn = service.spawn.bind(service);
+      const launch = deferred();
+      const entered = deferred();
+      service.spawn = async (request) => {
+        entered.resolve();
+        await launch.promise;
+        return spawn(request);
+      };
+      service.rejectOnStop.add("slow-start");
+      const manager = createManager();
+      const script = `export const meta = { name: 'abort-reject', description: 'x' }
+return await agent('slow-start', { label: 'slow-start' });
+`;
+      const run = await manager.start({ source: script, args: {} });
+      const executing = run.execute();
+      await entered.promise;
+      assert.ok(
+        run.view().calls.find((call) => call.status === "running"),
+        "the call must be live while its pane is still launching",
+      );
+      run.abort();
+      launch.resolve();
+
+      const view = await executing;
+      await waitFor(() => service.rejectedOnStop === 1, "the watcher to reject after the stop");
+      await drainTicks();
+      assert.equal(view.status, "aborted", view.error);
+      assert.equal(service.spawns.length, 1);
+      assert.equal(service.stopped.length, 1, "the late handle must be closed exactly once");
+      assert.deepEqual(leaked, [], "a watcher rejection must not leak");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 
   it("still fails a script that waits on a promise nobody answers", async () => {

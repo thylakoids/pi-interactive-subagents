@@ -22,6 +22,8 @@ import {
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { integrationModel } from "./model.ts";
+import { integrationRuntime } from "./runtime.ts";
 import {
   isMuxAvailable,
   createSurface,
@@ -67,8 +69,6 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -207,8 +207,10 @@ export function startPi(
   testDir: string,
   task: string,
   opts?: { model?: string; extraArgs?: string },
-): void {
-  const model = opts?.model ?? TEST_MODEL;
+): string {
+  const model = integrationModel(opts?.model);
+  const runtime = integrationRuntime();
+  const sessionFile = join(testDir, `parent-${uniqueId()}.jsonl`);
   const extra = opts?.extraArgs ?? "";
 
   // Force pi to load the working-tree extension (not an installed pi-package
@@ -217,10 +219,12 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
-    `pi`,
+    `env PI_OFFLINE=1 PATH=${shellEscape(runtime.path)} ${shellEscape(runtime.executable)}`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
+    `--session ${shellEscape(sessionFile)}`,
+    `--thinking off --approve --no-mcp -ns -np -nc`,
     extra,
     shellEscape(task),
   ]
@@ -230,6 +234,42 @@ export function startPi(
   sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
+  return sessionFile;
+}
+
+/** Inspect structured tool evidence, not a terminal's truncated presentation. */
+export async function waitForChildSession(parentFile: string, name: string): Promise<string> {
+  const deadline = Date.now() + PI_TIMEOUT;
+  while (Date.now() < deadline) {
+    if (existsSync(parentFile)) {
+      for (const line of readFileSync(parentFile, "utf8").split("\n").filter(Boolean)) {
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const message = entry.message;
+        if (message?.role === "toolResult" && message.toolName === "subagent" && message.details?.name === name) {
+          const path = message.details.sessionFile;
+          if (typeof path === "string" && existsSync(path)) return path;
+        }
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(`No successful subagent tool result for ${name} in ${parentFile}`);
+}
+
+export async function waitForSessionMessage(path: string, predicate: (message: any) => boolean): Promise<any> {
+  const deadline = Date.now() + PI_TIMEOUT;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) {
+      for (const line of readFileSync(path, "utf8").split("\n").filter(Boolean)) {
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (entry.type === "message" && predicate(entry.message)) return entry.message;
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(`Expected transcript evidence did not arrive in ${path}`);
 }
 
 // ── Polling helpers ──

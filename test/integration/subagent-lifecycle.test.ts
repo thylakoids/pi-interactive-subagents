@@ -1,18 +1,18 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with REAL LLM calls (explicit model required).
  * Each test creates a tmux pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
+ * Costs depend on PI_TEST_MODEL; these tests make billed calls.
  * Duration: ~30-90s per test.
  *
  * Run inside tmux:
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — required model for all pi sessions
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -25,6 +25,8 @@ import {
   createTrackedSurface,
   startPi,
   waitForScreen,
+  waitForChildSession,
+  waitForSessionMessage,
   waitForFile,
   sleep,
   uniqueId,
@@ -72,7 +74,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      const parentSession = startPi(surface, env.dir, task);
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
@@ -81,19 +83,8 @@ for (const backend of backends) {
         `Marker file should contain PASS_${id}. Got: ${content.trim()}`,
       );
 
-      // Verify: outer pi received the subagent result
-      const screen = await waitForScreen(
-        surface,
-        /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
-        PI_TIMEOUT,
-      );
-
-      // Verify: session file was created (shown in steer result)
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Subagent session file should exist: ${sessionFile}`);
-
+      const sessionFile = await waitForChildSession(parentSession, `Echo-${id}`);
+      {
         const lines = readFileSync(sessionFile, "utf8").trim().split("\n");
         assert.ok(lines.length >= 2, `Session should have ≥2 entries, got ${lines.length}`);
 
@@ -201,31 +192,20 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
+        `  agent: "test-fork"`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `Use the test-fork profile; its definition enables forked context.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      const parentSession = startPi(surface, env.dir, task);
 
       // Verify: forked subagent created the file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
       assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
 
-      // Wait for the outer pi to show the result
-      const screen = await waitForScreen(
-        surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
-      );
-
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
-
+      const sessionFile = await waitForChildSession(parentSession, `Fork-${id}`);
+      {
         const entries = readFileSync(sessionFile, "utf8")
           .trim()
           .split("\n")
@@ -238,36 +218,22 @@ for (const backend of backends) {
       }
     });
 
-    // ── caller_ping ──
-
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    // Verify a round trip, not text echoed from the initial task.
+    it("subagent asks the parent and continues after its reply", async () => {
       const id = uniqueId();
-
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const token = "SECRET_" + uniqueId();
+      const markerFile = `/tmp/pi-integ-question-${id}.txt`;
+      trackTempFile(env, markerFile);
+      const surface = createTrackedSurface(env, `question-${id}`);
       await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
-
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
-      );
+      startPi(surface, env.dir, [
+        `Call subagent with agent "test-ping", name "Question-${id}", task "Output path: ${markerFile}".`,
+        `Do NOT include this secret token in the task: ${token}`,
+        `When that agent asks a question, use subagent_message to reply with exactly ${token}.`,
+        "Do not write the output file yourself.",
+      ].join("\n"));
+      const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(token));
+      assert.equal(content.trim(), token, "Child must consume the parent reply before writing");
     });
 
     // ── Agent discovery ──
@@ -291,16 +257,20 @@ for (const backend of backends) {
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      const parentSession = startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
+      await waitForSessionMessage(parentSession, message => message.role === "toolResult" &&
+        message.toolName === "subagents_list" &&
+        message.details?.agents?.some((agent: any) => agent.name === "test-echo" && agent.source === "project"));
+
     });
 
     // ── Subagent with custom system prompt ──
 
-    it("passes systemPrompt to subagent", async () => {
+    it("applies the agent definition system prompt to the child", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
       trackTempFile(env, markerFile);
@@ -311,16 +281,19 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these parameters:`,
         `  name: "SysP-${id}"`,
-        `  agent: "test-echo"`,
-        `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
+        `  agent: "test-sysprompt"`,
         `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      const parentSession = startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
       assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+      const childSession = await waitForChildSession(parentSession, `SysP-${id}`);
+      await waitForSessionMessage(childSession, message => message.role === "assistant" &&
+        message.content.some((block: any) => block.type === "text" && block.text.startsWith("CUSTOM_PROMPT_ACTIVE")));
+
     });
   });
 }

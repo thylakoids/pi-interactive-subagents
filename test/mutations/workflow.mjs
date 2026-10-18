@@ -9,6 +9,21 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['nonzero exit without error text is accepted', 'pi-extension/subagents/workflow/manager.ts',
+    'if (result.exitCode !== 0)', 'if (result.error && result.exitCode !== 0)', 'fails a non-zero exit that carries no error text'],
+  ['Skip holds its scheduling slot', 'pi-extension/subagents/workflow/manager.ts',
+    '    this.abandonment.get(callKey)?.abort();', '', 'frees a skipped call'],
+  ['fatal failure is not persisted', 'pi-extension/subagents/workflow/manager.ts',
+    '    this.persistSnapshot(true);\n  }\n\n  /**\n   * Stop everything',
+    '  }\n\n  /**\n   * Stop everything', 'writes a fatal run failure to disk'],
+  ['waiting is charged as working time', 'pi-extension/subagents/workflow/manager.ts',
+    'if (waiting && waitedMs < waitAllowanceMs)', 'if (false)', 'starts counting work again when a wait ends'],
+  ['research gaps incorrectly reported complete', 'examples/workflows/deep-research.js',
+    ' && evidenceGaps.length === 0', ''],
+  ['omitted research queries incorrectly reported complete', 'examples/workflows/deep-research.js',
+    ' && omittedQueries.length === 0', ''],
+  ['review admission ignores severity', 'examples/workflows/review-changes.js',
+    'findings.slice().sort((left, right) => severityOf(left) - severityOf(right))', 'findings.slice()'],
   ['delegated result incorrectly answers pending question', 'pi-extension/subagents/subagent-done.ts',
     '    recorder.agentStart();', '    awaitingAnswer = false;\n    recorder.agentStart();'],
   ['working continues before parent reply', 'pi-extension/subagents/subagent-done.ts',
@@ -47,20 +62,26 @@ const mutants = [
   ['missing votes reported complete', 'examples/workflows/deep-research.js',
     " && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted'))", ''],
 ];
-const execute = () => spawnSync(process.execPath, ['--test', ...tests], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
+const execute = (pattern) => spawnSync(process.execPath, pattern
+  ? ['--test', '--test-timeout=10000', '--test-name-pattern=' + pattern, 'test/workflow.test.ts']
+  : ['--test', ...tests], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
 try {
   for (const path of ['pi-extension', 'agents', 'examples', 'skills', 'test', 'package.json', 'config.json.example']) cpSync(join(root, path), join(dir, path), { recursive: true });
   symlinkSync(join(root, 'node_modules'), join(dir, 'node_modules'), 'dir');
   const baseline = execute();
   assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
   console.log('Baseline: passed');
-  for (const [name, path, before, after] of mutants) {
+  for (const [name, path, before, after, pattern] of mutants) {
+    if (pattern) {
+      const control = execute(pattern);
+      assert.equal(control.status, 0, 'Targeted baseline failed: ' + name + '\n' + control.stdout + control.stderr);
+    }
     const target = join(dir, path);
     const source = readFileSync(target, 'utf8');
     assert.equal(source.split(before).length, 2, 'Mutation must match exactly once: ' + name);
     writeFileSync(target, source.replace(before, after));
     try {
-      const result = execute();
+      const result = execute(pattern);
       assert.equal(result.status, 1, 'Mutant survived or crashed: ' + name + '\n' + result.stdout + result.stderr);
       assert.match(result.stdout, /ERR_ASSERTION/, 'Must fail an assertion, not a syntax/import error: ' + name);
       assert.doesNotMatch(result.stdout + result.stderr, /SyntaxError|ERR_MODULE_NOT_FOUND/);

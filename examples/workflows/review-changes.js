@@ -38,10 +38,11 @@ const target = typeof args.target === 'string' && args.target.trim()
   ? args.target
   : '当前工作区相对 HEAD 的未提交改动（先用 git status / git diff 确认范围）'
 
-// 动态扇出必须在脚本里设上限：运行时只拒绝超大批次（单批 4096 项），不会替模板限制
-// 维度数或发现数，所以两者都在这里截断，并在 report 里如实报告被丢掉的部分。
-const maxDimensions = Number.isInteger(args.maxDimensions) ? Math.max(1, Math.min(24, args.maxDimensions)) : 8
-const maxFindings = Number.isInteger(args.maxFindings) ? Math.max(1, Math.min(50, args.maxFindings)) : 20
+// 动态扇出必须在脚本里设上限：运行时不管维度数和发现数（它只拒绝单批超过 4096 项，
+// 以及单 run 超过 1000 次启动——后者是致命错误，会让整个 run 失败而不是降级）。
+// 所以两者都在这里截断，上限相乘也留在启动上限以内，并如实报告被丢掉的部分。
+const maxDimensions = Number.isInteger(args.maxDimensions) ? Math.max(1, Math.min(16, args.maxDimensions)) : 8
+const maxFindings = Number.isInteger(args.maxFindings) ? Math.max(1, Math.min(25, args.maxFindings)) : 20
 
 // args.dimensions 每项是字符串或 { name, focus, agent }；缺省三个维度。
 // 维度本身不绑定 agent：审查者用 workflow 的默认子代理，维度要求写在提示词里。
@@ -69,6 +70,11 @@ const droppedDimensions = allDimensions.slice(maxDimensions).map((dimension) => 
 
 const verifierAgent = typeof args.verifierAgent === 'string' ? args.verifierAgent : undefined
 
+// 裁掉哪些发现只按严重性，不按模型给的顺序：顺序是模型的自由文本排序，
+// 位置裁剪会把该验的那几条留在门外
+const severityRank = { high: 0, medium: 1, low: 2 }
+const severityOf = (finding) => (finding && severityRank[finding.severity] !== undefined ? severityRank[finding.severity] : 3)
+
 await phase('Review')
 await log('审查范围：' + target + '；维度：' + dimensions.map((dimension) => dimension.name).join('、'))
 if (droppedDimensions.length > 0) {
@@ -95,8 +101,9 @@ const reviewed = await pipeline(
     if (!audit) return null
     const findings = audit && Array.isArray(audit.findings) ? audit.findings : []
     // 每个维度先截断再进入 fan-out：验证者数量 = 维度数 + admitted findings，不随发现数无限增长
-    const admitted = findings.slice(0, maxFindings)
-    return { dimension: dimension.name, findings: admitted, dropped: findings.length - admitted.length }
+    const ranked = findings.slice().sort((left, right) => severityOf(left) - severityOf(right))
+    const admitted = ranked.slice(0, maxFindings)
+    return { dimension: dimension.name, findings: admitted, dropped: ranked.length - admitted.length }
   },
   async (audited, dimension) => {
     if (!audited) return null
@@ -170,12 +177,7 @@ for (let index = 0; index < reviewed.length; index++) {
   for (const finding of entry.unverified) report.unverified.push(finding)
 }
 
-const severityRank = { high: 0, medium: 1, low: 2 }
-report.confirmed.sort((left, right) => {
-  const a = severityRank[left.severity] === undefined ? 3 : severityRank[left.severity]
-  const b = severityRank[right.severity] === undefined ? 3 : severityRank[right.severity]
-  return a - b
-})
+report.confirmed.sort((left, right) => severityOf(left) - severityOf(right))
 
 const droppedTotal = report.droppedFindings.reduce((sum, item) => sum + item.count, 0)
 await log('完成：确认 ' + report.confirmed.length + ' 条，驳回 ' + report.rejected + ' 条，未验证 ' + report.unverified.length + ' 条' + (droppedTotal > 0 ? '，超上限未送验证 ' + droppedTotal + ' 条' : ''))

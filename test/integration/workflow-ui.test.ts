@@ -1,3 +1,4 @@
+import { integrationRuntime } from './runtime.ts';
 /** Real terminal navigation and original-session Focus, without model calls. */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -23,14 +24,16 @@ describe("workflow tree terminal", { skip: !available, timeout: 90_000 }, () => 
     const dir = mkdtempSync(join(tmpdir(), "pi-workflow-ui-"));
     const session = `pi-ui-${process.pid}-${Date.now()}`;
     const root = resolve(import.meta.dirname, "../..");
-    t.after(() => cleanupSession(session, dir));
+    console.log("UI evidence: " + dir);
+    t.after(() => cleanupSession(session, dir, { preserveArtifacts: true }));
     let pane = "";
     mkdirSync(join(dir, "config"));
     writeFileSync(join(dir, "config", "settings.json"), JSON.stringify({ quietStartup: true, enableTerminalTitle: false }));
     pane = tmux(["new-session", "-d", "-s", session, "-x", "120", "-y", "42", "-P", "-F", "#{pane_id}"]);
     tmux(["set-option", "-w", "-t", session, "window-size", "manual"]);
     tmux(["resize-window", "-t", session, "-x", "120", "-y", "42"]);
-    const command = `cd ${shellEscape(dir)} && exec env PI_OFFLINE=1 PI_WORKFLOW_MAX_CONCURRENT_AGENTS=1 PI_CODING_AGENT_DIR=${shellEscape(join(dir, "config"))} PI_WORKFLOW_UI_FIXTURE_DIR=${shellEscape(dir)} pi -ne -ns -np -nc --no-mcp -e ${shellEscape(join(root, "test/integration/fixtures/workflow-ui.ts"))} --session ${shellEscape(join(dir, "parent.jsonl"))}`;
+    const runtime = integrationRuntime();
+    const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_WORKFLOW_MAX_CONCURRENT_AGENTS=1 PI_CODING_AGENT_DIR=${shellEscape(join(dir, "config"))} PI_WORKFLOW_UI_FIXTURE_DIR=${shellEscape(dir)} ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp -e ${shellEscape(join(root, "test/integration/fixtures/workflow-ui.ts"))} --session ${shellEscape(join(dir, "parent.jsonl"))} 2>${shellEscape(join(dir, "startup-error.log"))}; status=$?; echo $status >${shellEscape(join(dir, "parent-exit.txt"))}; sleep 120`;
     tmux(["respawn-pane", "-k", "-t", pane, command]);
     const screen = () => execFileSync("tmux", ["capture-pane", "-p", "-t", pane], { encoding: "utf8" });
     const key = (...keys: string[]) => tmux(["send-keys", "-t", pane, ...keys]);

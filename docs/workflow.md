@@ -186,11 +186,13 @@ workflow({ action: 'list' })
 
 ### review-changes
 
-按维度并行审查 → 每条发现由独立 agent 对抗性验证 → 只保留被确认的问题（结果里附各维度驳回/未验证计数）。`args`：
+按维度并行审查 → 每条发现由独立 agent 对抗性验证 → 只保留被确认的问题。返回的 `confirmed` 和 `unverified` 是扁平清单：`confirmed` 条目带 `dimension`，`unverified` 条目不带；`rejected` 是全局计数，不做维度归属。被上限挡住的维度与发现分别记在 `droppedDimensions`（维度名数组）和 `droppedFindings`（`{ dimension, count }` 数组）里，脚本日志也会打印。`args`：
 
 - `target`（可选）：审查范围描述，默认“当前未提交的改动”
 - `dimensions`（可选）：维度数组，默认三个（correctness、quality、regression）。每项是字符串，或 `{ name, focus, agent }`
 - `verifierAgent`（可选）：验证者 agent；默认不绑定，用 workflow 的默认子代理
+- `maxDimensions`（可选）：审查的维度数上限，默认 8、最大 16；超出的维度不审查，名字进 `droppedDimensions`
+- `maxFindings`（可选）：每个维度送往验证的发现数上限，默认 20、最大 25；按严重性从高到低取前 N 条，裁掉的数量进 `droppedFindings`
 
 默认维度不绑定 agent——维度要求写在提示词里，审查者就是普通的 workflow 子代理。想指定某个定义（比如一个只读的 reviewer）就在维度里写 `agent`：
 
@@ -212,6 +214,8 @@ workflow({ action: 'start', name: 'review-changes', args: {
 - `files`（必填）：文件路径列表
 - 可选覆盖：`planAgent`（默认 `scout`）、`applyAgent`（默认 `worker`）、`verifierAgent`（默认 `worker`）、`quickVerifierAgent`（默认 `scout`）
 
+`applyReport` 是执行者自述原文，**未经核验**：它只作为线索传给验证者，并原样附在走完验证的文件条目上（只有 `verified` 与 `needsAttention` 是对象条目，`unfinished` 里是文件路径字符串）。文件归类完全由验证者的 `ok` 决定；`issues` 随条目一起返回、但不参与分组。执行者自述某步没做不会改变归类，要读出这一点得人去看 `applyReport`。
+
 ```js
 workflow({ action: 'start', name: 'migrate-files', args: {
   task: '把 fs 回调风格改成 async/await',
@@ -229,7 +233,7 @@ workflow({ action: 'start', name: 'migrate-files', args: {
 
 ### deep-research
 
-Scope → 每查询 Search → Fetch → 对高优先级 claim 做三票 Verify → Synthesize。`args`：`question`（必填）、可选 `context`、`maxCalls`（默认 10）、`researchAgent`（默认 `researcher`）。模板会显式报告失败分支、未核验 claim 和因预算省略的证据。`researcher` 必须可用并具备搜索/抓取能力；也可指定其他等价 agent。
+Scope → 每查询 Search → Fetch → 对高优先级 claim 做三票 Verify → Synthesize。`args`：`question`（必填）、可选 `context`、`maxCalls`（默认 10）、`researchAgent`（默认 `researcher`）。模板会显式报告失败分支、未核验 claim、因预算省略的 claim 与查询（`omittedClaims`、`omittedQueries`），以及 fetch 明确报出的证据缺口（`evidenceGaps`）。`status` 只有在成功生成了综合答复（`answer` 非空）、没有任何省略与缺口、每条被纳入的查询都拿到证据、且每条被核验的 claim 都是 supported 或 refuted 时才是 `complete`，否则为 `incomplete`。`researcher` 必须可用并具备搜索/抓取能力；也可指定其他等价 agent。
 
 ### iterative-refinement
 
@@ -314,7 +318,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 - 不支持嵌套：`workflow()` 调用直接报错；子步骤写进当前脚本。
 - 需要 tmux；pi 会话必须有持久化 session 文件，否则 start 直接以 `Cannot run a workflow: …` 拒绝。
 - `agent()` 只能使用当前会话允许的 agent 定义（与 `subagent` 工具同一套 allowlist），都不满足时会报错。
-- 超时是两层的，都不按整轮的墙钟算：脚本自身 30 分钟没有任何进展、且没有未结算的调用，才中止整轮；单个 `agent()` 调用累计运行 60 分钟仍未结束则以 `failed` 结算，脚本拿到 `null` 继续，其他调用和整轮都不受影响。等待 `ask_question` 回复（状态 `waiting`）的时间不计入这个上限。`PI_WORKFLOW_CALL_TIMEOUT_MS` 可以改单调用上限，设为 `0` 关闭。
+- 超时是两层的，都不按整轮的墙钟算：脚本自身 30 分钟没有任何进展、且没有未结算的调用，才中止整轮；单个 `agent()` 调用累计运行 60 分钟仍未结束则以 `failed` 结算，脚本拿到 `null` 继续，其他调用和整轮都不受影响。等待 `ask_question` 回复（状态 `waiting`）默认不设上限：等待是 run 自己要来的状态，进程退出由 watcher 结算，运行时不会在无法证明失联时猜它死掉；只有显式设置 `PI_WORKFLOW_WAIT_TIMEOUT_MS`（毫秒，`0` 关闭）才给等待设上限，超出的等待时间开始计入上面的 60 分钟。`PI_WORKFLOW_CALL_TIMEOUT_MS` 改单调用上限，`0` 关闭。
 - 沙箱无文件系统/网络/计时器，堆上限 256MB；脚本卡死不会拖住 pi 主界面。
 - 每个 `agent()` 都是完整模型调用，成本按 agent 数量线性增长。
 

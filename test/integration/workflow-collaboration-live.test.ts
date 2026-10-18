@@ -1,3 +1,4 @@
+import { integrationRuntime } from './runtime.ts';
 /** Opt-in, billed live-model coverage. No service or model substitutions. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,12 +9,14 @@ import { tmpdir } from 'node:os';
 import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
 import { cleanupSession } from './cleanup.ts';
 
+import { integrationModel } from './model.ts';
+
 const live = process.env.PI_WORKFLOW_LIVE === '1';
 it('real parent answers workflow questions, worker delegates, and waiting workflow can Abort', { skip: !live, timeout: 1_200_000 }, async t => {
   const root = resolve(import.meta.dirname, '../..');
   const dir = mkdtempSync(join(tmpdir(), 'pi-workflow-collaboration-'));
   const session = 'pi-wf-collab-' + process.pid + '-' + Date.now();
-  const model = process.env.PI_TEST_MODEL ?? 'anthropic/claude-haiku-4-5';
+  const model = integrationModel();
   console.log('Live model: ' + model + '; retained evidence: ' + dir);
   // Retain all sessions, scripts, journals and tool-side markers after success
   // or failure; remove only our tmux processes.
@@ -30,7 +33,8 @@ it('real parent answers workflow questions, worker delegates, and waiting workfl
   }
   writeFileSync(join(dir, 'fixture.txt'), 'SCOUT_READ_OK\n');
   const pane = tmux('new-session', '-d', '-s', session, '-x', '140', '-y', '42', '-P', '-F', '#{pane_id}');
-  const command = `cd ${shellEscape(dir)} && env PI_OFFLINE=1 PI_WORKFLOW_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_WORKFLOW_MAX_CONCURRENT_AGENTS=4 PI_SUBAGENT_SHELL_READY_DELAY_MS=100 pi -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/workflow-collaboration-live.ts'))} --session ${shellEscape(join(dir, 'parent.jsonl'))} 2>${shellEscape(join(dir, 'startup-error.log'))}; status=$?; echo $status >${shellEscape(join(dir, 'parent-exit.txt'))}; sleep 120`;
+  const runtime = integrationRuntime();
+  const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_WORKFLOW_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_WORKFLOW_MAX_CONCURRENT_AGENTS=4 PI_SUBAGENT_SHELL_READY_DELAY_MS=100 ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/workflow-collaboration-live.ts'))} --session ${shellEscape(join(dir, 'parent.jsonl'))} 2>${shellEscape(join(dir, 'startup-error.log'))}; status=$?; echo $status >${shellEscape(join(dir, 'parent-exit.txt'))}; sleep 120`;
   writeFileSync(join(dir, 'launch-command.sh'), command + '\n');
   tmux('respawn-pane', '-k', '-t', pane, command);
   const deadline = Date.now() + 1_150_000;

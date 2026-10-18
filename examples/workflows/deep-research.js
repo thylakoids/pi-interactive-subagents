@@ -105,15 +105,13 @@ const queries = plannedQueries.slice(0, queryLimit)
 const omittedQueries = plannedQueries.slice(queryLimit).map((entry) => entry.query)
 
 if (queries.length === 0) {
+  // maxCalls 的下限是 8，queryLimit 因此永不为 0：这里的空 queries 只可能是
+  // scope 没给出可用查询（或 scope 失败），不是被预算切掉
   return {
     question,
     status: 'incomplete',
-    reason: scope
-      ? (plannedQueries.length > 0 ? 'maxCalls left no budget for a search query.' : 'The scope step found no usable search queries.')
-      : 'The scope step failed.',
+    reason: scope ? 'The scope step found no usable search queries.' : 'The scope step failed.',
     scope: scope || null,
-    queries: [],
-    omittedQueries: omittedQueries,
     sources: [],
     evidence: [],
     verdicts: [],
@@ -165,6 +163,11 @@ const researched = await pipeline(queries, async (entry, _, index) => {
 })
 
 const evidence = researched.filter((entry) => entry && entry.evidence)
+// fetch 阶段明确报告的缺口（读不到的页面、缺失的证据）同样算没覆盖到：
+// 只要有一条，答案就不能自称 complete
+const evidenceGaps = evidence.flatMap((entry) =>
+  entry.evidence && Array.isArray(entry.evidence.gaps) ? entry.evidence.gaps : []
+)
 const allClaims = evidence.flatMap((entry, evidenceIndex) =>
   (entry.evidence && Array.isArray(entry.evidence.claims) ? entry.evidence.claims : [])
     .map((claim, claimIndex) => ({ ...claim, evidenceIndex, claimIndex }))
@@ -231,13 +234,15 @@ const answer = evidence.length > 0 ? await callAgent([
 
 return {
   question,
-  status: answer && omittedClaims.length === 0 && omittedQueries.length === 0 && evidence.length === queries.length && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted')) ? 'complete' : 'incomplete',
+  status: answer && omittedClaims.length === 0 && omittedQueries.length === 0 && evidenceGaps.length === 0 && evidence.length === queries.length && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted')) ? 'complete' : 'incomplete',
   scope,
   queries: queries.map((query) => query.query),
   omittedQueries,
+  // 交给 fetch 的候选来源，不代表已经被读到；真正读过的来源记在 evidence[].sources
   sources: evidence.flatMap((entry) => entry.sources),
   evidence,
   verdicts,
   omittedClaims,
+  evidenceGaps,
   answer,
 }

@@ -258,3 +258,92 @@ for (const stop of ['rounds', 'tokens']) {
     assert.equal(f.calls.length, stop === 'tokens' ? 1 : 3);
   });
 }
+
+
+it('review-changes admits findings by severity and names what the caps dropped', async t => {
+  const f = fixture(t, request => {
+    if (request.task.startsWith('独立审查')) {
+      return { value: { findings: [finding('low', 'low'), finding('high'), finding('medium', 'medium')] } };
+    }
+    assert.match(request.task, /review-scope/);
+    assert.match(request.task, /high: src\/a\.ts:7/);
+    return { value: { isReal: true, reason: 'confirmed' } };
+  });
+  const view = await (await f.manager.start({ source: source('review-changes'), args: {
+    target: 'review-scope', dimensions: [{ name: 'main' }, { name: 'extra' }], maxDimensions: 1, maxFindings: 1,
+  } })).execute();
+  assert.equal(view.status, 'completed', view.error);
+  const result = view.result as any;
+  assert.deepEqual(result.droppedDimensions, ['extra'], 'a dimension past the cap is named, not silently skipped');
+  assert.deepEqual(result.droppedFindings, [{ dimension: 'main', count: 2 }]);
+  assert.deepEqual(result.confirmed.map((entry: any) => entry.title), ['high'], 'admission ranks by severity, not by the model list order');
+  assert.equal(f.calls.length, 2, 'one audit plus one verifier for the single admitted finding');
+});
+
+it('deep-research reports planned queries the call budget dropped', async t => {
+  const f = fixture(t, request => {
+    if (request.task.startsWith('Define')) return { value: { queries: [{ query: 'q1', reason: 'r1' }, { query: 'q2', reason: 'r2' }], scopeNotes: [] } };
+    if (request.task.startsWith('Find candidate')) return { value: { sources: [{ url: 'https://example.org/source', title: 'primary', relevance: 'direct' }] } };
+    if (request.task.startsWith('Fetch')) return { value: { findings: ['evidence'], claims: [], gaps: [] } };
+    assert.match(request.task, /Planned queries omitted because of maxCalls: \["q2"\]/);
+    return { text: 'answer' };
+  });
+  const view = await (await f.manager.start({ source: source('deep-research'), args: { question: 'Research', maxCalls: 8 } })).execute();
+  assert.equal(view.status, 'completed', view.error);
+  const result = view.result as any;
+  assert.deepEqual(result.queries, ['q1']);
+  assert.deepEqual(result.omittedQueries, ['q2']);
+  assert.equal(result.status, 'incomplete', 'a planned query that never ran must not read as complete');
+  assert.equal(f.calls.length, 4);
+});
+
+it('migrate-files carries the apply report to the verifier and the caller', async t => {
+  const f = fixture(t, request => {
+    if (request.task.startsWith('为一个文件')) return { value: { steps: ['step-one'], risky: false } };
+    if (request.task.startsWith('按给定')) return { text: '改了 step-one；step-two 要改别的文件，没做' };
+    assert.match(request.task, /执行者自述（未经核验/);
+    assert.match(request.task, /step-two 要改别的文件，没做/);
+    return { value: { ok: true, issues: [] } };
+  });
+  const view = await (await f.manager.start({ source: source('migrate-files'), args: { task: 'migration-task', files: ['a.ts'] } })).execute();
+  assert.equal(view.status, 'completed', view.error);
+  const result = view.result as any;
+  assert.equal(result.verified.length, 1);
+  assert.equal(result.verified[0].applyReport, '改了 step-one；step-two 要改别的文件，没做', 'the applier claim reaches the caller as a claim, not as a verdict');
+  assert.equal(f.calls.length, 3);
+});
+
+
+it('deep-research never reports complete while a fetch reported evidence gaps', async t => {
+  const f = fixture(t, request => {
+    if (request.task.startsWith('Define')) return { value: { queries: [{ query: 'q1', reason: 'r1' }], scopeNotes: [] } };
+    if (request.task.startsWith('Find candidate')) return { value: { sources: [{ url: 'https://example.org/source', title: 'primary', relevance: 'direct' }] } };
+    if (request.task.startsWith('Fetch')) return { value: { findings: ['partial'], claims: [], gaps: ['the second source was unreachable'] } };
+    return { text: 'answer that must state the gap' };
+  });
+  const view = await (await f.manager.start({ source: source('deep-research'), args: { question: 'Research', maxCalls: 8 } })).execute();
+  assert.equal(view.status, 'completed', view.error);
+  const result = view.result as any;
+  assert.deepEqual(result.evidenceGaps, ['the second source was unreachable']);
+  assert.equal(result.status, 'incomplete', 'a reported evidence gap must keep the run out of complete');
+  assert.equal(result.answer, 'answer that must state the gap');
+});
+
+it('review-changes keeps string dimensions as focus with a generated name', async t => {
+  const f = fixture(t, request => {
+    if (request.task.startsWith('独立审查')) {
+      assert.match(request.task, /审查维度——dimension-1：first focus/);
+      return { value: { findings: [finding('one')] } };
+    }
+    assert.match(request.task, /维度 dimension-1/);
+    return { value: { isReal: true, reason: 'confirmed' } };
+  });
+  const view = await (await f.manager.start({ source: source('review-changes'), args: {
+    target: 'review-scope', dimensions: ['first focus', 'second focus'], maxDimensions: 1, maxFindings: 1,
+  } })).execute();
+  assert.equal(view.status, 'completed', view.error);
+  const result = view.result as any;
+  assert.deepEqual(result.droppedDimensions, ['dimension-2'], 'a dropped string dimension keeps its generated name');
+  assert.equal(f.calls.length, 2, 'only the admitted dimension is audited; the dropped one never reaches a verifier');
+  assert.equal(f.calls.some(call => /dimension-2/.test(call.task)), false, 'the dropped dimension never reaches an agent');
+});

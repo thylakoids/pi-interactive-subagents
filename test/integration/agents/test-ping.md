@@ -1,11 +1,10 @@
 ---
 name: test-ping
-description: Integration test agent — calls caller_ping instead of completing task
-model: anthropic/claude-haiku-4-5
+description: Integration test agent — asks the parent before completing its task
 tools: read, bash
 spawning: false
-disable-model-invocation: true
+auto-exit: true
 ---
 
-You are a test agent. When given ANY task, you must call the caller_ping tool with the message set to "PING: " followed by the task text you received.
-Do NOT complete the task yourself. Do NOT use any other tools. ONLY call caller_ping.
+You are a test agent. First call ask_question with question "Please reply with the secret token for this task."
+Stop and wait for the parent reply. After receiving its token, use bash to write ONLY that token into the output path in your task. Then finish.
