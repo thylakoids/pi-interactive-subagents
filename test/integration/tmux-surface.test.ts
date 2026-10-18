@@ -10,6 +10,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { unlinkSync } from "node:fs";
 import {
   getAvailableBackends,
@@ -40,6 +41,14 @@ const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_REA
 if (backends.length === 0) {
   console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
   console.log("   Run inside tmux to enable these tests.");
+}
+
+function tmux(args: string[]): string {
+  return execFileSync("tmux", args, { encoding: "utf8" }).trim();
+}
+
+function panePosition(pane: string): string {
+  return tmux(["display-message", "-p", "-t", pane, "#{pane_left},#{pane_top}"]);
 }
 
 for (const backend of backends) {
@@ -192,6 +201,42 @@ for (const backend of backends) {
       try {
         unlinkSync(filePath);
       } catch {}
+    });
+
+    it("does not re-lay out a window the user split after placement", () => {
+      const originalPane = process.env.TMUX_PANE;
+      if (!originalPane) throw new Error("TMUX_PANE is required");
+
+      const sessionId = tmux(["display-message", "-p", "-t", originalPane, "#{session_id}"]);
+      const rootPane = tmux(["new-window", "-d", "-t", `${sessionId}:`, "-P", "-F", "#{pane_id}"]);
+      const windowId = tmux(["display-message", "-p", "-t", rootPane, "#{window_id}"]);
+      try {
+        // Run this test's placement from a fresh window, so it starts as home.
+        process.env.TMUX_PANE = rootPane;
+        const child = createTrackedSurface(env, "close-layout");
+        // The user now adds a pane of their own; spawn placement already treats
+        // the window as foreign, and closing the subagent must too.
+        const userPane = tmux([
+          "split-window", "-d", "-h", "-t", rootPane, "-P", "-F", "#{pane_id}",
+        ]);
+        const before = panePosition(userPane);
+
+        closeSurface(child);
+        untrackSurface(env, child);
+
+        // The pane grows into the space tmux frees; that is normal. It must not
+        // move to the right of the parent (which is what main-vertical would do).
+        assert.equal(
+          panePosition(userPane),
+          before,
+          "closing a subagent must not rearrange the user's pane",
+        );
+      } finally {
+        process.env.TMUX_PANE = originalPane;
+        try {
+          tmux(["kill-window", "-t", windowId]);
+        } catch {}
+      }
     });
   });
 }

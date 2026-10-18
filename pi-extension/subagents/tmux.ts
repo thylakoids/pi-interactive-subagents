@@ -17,7 +17,13 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { MAIN_PANE_WIDTH, choosePlacement, type WindowInfo } from "./layout.ts";
+import {
+  MAIN_PANE_WIDTH,
+  choosePlacement,
+  classifyWindow,
+  type PaneInfo,
+  type WindowInfo,
+} from "./layout.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -77,9 +83,10 @@ export function shellEscape(s: string): string {
  *
  * Closing a pane has to re-even its window, and the close can arrive after the
  * pane is already gone — at which point tmux can no longer say which window it
- * was in. Remembering the pairing keeps that repair possible.
+ * was in. Remembering the pairing and the tree keeps that repair possible
+ * without ever laying out a window this tree does not own.
  */
-const surfaceWindows = new Map<string, { window: string; home: boolean }>();
+const surfaceWindows = new Map<string, { window: string; tree: string }>();
 
 /**
  * `display-message` and `list-panes` in one invocation, so placing a pane costs
@@ -87,33 +94,73 @@ const surfaceWindows = new Map<string, { window: string; home: boolean }>();
  * pane's `@pi_subagent` expands to the empty string, and without a prefix that
  * line would look like a pane that is not there at all.
  *
- * The free-text fields come last so a `|` inside a session or window name
- * cannot shift the fields that are read by position.
+ * Session names may contain `|`, so the overflow-window target is the session
+ * *id* (`$N`), which cannot. Only the free-text window name is parsed from the
+ * tail, where `|` is harmless.
  */
 const HEAD_FORMAT =
-  "H|#{window_id}|#{window_width}|#{window_height}|#{@pi_subagent}|#{session_name}|#{window_name}";
+  "H|#{window_id}|#{window_width}|#{window_height}|#{session_id}|#{window_name}";
 const PANE_FORMAT =
   "P|#{window_id}|#{window_width}|#{window_height}|#{pane_id}|#{@pi_subagent}";
 
 interface SessionState {
   /** The window holding the anchor pane. */
   window: WindowInfo;
-  sessionName: string;
+  sessionId: string;
   windowName: string;
-  /** The anchor's own tree mark; empty when this process is the tree's root. */
-  anchorTree: string;
   /** Every window in the anchor's session. */
   windows: WindowInfo[];
+}
+
+/** Parse the `display-message` head line; the window name is free text. */
+export function parseSessionHead(line: string): {
+  windowId: string;
+  width: number;
+  height: number;
+  sessionId: string;
+  windowName: string;
+} {
+  const fields = line.split("|");
+  return {
+    windowId: fields[1] ?? "",
+    width: Number(fields[2] ?? "0"),
+    height: Number(fields[3] ?? "0"),
+    sessionId: fields[4] ?? "",
+    windowName: fields.slice(5).join("|"),
+  };
+}
+
+/**
+ * The tree this process belongs to. Subagents inherit it through the
+ * environment; a root's tree is its own pane id. The pane mark is deliberately
+ * not consulted: it can outlive the process that set it, and a new pi started
+ * in a reused pane must not join the old tree.
+ */
+export function currentTree(): string | undefined {
+  return process.env.PI_SUBAGENT_TREE || process.env.TMUX_PANE;
 }
 
 function runTmux(args: string[], allowFailure = false): string {
   requireTmux();
   try {
-    return execFileSync("tmux", args, { encoding: "utf8" });
+    // Capture stderr instead of inheriting it: best-effort calls commonly probe
+    // panes that are already gone, and those tmux errors must not land in the
+    // pi TUI. A real failure still carries stderr on the thrown error.
+    return execFileSync("tmux", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   } catch (error) {
     if (allowFailure) return "";
     throw error;
   }
+}
+
+/** True when tmux lost the pane/window a placement read its snapshot from. */
+function isStaleTargetError(error: unknown): boolean {
+  const e = error as { stderr?: string | Buffer; message?: string };
+  const text = `${e?.stderr ?? ""}\n${e?.message ?? ""}`;
+  return /can't find (pane|window)|no space for new pane/.test(text);
 }
 
 /** Group `list-panes -s` output into windows, keeping tmux's own pane order. */
@@ -141,19 +188,18 @@ function readSessionState(anchor: string): SessionState {
     "list-panes", "-s", "-t", anchor, "-F", PANE_FORMAT,
   ]);
   const lines = raw.split("\n").filter((line) => line.length > 0);
-  const head = lines.find((line) => line.startsWith("H|"));
-  if (!head) throw new Error(`Cannot read the tmux window holding pane ${anchor}.`);
+  const headLine = lines.find((line) => line.startsWith("H|"));
+  if (!headLine) throw new Error(`Cannot read the tmux window holding pane ${anchor}.`);
 
-  const fields = head.split("|");
+  const head = parseSessionHead(headLine);
   const windows = groupWindows(lines);
-  const window = windows.find((candidate) => candidate.id === fields[1]);
-  if (!window) throw new Error(`tmux reported no panes for window ${fields[1]}.`);
+  const window = windows.find((candidate) => candidate.id === head.windowId);
+  if (!window) throw new Error(`tmux reported no panes for window ${head.windowId}.`);
 
   return {
     window,
-    anchorTree: fields[4] ?? "",
-    sessionName: fields[5] ?? "",
-    windowName: fields.slice(6).join("|"),
+    sessionId: head.sessionId,
+    windowName: head.windowName,
     windows,
   };
 }
@@ -171,29 +217,58 @@ function overflowWindowName(homeName: string, windows: WindowInfo[], tree: strin
   return `${base}+${existing + 1}`;
 }
 
-/** The pane's window, or nothing when the pane is already gone. */
-function readPaneWindow(
-  pane: string,
-): { window: string; panes: number; hasMain: boolean } | undefined {
+/** Parse `P|#{pane_id}|#{@pi_subagent}` lines, keeping tmux's pane order. */
+function parsePaneMarks(lines: string[]): PaneInfo[] {
+  const panes: PaneInfo[] = [];
+  for (const line of lines) {
+    if (!line.startsWith("P|")) continue;
+    const fields = line.split("|");
+    if (fields.length < 3) continue;
+    panes.push({ id: fields[1], tree: fields[2] ?? "" });
+  }
+  return panes;
+}
+
+/** The pane's window and its panes, or nothing when the pane is gone. */
+function readPaneWindow(pane: string): { window: string; panes: PaneInfo[] } | undefined {
   const raw = runTmux(
     [
       "display-message", "-p", "-t", pane, "W|#{window_id}",
       ";",
-      "list-panes", "-t", pane, "-F", "P|#{@pi_subagent}",
+      "list-panes", "-t", pane, "-F", "P|#{pane_id}|#{@pi_subagent}",
     ],
     true,
   );
   const lines = raw.split("\n").filter((line) => line.length > 0);
   const head = lines.find((line) => line.startsWith("W|"));
   if (!head) return undefined;
-  const marks = lines.filter((line) => line.startsWith("P|")).map((line) => line.slice(2));
-  if (marks.length === 0) return undefined;
-  return {
-    window: head.slice(2),
-    panes: marks.length,
-    // An unmarked pane means the window has a main pane, i.e. it is a home window.
-    hasMain: marks.some((mark) => mark === ""),
-  };
+  const panes = parsePaneMarks(lines);
+  if (panes.length === 0) return undefined;
+  return { window: head.slice(2), panes };
+}
+
+/** A window's panes by window id, or nothing when the window is gone. */
+function readWindowPanes(window: string): PaneInfo[] | undefined {
+  const raw = runTmux(
+    ["list-panes", "-t", window, "-F", "P|#{pane_id}|#{@pi_subagent}"],
+    true,
+  );
+  const panes = parsePaneMarks(raw.split("\n"));
+  return panes.length > 0 ? panes : undefined;
+}
+
+/**
+ * The layout this tree may apply to a window after closing one of its panes,
+ * or nothing when the window is not this tree's to rearrange.
+ */
+function ownedLayout(
+  panes: PaneInfo[],
+  tree: string,
+): "main-vertical" | "tiled" | undefined {
+  const kind = classifyWindow({ id: "", width: 0, height: 0, panes }, tree);
+  if (kind === "home") return "main-vertical";
+  if (kind === "overflow") return "tiled";
+  return undefined;
 }
 
 // ── Surface primitives ──
@@ -223,8 +298,25 @@ export function createSurface(name: string): string {
     throw new Error(`Subagent panes need the parent's tmux pane. ${muxSetupHint()}`);
   }
 
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return createSurfaceFor(anchor);
+    } catch (error) {
+      lastError = error;
+      // The pane chosen as the split target can finish and be closed by its
+      // owner between the snapshot and the split. Re-read and place again.
+      if (!isStaleTargetError(error)) throw error;
+    }
+  }
+  throw lastError;
+}
+
+function createSurfaceFor(anchor: string): string {
   const state = readSessionState(anchor);
-  const tree = state.anchorTree || anchor;
+  // The tree is inherited, not inferred from a pane mark: a mark can outlive
+  // the subagent and be inherited by a new pi started in the same pane.
+  const tree = process.env.PI_SUBAGENT_TREE || anchor;
   const placement = choosePlacement({
     home: state.window,
     anchor,
@@ -234,9 +326,7 @@ export function createSurface(name: string): string {
 
   let pane: string;
   let window: string;
-  let home: boolean;
   if (placement.kind === "column") {
-    home = true;
     window = placement.window;
     pane = runTmux([
       "set-option", "-w", "-t", placement.window, "main-pane-width", MAIN_PANE_WIDTH,
@@ -247,7 +337,6 @@ export function createSurface(name: string): string {
       "select-layout", "-t", placement.window, "main-vertical",
     ]).trim();
   } else if (placement.kind === "overflow-add") {
-    home = false;
     window = placement.window;
     pane = runTmux([
       "split-window", "-d", "-v", "-t", placement.target, "-P", "-F", "#{pane_id}",
@@ -255,11 +344,10 @@ export function createSurface(name: string): string {
       "select-layout", "-t", placement.window, "tiled",
     ]).trim();
   } else {
-    home = false;
     // A new window's first pane is an ordinary shell, so it can be the
     // subagent's pane directly — no placeholder to create and clean up.
     [window, pane] = runTmux([
-      "new-window", "-d", "-t", `${state.sessionName}:`,
+      "new-window", "-d", "-t", `${state.sessionId}:`,
       "-n", overflowWindowName(state.windowName, state.windows, tree),
       "-P", "-F", "#{window_id} #{pane_id}",
     ]).trim().split(/\s+/);
@@ -274,7 +362,7 @@ export function createSurface(name: string): string {
   }
   // Layout-neutral, so it renders no frame; see the mark's role in layout.ts.
   runTmux(["set-option", "-p", "-t", pane, "@pi_subagent", tree], true);
-  surfaceWindows.set(pane, { window, home });
+  surfaceWindows.set(pane, { window, tree });
   return pane;
 }
 
@@ -403,21 +491,26 @@ export function closeSurface(surface: string): void {
     return;
   }
 
+  // Never lay out a window we do not own. The pane's mark is this tree's id;
+  // if the pane is gone, the tree recorded when we placed it is still valid.
+  const tree = live?.panes.find((pane) => pane.id === surface)?.tree || remembered?.tree;
+  const panes = live?.panes ?? readWindowPanes(window);
+  const layout = tree && panes ? ownedLayout(panes, tree) : undefined;
+
+  if (!live) {
+    // The pane is gone; re-even its window only if it is still ours.
+    if (layout) runTmux(["select-layout", "-t", window, layout], true);
+    return;
+  }
   // A tmux command that fails aborts the rest of the command list, so the kill
   // and the re-layout are bundled only when the read above proved the pane is
   // still there to kill.
-  const home = live ? live.hasMain : (remembered?.home ?? true);
-  const layout = home ? "main-vertical" : "tiled";
-  if (!live) {
-    // The pane is gone; its window still needs its proportions evened out.
-    runTmux(["select-layout", "-t", window, layout], true);
-  } else if (live.panes === 1) {
-    // The window closes with its last pane; a trailing layout call would just
-    // return exit 1.
+  if (live.panes.length === 1 || !layout) {
+    // The window closes with its last pane; a foreign window is left alone.
     runTmux(["kill-pane", "-t", surface], true);
-  } else {
-    runTmux(["kill-pane", "-t", surface, ";", "select-layout", "-t", window, layout], true);
+    return;
   }
+  runTmux(["kill-pane", "-t", surface, ";", "select-layout", "-t", window, layout], true);
 }
 
 // ── Exit polling ──

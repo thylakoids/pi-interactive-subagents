@@ -78,24 +78,58 @@ export function columnCapacity(width: number, height: number): number {
 }
 
 /**
+ * The grid tmux's `tiled` layout chooses for `panes` panes.
+ *
+ * `layout_set_tiled` grows a near-square grid from 1x1, incrementing rows first
+ * and columns second until the grid holds every pane. The window's width and
+ * height are only divided into that grid afterwards, so the grid shape is a
+ * function of the pane count alone.
+ */
+function tiledGrid(panes: number): { columns: number; rows: number } {
+  let columns = 1;
+  let rows = 1;
+  while (rows * columns < panes) {
+    rows++;
+    if (rows * columns < panes) columns++;
+  }
+  return { columns, rows };
+}
+
+/**
  * How many subagents fit in one overflow window.
  *
- * `tiled` lays panes out in a grid, so the cap is how many
- * `OVERFLOW_CELL_*`-sized tiles the window holds. Measured against tmux's own
- * grid: 9 panes on a 200x50 gives each 66x16; the 12-pane grid a looser cap
- * would allow drops to 66x11, which is too short.
+ * Both cell dimensions shrink monotonically as the grid grows, so the largest
+ * pane count whose cells stay above the readability floor is the capacity.
+ * Measured against tmux's own grid: 9 panes on a 200x50 gives each 66x16; the
+ * 12-pane grid a looser cap would allow drops to 66x11, which is too short.
  */
 export function overflowCapacity(width: number, height: number): number {
-  const tiles =
-    Math.floor(width / OVERFLOW_CELL_COLS) * Math.floor(height / OVERFLOW_CELL_ROWS);
-  return Math.max(1, Math.min(MAX_OVERFLOW_PANES, tiles));
+  let capacity = 1;
+  for (let panes = 1; panes <= MAX_OVERFLOW_PANES; panes++) {
+    const { columns, rows } = tiledGrid(panes);
+    // One cell of slack covers the border tmux draws between cells.
+    const cellWidth = Math.floor((width - (columns - 1)) / columns);
+    const cellHeight = Math.floor((height - (rows - 1)) / rows);
+    if (cellWidth < OVERFLOW_CELL_COLS - 1 || cellHeight < OVERFLOW_CELL_ROWS - 1) break;
+    capacity = panes;
+  }
+  return capacity;
 }
 
 export function classifyWindow(window: WindowInfo, tree: string): WindowKind {
   const unmarked = window.panes.filter((pane) => !pane.tree);
-  // The root is the one unmarked pane, and it has to be the window's first for
-  // `main-vertical` to make it the main pane.
-  if (unmarked.length === 1 && unmarked[0].id === window.panes[0]?.id) return "home";
+  // The root is the one unmarked pane. It has to be the window's first for
+  // `main-vertical` to make it the main pane, it has to be *this tree's* root
+  // (not a user pane tmux promoted after the root died), and every other pane
+  // has to belong to this tree.
+  if (
+    unmarked.length === 1 &&
+    unmarked[0].id === window.panes[0]?.id &&
+    unmarked[0].id === tree &&
+    window.panes.slice(1).every((pane) => pane.tree === tree)
+  ) {
+    return "home";
+  }
   if (window.panes.length > 0 && window.panes.every((pane) => pane.tree === tree)) {
     return "overflow";
   }

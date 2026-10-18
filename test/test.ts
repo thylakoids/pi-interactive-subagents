@@ -25,7 +25,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { parseSessionHead, shellEscape } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -2592,6 +2592,18 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+
+  describe("parseSessionHead", () => {
+    it("targets the session by id and keeps a pipe in the window name", () => {
+      assert.deepEqual(parseSessionHead("H|@12|238|58|$3|my|window"), {
+        windowId: "@12",
+        width: 238,
+        height: 58,
+        sessionId: "$3",
+        windowName: "my|window",
+      });
     });
   });
 });

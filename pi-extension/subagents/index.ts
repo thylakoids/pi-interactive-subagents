@@ -23,6 +23,7 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
+  currentTree,
   startSurfaceProcess,
   pasteMessage,
 } from "./tmux.ts";
@@ -1315,6 +1316,15 @@ function startWidgetRefresh() {
 }
 
 /**
+ * Finish a subagent launch: capture pi's exit status, clear the pane's tree
+ * mark (a new pi started in this pane must not inherit the old tree), then
+ * print the sentinel the watcher polls for.
+ */
+function finishCommand(command: string): string {
+  return `${command}; status=$?; tmux set-option -p -t "$TMUX_PANE" -u @pi_subagent 2>/dev/null; echo '__SUBAGENT_DONE_'$status'__'`;
+}
+
+/**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
  *
@@ -1511,6 +1521,13 @@ async function launchSubagent(
       envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
     }
 
+    // The tree is process-scoped, not inferred from the pane's mark: a mark can
+    // survive the subagent and be inherited by a new pi started in its pane.
+    const tree = currentTree();
+    if (tree) {
+      envParts.push(`PI_SUBAGENT_TREE=${shellEscape(tree)}`);
+    }
+
     if (grantSpawning && agentDefs?.subagentAgents) {
       envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
     }
@@ -1559,7 +1576,7 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
     const piCommand = cdPrefix + envPrefix + parts.join(" ");
-    const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = finishCommand(piCommand);
     const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
     sendLongCommand(surface, command, {
@@ -2324,6 +2341,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           if (resumeAgentDir) {
             resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
           }
+          const resumeTree = currentTree();
+          if (resumeTree) {
+            resumeEnvParts.push(`PI_SUBAGENT_TREE=${shellEscape(resumeTree)}`);
+          }
           if (loadout.spawnable && loadout.spawnable.length > 0) {
             resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
           }
@@ -2343,7 +2364,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           // operate where they did before.
           const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-          const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+          const command = finishCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
           const launchScriptFile = join(
             artifactDir,
             "subagent-scripts",
