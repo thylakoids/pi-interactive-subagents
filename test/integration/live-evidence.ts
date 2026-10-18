@@ -31,6 +31,8 @@ export function verifyLiveEvidence(dir: string) {
   const fast = pipeline.calls.find(call => call.label === 'verify-fast')!;
   const slow = pipeline.calls.find(call => call.label === 'recon-slow')!;
   assert.ok(fast.startedAt! < slow.finishedAt!, 'Fast Verify must start before slow Recon finishes');
+  assert.equal(readFileSync(join(dir, 'slow-end'), 'utf8'), 'ended');
+  for (const item of ['slow', 'fast']) assert.equal(readFileSync(join(dir, item + '-verify'), 'utf8'), item);
   const files = [...new Set([review, migration, pipeline, aborted, resumed].flatMap(view => view.calls.map(call => call.sessionFile)).filter(Boolean))];
   const models = new Set<string>();
   let assistantResponses = 0, toolCalls = 0;

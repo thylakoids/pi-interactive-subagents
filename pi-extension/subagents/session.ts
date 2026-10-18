@@ -91,6 +91,8 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface SubagentLoadout {
+  /** Persistent execution restriction, also enforced when resumed or focused. */
+  readOnly?: boolean;
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */

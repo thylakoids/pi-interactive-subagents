@@ -166,6 +166,13 @@ export class WorkflowRun {
    */
   private readonly abandonment = new Map<string, AbortController>();
   /**
+   * Releases a scheduling slot early. A call holds its slot while its launch
+   * task runs, but a call settled before that task returns (skipped, or the run
+   * aborted) must not keep the queue waiting on a launcher that is still
+   * opening a pane: the slot is a runtime resource, not the launcher's.
+   */
+  private readonly slotReleases = new Map<string, () => void>();
+  /**
    * Names this run has handed out but the service has not seen yet: the service
    * only learns a name once its pane launch resolves, so without a local claim
    * a fan-out of same-label calls reads one taken-set and picks one name.
@@ -378,6 +385,9 @@ export class WorkflowRun {
     if (!parsed.prompt.trim()) {
       throw new WorkflowScriptError("agent() requires a non-empty prompt.");
     }
+    if (parsed.opts.readOnly && this.manager.service.agentKind(agentType) === "cli") {
+      throw new WorkflowScriptError("readOnly requires a Pi agent; external CLI permissions cannot be enforced.");
+    }
     // A `cli:` definition is an external coding agent: it runs its own toolset
     // and cannot answer through a schema sidecar. Say so here rather than
     // letting the child finish and reporting that it never called the tool.
@@ -397,6 +407,7 @@ export class WorkflowRun {
       agent: legacyAlias ? "workflow-subagent" : agentType,
       model: parsed.opts.model,
       effort: parsed.opts.effort,
+      ...(parsed.opts.readOnly ? { readOnly: true } : {}),
     };
     let base = makeCallKey(content);
     if (!requestedAgent && agentType === "worker") {
@@ -459,7 +470,7 @@ export class WorkflowRun {
       this.waiters.set(key, list);
     });
 
-    this.enqueue(async () => {
+    this.enqueue(key, async () => {
       const outcome = await this.launchAgent(liveCall, parsed);
       const waiters = this.waiters.get(key) ?? [];
       this.waiters.delete(key);
@@ -494,14 +505,23 @@ export class WorkflowRun {
 
   // ── agent scheduling ────────────────────────────────────────────────────
 
-  private enqueue(task: () => Promise<void>): void {
+  private enqueue(callKey: string, task: () => Promise<void>): void {
+    let started = false;
+    let released = false;
+    // Idempotent for both the normal end of the task and an early release.
+    const release = () => {
+      if (!started || released) return;
+      released = true;
+      this.slotReleases.delete(callKey);
+      this.activeAgents--;
+      const next = this.queue.shift();
+      if (next) next();
+    };
+    this.slotReleases.set(callKey, release);
     const start = () => {
+      started = true;
       this.activeAgents++;
-      void task().finally(() => {
-        this.activeAgents--;
-        const next = this.queue.shift();
-        if (next) next();
-      });
+      void task().finally(release);
     };
     if (this.activeAgents < this.maxConcurrent) start();
     else this.queue.push(start);
@@ -560,6 +580,9 @@ export class WorkflowRun {
    */
   private teardown(reason: string): void {
     this.abortController.abort(new Error(reason));
+    // Cancel launches that are still opening panes: their children must never
+    // start, and their slots must come back without waiting for the launcher.
+    for (const controller of this.abandonment.values()) controller.abort();
     for (const handle of this.running.values()) this.manager.service.stop(handle.name);
     // Drain rather than clear: a queued task that never starts would leave its
     // caller waiting forever.
@@ -574,6 +597,9 @@ export class WorkflowRun {
       this.waiters.delete(key);
       for (const resolve of waiters) resolve({ ok: false, status: "aborted", value: null, error: reason });
     }
+    // Release whatever the launch tasks were still holding. Their own
+    // finally-handlers no-op afterwards, so nothing is double-counted.
+    for (const release of [...this.slotReleases.values()]) release();
   }
 
   private async launchAgent(liveCall: LiveCall, parsed: ParsedAgentArgs): Promise<WorkflowAgentOutcome> {
@@ -624,14 +650,15 @@ export class WorkflowRun {
     liveCall.name = name;
 
     // Registered before the spawn so a skip that lands while the pane is still
-    // launching is recorded as well; that slot returns when the spawn does and
-    // the late handle is stopped, not before.
+    // launching cancels the launch and releases its slot immediately. A service
+    // that ignores cancellation still has its late handle stopped on return.
     const abandonment = new AbortController();
     this.abandonment.set(liveCall.callKey, abandonment);
 
     try {
       const handle = await this.manager.service.spawn({
         agentType: liveCall.agentType,
+        ...(parsed.opts.readOnly ? { readOnly: true } : {}),
         name,
         task,
         // Model and effort stay separate: the effort applies to whichever model
@@ -646,6 +673,9 @@ export class WorkflowRun {
             ? [this.manager.structuredOutputExtension]
             : undefined,
         cwd: this.manager.cwd,
+        // Cancels a spawn whose call is settled before the pane exists. The
+        // launcher closes anything it opened and never starts the child.
+        signal: abandonment.signal,
       });
       // Own the completion before any branch can walk away from it. Every path
       // below (a settled call, a timeout, an abort) stops waiting at some point,
@@ -937,6 +967,8 @@ export class WorkflowRun {
     // Stop the launch task from waiting on a watcher that may never settle: the
     // call is decided, and its slot has to go back to the queue now.
     this.abandonment.get(callKey)?.abort();
+    // The spawn may still be opening its pane; the queue must not wait for it.
+    this.slotReleases.get(callKey)?.();
     const waiters = this.waiters.get(callKey);
     this.waiters.delete(callKey);
     if (waiters) for (const resolve of waiters) resolve({ ok: false, status: "skipped", value: null, error: "skipped by user" });
@@ -1317,6 +1349,7 @@ interface ParsedAgentArgs {
     agent?: string;
     model?: string;
     effort?: string;
+    readOnly?: boolean;
   };
 }
 
@@ -1361,7 +1394,7 @@ function parseAgentArgs(raw: unknown): ParsedAgentArgs {
  * a typo like `schemas:` or `modle:` would otherwise be dropped in silence and
  * the call would run with defaults the author did not ask for.
  */
-const KNOWN_AGENT_OPTS = new Set(["prompt", "label", "phase", "schema", "agent", "agentType", "model", "effort"]);
+const KNOWN_AGENT_OPTS = new Set(["prompt", "label", "phase", "schema", "agent", "agentType", "model", "effort", "readOnly"]);
 
 /** Options that exist in Claude Code but have no pi equivalent yet. */
 const UNSUPPORTED_AGENT_OPTS: Record<string, string> = {
@@ -1371,6 +1404,10 @@ const UNSUPPORTED_AGENT_OPTS: Record<string, string> = {
 
 function normalizeOpts(record: Record<string, unknown>): ParsedAgentArgs["opts"] {
   const opts: ParsedAgentArgs["opts"] = {};
+  if (record.readOnly !== undefined) {
+    if (typeof record.readOnly !== "boolean") throw new WorkflowScriptError("agent() readOnly must be a boolean.");
+    opts.readOnly = record.readOnly;
+  }
   if (typeof record.label === "string") opts.label = record.label;
   if (typeof record.phase === "string") opts.phase = record.phase;
   if (record.schema && typeof record.schema === "object") {

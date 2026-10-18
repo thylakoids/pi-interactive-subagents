@@ -1,6 +1,6 @@
 /** Regression sensitivity: reintroduce one historical fault in an isolated copy. */
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,10 +9,26 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['read-only permission cache isolation disabled', 'pi-extension/subagents/workflow/journal.ts',
+    '    ...(parts.readOnly ? ["readOnly"] : []),', '', 'readOnly reaches the service', 'test/workflow-readonly-integration.test.ts'],
+  ['read-only adapter propagation disabled', 'pi-extension/subagents/wiring.ts',
+    '          ...(request.readOnly ? { readOnly: true } : {}),', '', 'adapter forwards the restriction', 'test/workflow-readonly-integration.test.ts'],
+  ['read-only resume enforcement disabled', 'pi-extension/subagents/index.ts',
+    '  if (loadout.readOnly) {\n    // Re-enforce', '  if (false) {\n    // Re-enforce', 'saved readonly loadouts', 'test/workflow-readonly-integration.test.ts'],
+  ['read-only tools unrestricted again', 'pi-extension/subagents/workflow/execution.ts',
+    'const readOnly = options.readOnly === true;', 'const readOnly = false;', 'read-only execution keeps', 'test/workflow-readonly.test.ts'],
+  ['sandbox filesystem default made writable', 'pi-extension/subagents/workflow/readonly.ts',
+    '    "(deny default)",', '    "(allow default)",', 'runs a real test suite read-only', 'test/workflow-readonly.test.ts'],
+  ['verification survives owning Pi death', 'pi-extension/subagents/workflow/readonly.ts',
+    '  "  while :; do",', '  "  while false; do",', 'kills its process group when the owning pi process is SIGKILLed', 'test/workflow-readonly.test.ts'],
+  ['launch cancellation not forwarded', 'pi-extension/subagents/wiring.ts',
+    '          ...(request.signal ? { signal: request.signal } : {}),', '', 'forwards the workflow request', 'test/workflow-launch-cancellation.test.ts'],
+  ['pending spawn keeps its logical slot', 'pi-extension/subagents/workflow/manager.ts',
+    '    this.slotReleases.get(callKey)?.();', '', 'frees a skipped call\x27s slot while its spawn is still pending', 'test/workflow-launch-cancellation.test.ts'],
   ['nonzero exit without error text is accepted', 'pi-extension/subagents/workflow/manager.ts',
     'if (result.exitCode !== 0)', 'if (result.error && result.exitCode !== 0)', 'fails a non-zero exit that carries no error text'],
   ['Skip holds its scheduling slot', 'pi-extension/subagents/workflow/manager.ts',
-    '    this.abandonment.get(callKey)?.abort();', '', 'frees a skipped call'],
+    '    this.abandonment.get(callKey)?.abort();\n    // The spawn may still be opening its pane; the queue must not wait for it.\n    this.slotReleases.get(callKey)?.();', '', 'frees a skipped call'],
   ['fatal failure is not persisted', 'pi-extension/subagents/workflow/manager.ts',
     '    this.persistSnapshot(true);\n  }\n\n  /**\n   * Stop everything',
     '  }\n\n  /**\n   * Stop everything', 'writes a fatal run failure to disk'],
@@ -62,8 +78,12 @@ const mutants = [
   ['missing votes reported complete', 'examples/workflows/deep-research.js',
     " && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted'))", ''],
 ];
-const execute = (pattern) => spawnSync(process.execPath, pattern
-  ? ['--test', '--test-timeout=10000', '--test-name-pattern=' + pattern, 'test/workflow.test.ts']
+const sandboxMutants = new Set(['sandbox filesystem default made writable', 'verification survives owning Pi death']);
+const applicable = mutants.filter(([name]) => !sandboxMutants.has(name) ||
+  (process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec')));
+if (applicable.length !== mutants.length) console.log('Not run: macOS sandbox mutation requires a real supported backend.');
+const execute = (pattern, testFile = 'test/workflow.test.ts') => spawnSync(process.execPath, pattern
+  ? ['--test', '--test-timeout=10000', '--test-name-pattern=' + pattern, testFile]
   : ['--test', ...tests], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
 try {
   for (const path of ['pi-extension', 'agents', 'examples', 'skills', 'test', 'package.json', 'config.json.example']) cpSync(join(root, path), join(dir, path), { recursive: true });
@@ -71,9 +91,9 @@ try {
   const baseline = execute();
   assert.equal(baseline.status, 0, baseline.stdout + baseline.stderr);
   console.log('Baseline: passed');
-  for (const [name, path, before, after, pattern] of mutants) {
+  for (const [name, path, before, after, pattern, testFile] of applicable) {
     if (pattern) {
-      const control = execute(pattern);
+      const control = execute(pattern, testFile);
       assert.equal(control.status, 0, 'Targeted baseline failed: ' + name + '\n' + control.stdout + control.stderr);
     }
     const target = join(dir, path);
@@ -81,12 +101,12 @@ try {
     assert.equal(source.split(before).length, 2, 'Mutation must match exactly once: ' + name);
     writeFileSync(target, source.replace(before, after));
     try {
-      const result = execute(pattern);
+      const result = execute(pattern, testFile);
       assert.equal(result.status, 1, 'Mutant survived or crashed: ' + name + '\n' + result.stdout + result.stderr);
       assert.match(result.stdout, /ERR_ASSERTION/, 'Must fail an assertion, not a syntax/import error: ' + name);
       assert.doesNotMatch(result.stdout + result.stderr, /SyntaxError|ERR_MODULE_NOT_FOUND/);
       console.log('Detected: ' + name);
     } finally { writeFileSync(target, source); }
   }
-  console.log(mutants.length + '/' + mutants.length + ' regression faults detected');
+  console.log(applicable.length + '/' + applicable.length + ' regression faults detected');
 } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }

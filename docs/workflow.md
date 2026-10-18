@@ -77,6 +77,12 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 **结构化结果必须用 `schema`。** `agent(prompt, { schema })` 返回的是子代理通过 `structured_output` 工具提交并被校验的对象，不是自由文本；要在结果上做分支就必须用它。子代理完成时若没有调用 `structured_output`，该调用判为失败（错误文本：`the agent finished without calling structured_output`）。schema 用常用 JSON Schema 子集：`type`（object / array / string / number / integer / boolean）、`properties`、`required`、`items`、`enum`、`description`。根必须是 `{ type: 'object', properties: {...} }`，且 `required` 里的字段必须在 `properties` 里——不满足的 schema 在任何子代理启动之前就报错，而不是等烧完模型调用才失败。运行时会给 prompt 自动附加一句“用 structured_output 返回结果”，prompt 里不用重复。
 
+**只读验证。** 证据收集、规划、审查和验证步骤可设置 `agent(prompt, { readOnly: true })`；随包 review-changes 的审查/核验以及 migrate-files 的规划/核验已启用，apply 仍可写。运行时移除 write/edit/普通 bash、任意扩展工具和自行委派（普通 worker 不受影响），保留定义中已有的 read/grep/find/ls、ask_question，以及受沙箱约束的 `verify_command`；schema 的 structured_output 照常可用。
+
+`verify_command({ command, timeout_ms? })` 可读取文件，但只能向独立临时 scratch 写入；网络、tmux 和外部应用 IPC 被阻止。macOS 使用 sandbox-exec；本轮未验证的平台明确拒绝命令，绝不退回裸 shell。默认每条命令 120 秒、最多 10 分钟，输出有上限；取消/超时会终止命令进程组，所属 Pi 退出（包括被强制结束）后，独立 watchdog 也会清理该组。需要生成仓库内构建产物或联网的测试会失败，应报告证据缺口或显式把输出配置到临时目录，而不是绕过限制。这不是敌对代码的通用安全容器，也不限制文件读取范围、CPU 或内存；自行脱离进程组的恶意守护进程不在清理保证内。
+
+只读模式纳入缓存键：不会复用之前可写步骤的答案；Focus 和 subagent_message 恢复原会话时继续限制权限。外部 CLI agent 不支持此模式，会在启动前拒绝。Skip/Abort 在 shell 就绪等待期间会取消启动、关闭已创建的自有 pane，并释放逻辑并发槽；已越过发命令时刻的调用按运行中取消处理。
+
 **错误语义。** 一个子代理**死掉或失败**，只是这次调用落为 `null`，其他项继续——`parallel` / `pipeline` 如此，裸 `await agent(...)` 也如此，所以按 Claude Code 写的脚本（不包 `try/catch`，用 `.filter(Boolean)` 过滤）在这里行为一致。`null` 不等于“没事发生”：该调用仍记为 `failed`，面板上是 `✗`，run 的日志里会写一行 `… resolved to null`，落定消息里按名字列出所有“没有返回值的调用”。
 
 **参数写错**（未知 agent、拼错的选项、不满足的 schema、超限、cli 型 agent 要 schema）是另一回事：这类错误直接抛，整个 run 失败。作者的错误不该被当成“没有结果”。

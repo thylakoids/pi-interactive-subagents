@@ -36,7 +36,7 @@ export const DEFAULT_LIMITS: ScriptLimits = {
  * so the authoring contract and the runtime cannot drift apart.
  */
 export const WORKFLOW_GLOBAL_DECLARATIONS = `declare function agent(prompt: string, opts?: {
-  label?: string; phase?: string; schema?: object; agent?: string; agentType?: string; model?: string; effort?: string;
+  label?: string; phase?: string; schema?: object; agent?: string; agentType?: string; model?: string; effort?: string; readOnly?: boolean;
 }): Promise<any>;
 /** Run every thunk concurrently and resolve with their results (a barrier). Failures resolve to null. */
 declare function parallel(thunks: Array<() => Promise<any>>): Promise<any[]>;

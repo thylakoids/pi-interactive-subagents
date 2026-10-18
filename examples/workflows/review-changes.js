@@ -96,7 +96,7 @@ const reviewed = await pipeline(
         '只记录这批改动引入或加重的问题；每条发现都要给出具体触发路径，给不出就不要记录；列表按严重性从高到低排列。',
         '只审查，不修改任何文件，也不运行测试、构建或 lint；不要为了凑足数量而虚报。',
       ].join('\n'),
-      { label: 'audit:' + dimension.name, phase: 'Review', agent: dimension.agent, schema: AUDIT_SCHEMA },
+      { label: 'audit:' + dimension.name, phase: 'Review', agent: dimension.agent, schema: AUDIT_SCHEMA, readOnly: true },
     )
     if (!audit) return null
     const findings = audit && Array.isArray(audit.findings) ? audit.findings : []
@@ -124,7 +124,7 @@ const reviewed = await pipeline(
             '先尝试反驳：按 detail 的路径去读代码，找它不成立的理由——路径不可达、上游已校验、行为原本如此、需要不存在的调用方式。',
             '找不到反证且路径确实成立，才判 isReal=true；不要因为“无法证明它是错的”就判 true。',
           ].join('\n'),
-          { label: 'verify:' + dimension.name + ':' + (index + 1), phase: 'Verify', agent: verifierAgent, schema: VERDICT_SCHEMA },
+          { label: 'verify:' + dimension.name + ':' + (index + 1), phase: 'Verify', agent: verifierAgent, schema: VERDICT_SCHEMA, readOnly: true },
         )
         return { finding: finding, verdict: verdict }
       }),

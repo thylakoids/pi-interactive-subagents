@@ -11,9 +11,12 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
+  rmSync,
   unlinkSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { READONLY_TOOL_ALLOWLIST, READONLY_ENV } from "./workflow/readonly.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -258,6 +261,7 @@ function getToolExtensionPath(tool: string): string | undefined {
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
+    verify_command: join(SUBAGENTS_DIR, "workflow", "readonly.ts"),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
   // when that path no longer exists on disk (e.g. a built-in tool extension
@@ -586,6 +590,58 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/** A launch the caller cancelled before its child started. */
+export class SubagentLaunchCancelledError extends Error {
+  constructor() {
+    super("subagent launch cancelled");
+    this.name = "SubagentLaunchCancelledError";
+  }
+}
+
+/**
+ * Refuse a launch whose caller already cancelled it.
+ *
+ * Called before a pane exists, after the shell-ready wait and before the child's
+ * command is sent: a cancelled launch must never open a surface, and one that
+ * opened it before the cancel landed must close it instead of starting a child
+ * nobody will ever wait for.
+ */
+export function throwIfLaunchCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new SubagentLaunchCancelledError();
+}
+
+/**
+ * Wait for a freshly created pane's shell, unless the caller cancels first.
+ *
+ * Resolves after `ms`; rejects with {@link SubagentLaunchCancelledError} as soon
+ * as the signal aborts, so a cancelled launch neither waits out the delay nor
+ * sends its command.
+ */
+export function waitForShellReady(ms: number, signal?: AbortSignal): Promise<void> {
+  // Reject rather than throw: this function hands back a promise, and callers
+  // (including tests) expect the cancellation to arrive through it.
+  if (signal?.aborted) return Promise.reject(new SubagentLaunchCancelledError());
+  // Not unref'd: whoever awaits this promise must keep the process alive until
+  // it settles, exactly like any other awaited delay.
+  if (!signal) return new Promise((resolve) => { setTimeout(resolve, ms); });
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new SubagentLaunchCancelledError());
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -725,6 +781,7 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  verifyScratchDir?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -1003,11 +1060,27 @@ function buildSubagentToolAllowlist(
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
  * responsibility since they differ slightly between launch and resume.
  */
+const verifyScratchRoots = new Set<string>();
+function cleanupVerifyScratch(path?: string): void {
+  if (!path || !verifyScratchRoots.has(path)) return;
+  try { rmSync(path, { recursive: true, force: true }); verifyScratchRoots.delete(path); } catch {}
+}
+
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
-): void {
+): string | undefined {
+  if (loadout.readOnly) {
+    // Re-enforce on every launch, including Focus/Resume, rather than trusting
+    // a mutable definition or a permissive historical tool list.
+    const safe = new Set(READONLY_TOOL_ALLOWLIST.split(","));
+    safe.add("structured_output");
+    const stored = (loadout.toolAllowlist ?? READONLY_TOOL_ALLOWLIST).split(",");
+    loadout = { ...loadout, toolAllowlist: stored.map(tool => tool.trim()).filter(tool => safe.has(tool)).join(","), spawnable: null };
+    if (!loadout.toolAllowlist) loadout.toolAllowlist = READONLY_TOOL_ALLOWLIST;
+
+  }
   if (loadout.model) {
     // A model that already carries a `:level` suffix keeps it: a caller that
     // passed `provider/model:high` meant that level, and appending the
@@ -1041,6 +1114,12 @@ function applySandboxToParts(
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
+  }
+  if (loadout.readOnly) {
+    const scratch = mkdtempSync(join(tmpdir(), "pi-verify-"));
+    verifyScratchRoots.add(scratch);
+    parts.unshift("env", `${READONLY_ENV.scratch}=${shellEscape(scratch)}`);
+    return scratch;
   }
 }
 
@@ -1305,6 +1384,7 @@ export const __test__ = {
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   applySandboxToParts,
+  cleanupVerifyScratch,
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1355,6 +1435,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
   let surface: string | undefined;
   let sessionPath: string | undefined;
   let ownsOpening = false;
+  let verifyScratchDir: string | undefined;
   try {
     const current = [...runningSubagents.values()].find(r =>
       r.name === name || (savedSession && resolve(r.sessionFile) === resolve(savedSession)));
@@ -1396,7 +1477,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
     const parts = ["pi", "--session", shellEscape(sessionPath), "-e", shellEscape(join(SUBAGENTS_DIR, "subagent-done.ts"))];
-    applySandboxToParts(parts, loadout, { artifactDir, name });
+    verifyScratchDir = applySandboxToParts(parts, loadout, { artifactDir, name });
     // Explicitly clear inherited workflow contracts; viewing must stay interactive.
     const env = ["env", "-u", "PI_SUBAGENT_AUTO_EXIT", "-u", "PI_SUBAGENT_SCHEMA_FILE", "-u", "PI_SUBAGENT_RESULT_FILE", "-u", "PI_SUBAGENT_AGENT",
       `PI_SUBAGENT_NAME=${shellEscape(name)}`, `PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`,
@@ -1416,7 +1497,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     const startTime = Date.now();
     const running: RunningSubagent = {
       id, name, task: "", agent: loadout.agent ?? undefined, surface, startTime, sessionFile: sessionPath,
-      launchScriptFile: scriptPath, activityFile, interactive: true,
+      launchScriptFile: scriptPath, activityFile, interactive: true, verifyScratchDir,
       statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
     };
     runningSubagents.set(id, running);
@@ -1429,6 +1510,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
   } catch (error: any) {
     if (surface && ![...runningSubagents.values()].some(r => r.surface === surface)) {
       try { closeSurface(surface); } catch {}
+      cleanupVerifyScratch(verifyScratchDir);
     }
     return { error: `Cannot focus ${name}: ${error?.message ?? String(error)}` };
   } finally {
@@ -1459,6 +1541,13 @@ async function launchSubagent(
     nonInteractive?: boolean;
     /** Enforce single-step workflow permissions and output semantics. */
     workflow?: boolean;
+    readOnly?: boolean;
+    /**
+     * Cancels this launch. Checked before the pane exists, after the shell-ready
+     * wait, and before the command is sent; a cancelled launch closes the
+     * surface it opened and never starts the child.
+     */
+    signal?: AbortSignal;
   },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1470,7 +1559,14 @@ async function launchSubagent(
   // current parent session, including model switches made after startup.
   // Native CLIs use their own defaults, not Pi provider/model identifiers.
   const effectiveModel = resolveAgentModel(params.model, agentDefs?.model, !cliKind);
-  const policy = options?.workflow ? workflowExecution(agentDefs) : undefined;
+  const policy = options?.workflow ? workflowExecution(agentDefs, { readOnly: options.readOnly }) : undefined;
+  if (options?.readOnly) {
+    if (!policy || cliKind) throw new Error("readOnly requires workflow execution with a Pi agent.");
+    const structured = join(SUBAGENTS_DIR, "workflow", "structured-output.ts");
+    if (options.extraExtensions?.some(path => resolve(path) !== structured)) {
+      throw new Error("readOnly cannot load arbitrary extra extensions.");
+    }
+  }
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? sessionDefaults.thinking;
@@ -1508,13 +1604,19 @@ async function launchSubagent(
   const launchBehavior = resolveLaunchBehavior(params, policy ? { ...agentDefs, sessionMode: policy.sessionMode } : agentDefs);
   assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
 
+  // A launch that is already cancelled must not open a pane at all.
+  throwIfLaunchCancelled(options?.signal);
+
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
+  let verifyScratchDir: string | undefined;
   try {
     if (!surfacePreCreated) {
-      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+      // Abortable: a cancelled launch closes its pane instead of waiting out
+      // the shell delay and then starting a child nobody waits for.
+      await waitForShellReady(getShellReadyDelayMs(), options?.signal);
     }
 
     if (launchBehavior.seededSessionMode) {
@@ -1556,6 +1658,7 @@ async function launchSubagent(
       ? params.task
       : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
     if (cliKind) {
+      throwIfLaunchCancelled(options?.signal);
       if (!launchBehavior.seededSessionMode) {
         seedSubagentSessionFile({ mode: "lineage-only", parentSessionFile: sessionFile,
           childSessionFile: subagentSessionFile, childCwd: targetCwdForSession });
@@ -1605,6 +1708,7 @@ async function launchSubagent(
     // resume keeps the same tools.
     const loadout: SubagentLoadout = {
       agent: params.agent ?? null,
+      ...(policy?.readOnly ? { readOnly: true } : {}),
       toolAllowlist: withExtraTool(options?.extraExtensions, toolAllowlist),
       model: effectiveModel ?? null,
       thinking: effectiveThinking ?? null,
@@ -1619,7 +1723,7 @@ async function launchSubagent(
 
     // Apply model, identity, and the default-deny tool/extension restriction via
     // the shared helper (same code path resume uses — they can't drift).
-    applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+    verifyScratchDir = applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
     // Extra extensions (e.g. workflow structured output) ride alongside the
     // sandbox's own whitelist; `-e` is additive even after --no-extensions.
@@ -1694,6 +1798,8 @@ async function launchSubagent(
     const command = finishCommand(piCommand);
     const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+    // The last point where a cancel can still keep the child from starting.
+    throwIfLaunchCancelled(options?.signal);
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
@@ -1713,6 +1819,7 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
+      verifyScratchDir,
       activityFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
@@ -1724,7 +1831,12 @@ async function launchSubagent(
     runningSubagents.set(id, running);
     return running;
   } catch (error) {
-    try { closeSurface(surface); } catch {}
+    cleanupVerifyScratch(verifyScratchDir);
+    // Only a surface this launch created may be torn down: a pre-created one
+    // (parallel mode) belongs to the caller, which decides what happens next.
+    if (!surfacePreCreated) {
+      try { closeSurface(surface); } catch {}
+    }
     throw error;
   }
 }
@@ -1901,6 +2013,8 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
+  } finally {
+    cleanupVerifyScratch(running.verifyScratchDir);
   }
 }
 
@@ -1970,7 +2084,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -2071,7 +2185,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, { signal });
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -2307,8 +2421,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const requestedName = params.name?.trim();
+        throwIfLaunchCancelled(signal);
         if (!requestedName) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
@@ -2381,6 +2496,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const error = `Subagent "${name}" has no native CLI session ID; start a fresh subagent.`;
             return { content: [{ type: "text" as const, text: error }], details: { error } };
           }
+          throwIfLaunchCancelled(signal);
           const surface = createSurface(name);
           let running: RunningSubagent;
           try {
@@ -2423,9 +2539,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
+        throwIfLaunchCancelled(signal);
         const surface = createSurface(name);
+        let verifyScratchDir: string | undefined;
         try {
-          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          await waitForShellReady(getShellReadyDelayMs(), signal);
 
           // Build pi resume command
           const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2440,7 +2558,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           mkdirSync(dirname(activityFile), { recursive: true });
 
           // Replay the model, identity, and default-deny tool/extension sandbox.
-          applySandboxToParts(parts, loadout, { artifactDir, name });
+          verifyScratchDir = applySandboxToParts(parts, loadout, { artifactDir, name });
 
           let resumeMsgFile: string | undefined;
           if (params.message) {
@@ -2492,6 +2610,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             "subagent-scripts",
             `${slugifyName(name, "resume")}-resume-${Date.now()}.sh`,
           );
+          throwIfLaunchCancelled(signal);
           sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
             scriptPreamble: [
@@ -2512,6 +2631,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             startTime,
             sessionFile: sessionPath,
             launchScriptFile,
+            verifyScratchDir,
             activityFile,
             interactive,
             statusState: createStatusState({
@@ -2554,6 +2674,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             },
           };
         } catch (error) {
+          cleanupVerifyScratch(verifyScratchDir);
           try { closeSurface(surface); } catch {}
           runningSubagents.delete(id);
           throw error;

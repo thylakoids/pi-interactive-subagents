@@ -213,6 +213,8 @@ export interface WorkflowAgentOutcome {
  * permission checks instead of getting a second, parallel execution path.
  */
 export interface WorkflowSubagentRequest {
+  /** Enforce evidence-only tools and sandboxed local verification commands. */
+  readOnly?: boolean;
   agentType: string;
   name: string;
   task: string;
@@ -240,6 +242,16 @@ export interface WorkflowSubagentRequest {
    * that waits for a human would stall the run until the script's watchdog.
    */
   nonInteractive?: boolean;
+  /**
+   * Cancels this spawn before the child starts. The launcher checks it before
+   * it creates a pane, while it waits for the pane's shell, and again before it
+   * sends the command: once aborted it closes any surface it opened and never
+   * starts the child. An already-aborted signal means "do not spawn at all".
+   *
+   * This does not stop a child that already started — that is `stop()`, which
+   * the runtime calls when a call is skipped or the run is aborted.
+   */
+  signal?: AbortSignal;
 }
 
 export interface WorkflowSubagentHandle {

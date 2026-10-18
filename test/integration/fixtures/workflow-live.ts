@@ -18,6 +18,11 @@ async function until(check: () => boolean, label: string, timeout = 240_000) {
 const script = (name: string, body: string) =>
   'export const meta = ' + JSON.stringify({ name, description: 'Live provider regression', phases: ['Recon', 'Verify'] }) + '\n' + body;
 
+// Keep prose punctuation outside executable commands, including file names.
+const bashPrompt = (command: string, reply: string) =>
+  'Use bash to execute exactly the command inside this fenced block (timeout 240 seconds):\n```sh\n' +
+  command + '\n```\nAfter the command succeeds, reply ' + reply + '.';
+
 export default function liveFixture(pi: any) {
   subagentsExtension(pi);
   const dir = process.env.PI_WORKFLOW_LIVE_DIR!;
@@ -50,7 +55,11 @@ export default function liveFixture(pi: any) {
           const loadout = readSubagentLoadout(call.sessionFile!)!;
           assert.ok(loadout, 'Real workflow loadout must be persisted');
           assert.ok(loadout.toolAllowlist!.split(',').includes('ask_question'));
-          if (call.agentType === 'worker') assert.deepEqual(loadout.spawnable, ['scout', 'researcher']);
+          if (loadout.readOnly) {
+            assert.equal(loadout.spawnable, null);
+            for (const writer of ['write', 'edit', 'bash', 'subagent']) assert.ok(!loadout.toolAllowlist!.split(',').includes(writer));
+            assert.ok(loadout.toolAllowlist!.split(',').includes('verify_command'));
+          } else if (call.agentType === 'worker') assert.deepEqual(loadout.spawnable, ['scout', 'researcher']);
           assert.equal(loadout.autoExit, true);
           assert.match(loadout.identity!, /Workflow execution contract/);
           assert.equal(loadout.model, process.env.PI_TEST_MODEL, 'Unpinned worker inherits the parent model');
@@ -106,12 +115,12 @@ export default function liveFixture(pi: any) {
           source: script('live-pipeline', `
             return await pipeline(args.items,
               item => agent(item === 'slow'
-                ? "Use bash to execute this exact command and wait for it to exit (timeout 240 seconds): printf started > slow-start; while ! test -f release-slow; do sleep 0.2; done; printf ended > slow-end. Then reply SLOW_RECON_DONE."
-                : "Use bash to wait for slow-start (timeout 240 seconds): while ! test -f slow-start; do sleep 0.2; done. Then reply FAST_RECON_DONE.",
+                ? ${JSON.stringify(bashPrompt("printf started > slow-start; while ! test -f release-slow; do sleep 0.2; done; printf ended > slow-end", "SLOW_RECON_DONE"))}
+                : ${JSON.stringify(bashPrompt("while ! test -f slow-start; do sleep 0.2; done", "FAST_RECON_DONE"))},
                 {label: 'recon-' + item, phase:'Recon'}),
               async (recon, item) => {
                 if (!recon) throw new Error('Recon failed: ' + item);
-                const checked = await agent("Use bash to write " + item + " to " + item + "-verify. Then reply VERIFIED_" + item, {label:'verify-' + item, phase:'Verify'});
+                const checked = await agent(item === 'slow' ? ${JSON.stringify(bashPrompt("printf slow > slow-verify", "VERIFIED_slow"))} : ${JSON.stringify(bashPrompt("printf fast > fast-verify", "VERIFIED_fast"))}, {label:'verify-' + item, phase:'Verify'});
                 return {item, recon, checked};
               });
           `), args: { items: ['slow', 'fast'] }, reuse: 'none',
@@ -133,13 +142,15 @@ export default function liveFixture(pi: any) {
         assert.deepEqual((pipelined.result as any[]).map(row => row.item), ['slow', 'fast']);
         assert.match((pipelined.result as any[])[0].recon, /SLOW_RECON_DONE/);
         assert.ok((pipelined.result as any[]).every(row => row.checked));
+        assert.equal(readFileSync(join(dir, 'slow-end'), 'utf8'), 'ended');
+        for (const item of ['slow', 'fast']) assert.equal(readFileSync(join(dir, item + '-verify'), 'utf8'), item);
         record('pipeline-passed', { runId: gated.runId });
 
         const recovery = await manager.start({
           source: script('live-recovery', `
-            const first = await agent("Use bash: echo done >> completed-side-effect. Reply COMPLETED_ONCE.", {agent:'workflow-subagent', label:'completed', phase:'Recon'});
+            const first = await agent(${JSON.stringify(bashPrompt("echo done >> completed-side-effect", "COMPLETED_ONCE"))}, {agent:'workflow-subagent', label:'completed', phase:'Recon'});
             if (!first) throw new Error('First child failed');
-            const second = await agent("Use bash to execute this exact command (timeout 240 seconds): echo started >> resume-attempts; while ! test -f allow-resume; do sleep 0.2; done; echo resumed >> resumed-side-effect. Reply RESUMED_OK.", {label:'interrupted', phase:'Verify'});
+            const second = await agent(${JSON.stringify(bashPrompt("echo started >> resume-attempts; while ! test -f allow-resume; do sleep 0.2; done; echo resumed >> resumed-side-effect", "RESUMED_OK"))}, {label:'interrupted', phase:'Verify'});
             return {first, second, epoch: Date.now()};
           `), args: {}, reuse: 'none',
         });

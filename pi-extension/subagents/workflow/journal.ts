@@ -63,6 +63,7 @@ export function callKey(parts: {
   agent?: string;
   model?: string;
   effort?: string;
+  readOnly?: boolean;
 }): string {
   const basis = [
     parts.kind,
@@ -72,6 +73,8 @@ export function callKey(parts: {
     parts.effort ?? "",
     parts.prompt,
     parts.schema === undefined ? "" : JSON.stringify(parts.schema),
+    // Keep old writable keys stable while separating permission-restricted calls.
+    ...(parts.readOnly ? ["readOnly"] : []),
   ].join("\u0000");
   return createHash("sha256").update(basis).digest("hex").slice(0, 24);
 }

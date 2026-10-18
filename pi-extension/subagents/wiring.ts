@@ -46,6 +46,13 @@ export interface SubagentPluginSurface {
       outputIsData?: boolean;
       nonInteractive?: boolean;
       workflow?: boolean;
+      readOnly?: boolean;
+      /**
+       * Cancels the launch before the child starts: the launcher checks it
+       * before creating a pane, during the shell-ready wait, and before sending
+       * the command. It never stops a child that already started.
+       */
+      signal?: AbortSignal;
     },
   ): Promise<RunningSubagent>;
   watch(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult>;
@@ -145,8 +152,10 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
           // A workflow child is read by a program and watched by nobody: its
           // final message is data, and it must end on its own.
           workflow: true,
+          ...(request.readOnly ? { readOnly: true } : {}),
           outputIsData: true,
           nonInteractive: true,
+          ...(request.signal ? { signal: request.signal } : {}),
         },
       );
 

@@ -61,7 +61,7 @@ const results = await pipeline(
         '当前工作目录就是仓库根。先读文件和相关调用方，再给出按顺序可执行的步骤（每步指明位置和改法）。',
         'risky=true 表示这次改动会改变对外行为、跨文件契约或难以回滚。不要修改任何文件。',
       ].join('\n'),
-      { label: 'plan:' + baseName(file), phase: 'Plan', agent: planAgent, schema: PLAN_SCHEMA },
+      { label: 'plan:' + baseName(file), phase: 'Plan', agent: planAgent, schema: PLAN_SCHEMA, readOnly: true },
     )
     const steps = plan && Array.isArray(plan.steps) ? plan.steps.filter((step) => typeof step === 'string' && step.trim()) : []
     // 空计划按该文件失败处理：pipeline 会把这一项置为 null，不拿空计划去改文件
@@ -134,7 +134,7 @@ const results = await pipeline(
     await log('验证 ' + file + '：risky=' + (applied.risky ? 'true' : 'false') + ' → ' + verifier)
     const verdict = await agent(
       prompt,
-      { label: 'verify:' + baseName(file), phase: 'Verify', agent: verifier, schema: VERIFY_SCHEMA },
+      { label: 'verify:' + baseName(file), phase: 'Verify', agent: verifier, schema: VERIFY_SCHEMA, readOnly: true },
     )
     if (!verdict) {
       return { file: file, risky: applied.risky, verifier: verifier, ok: false, issues: ['验证没有完成（agent 失败或没有结构化结果）'], applyReport: applied.applyReport }
