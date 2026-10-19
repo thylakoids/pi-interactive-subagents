@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+#
+# Portable Linux end-to-end runner for the workflow runtime.
+#
+# It builds (or reuses) test/linux/Dockerfile, mounts this repository read-only
+# at /src, and runs the requested suites inside a real Linux kernel as a
+# non-root user. The container is run with --init so its PID 1 reaps zombies:
+# the owner-SIGKILL and watchdog tests deliberately orphan process groups, and
+# without a reaper those zombies would make a later "kill -0 <pgid>" look alive.
+#
+# The container gets three relaxations, and nothing else:
+#
+#   --security-opt seccomp=unconfined
+#   --security-opt apparmor=unconfined
+#   --security-opt systempaths=unconfined
+#
+# The first two let a nested bubblewrap create its own namespaces. The third
+# only lifts Docker's masked /proc submounts, without which bwrap's own
+# "--proc /proc" fails with EPERM. The container stays unprivileged, gains no
+# capabilities, still runs as the image's non-root node user, and production
+# runs never see these flags: each verification command is still isolated by
+# bwrap (all namespaces unshared, root read-only, no sockets).
+#
+# A Linux kernel alone does not prove the run is native. The platform is
+# derived from the docker daemon's own architecture, an explicit platform must
+# match it, the image must have been built for it, and the container's
+# uname/node arch are recorded and compared. Anything else is emulation.
+#
+# Usage:
+#   test/linux/run                       # build if needed, run every suite
+#   test/linux/run --suite unit          # unit | mutations | terminal | live | all
+#   test/linux/run --rebuild --model provider/model
+#   PI_SECRET_DIR=/path/to/agent-config test/linux/run --suite live
+set -Eeuo pipefail
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+IMAGE=${PI_LINUX_IMAGE:-pi-linux-e2e:local}
+PLATFORM=${PI_LINUX_PLATFORM:-}
+PI_CLI_VERSION=${PI_CLI_VERSION:-latest}
+SUITE=all
+MODEL=${PI_TEST_MODEL:-}
+SECRET_DIR=${PI_SECRET_DIR:-}
+LOG_DIR=${PI_LINUX_LOG_DIR:-}
+SUITE_TIMEOUT=${PI_LINUX_SUITE_TIMEOUT:-3600}
+REBUILD=0
+FAILED=0
+
+usage() { sed -n '3,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+log() { printf '[run] %s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --suite)         SUITE=${2:-}; shift 2 ;;
+    --suite=*)       SUITE=${1#*=}; shift ;;
+    --model)         MODEL=${2:-}; shift 2 ;;
+    --model=*)       MODEL=${1#*=}; shift ;;
+    --secret-dir)    SECRET_DIR=${2:-}; shift 2 ;;
+    --secret-dir=*)  SECRET_DIR=${1#*=}; shift ;;
+    --log-dir)       LOG_DIR=${2:-}; shift 2 ;;
+    --log-dir=*)     LOG_DIR=${1#*=}; shift ;;
+    --image)         IMAGE=${2:-}; shift 2 ;;
+    --image=*)       IMAGE=${1#*=}; shift ;;
+    --platform)      PLATFORM=${2:-}; shift 2 ;;
+    --platform=*)    PLATFORM=${1#*=}; shift ;;
+    --suite-timeout) SUITE_TIMEOUT=${2:-}; shift 2 ;;
+    --rebuild)       REBUILD=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+
+case "$SUITE" in
+  all|unit|mutations|terminal|live) ;;
+  *) die "unknown suite: $SUITE (expected all|unit|mutations|terminal|live)" ;;
+esac
+
+command -v docker >/dev/null 2>&1 || die "the docker CLI is not installed"
+docker info >/dev/null 2>&1 || die "the docker daemon is not reachable for this user"
+
+# -- native platform only ---------------------------------------------------
+docker_arch=$(docker info --format '{{.Architecture}}' 2>/dev/null || true)
+case "$docker_arch" in
+  arm64|aarch64) server_arch=arm64 ;;
+  amd64|x86_64)  server_arch=amd64 ;;
+  *) die "cannot determine the docker server architecture ('$docker_arch'); refusing to guess" ;;
+esac
+if [ -z "$PLATFORM" ]; then
+  PLATFORM=linux/$server_arch
+else
+  case "$PLATFORM" in
+    linux/arm64|linux/amd64) ;;
+    *) die "unsupported platform: $PLATFORM (expected linux/arm64 or linux/amd64)" ;;
+  esac
+  if [ "${PLATFORM#linux/}" != "$server_arch" ]; then
+    die "platform $PLATFORM differs from the docker server architecture ($server_arch): that emulates the kernel and is not acceptance evidence"
+  fi
+fi
+log "platform: $PLATFORM (native; docker server architecture $server_arch)"
+
+case "$SUITE" in
+  live|terminal|all)
+    [ -n "$MODEL" ] || die "set PI_TEST_MODEL or pass --model for suite '$SUITE'"
+    ;;
+esac
+
+if [ -n "$SECRET_DIR" ]; then
+  [ -d "$SECRET_DIR" ] || die "secret directory not found: $SECRET_DIR"
+  log "credentials: mounting $SECRET_DIR read-only at /run/pi-secret (contents are never read by this script)"
+else
+  log "credentials: none mounted; set PI_SECRET_DIR or --secret-dir for suites that call models"
+fi
+
+[ -n "$LOG_DIR" ] || LOG_DIR="${TMPDIR:-/tmp}/pi-linux-e2e-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+printf '%s\n' "$server_arch" > "$LOG_DIR/docker-arch.txt"
+printf '%s\n' "$docker_arch" > "$LOG_DIR/docker-arch-raw.txt"
+log "logs: $LOG_DIR (root 0700; per-suite evidence dirs 0777 for the node user inside)"
+
+# -- image ------------------------------------------------------------------
+image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)
+if [ "$REBUILD" -eq 1 ] || [ -z "$image_id" ]; then
+  log "building $IMAGE ($PLATFORM, pi $PI_CLI_VERSION)"
+  set +e
+  docker build --platform "$PLATFORM" \
+    -f "$REPO_ROOT/test/linux/Dockerfile" \
+    --build-arg "PI_CLI_VERSION=$PI_CLI_VERSION" \
+    -t "$IMAGE" "$REPO_ROOT" 2>&1 | tee "$LOG_DIR/build.log"
+  build_status=${PIPESTATUS[0]}
+  set -e
+  [ "$build_status" -eq 0 ] || die "image build failed (exit $build_status, see $LOG_DIR/build.log)"
+  image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE")
+else
+  log "reusing image $IMAGE ($image_id)"
+fi
+printf '%s\n' "$image_id" > "$LOG_DIR/image-id.txt"
+docker run --rm --platform "$PLATFORM" --entrypoint /bin/cat "$IMAGE" \
+  /usr/local/bin/pi-linux-entrypoint > "$LOG_DIR/image-entrypoint.sh"
+cmp -s "$REPO_ROOT/test/linux/entrypoint.sh" "$LOG_DIR/image-entrypoint.sh" \
+  || die "image entrypoint is stale; rebuild the Linux test image with --rebuild"
+for manifest in package.json package-lock.json; do
+  docker run --rm --platform "$PLATFORM" --entrypoint /bin/cat "$IMAGE" \
+    "/opt/pi-deps/$manifest" > "$LOG_DIR/image-$manifest"
+  cmp -s "$REPO_ROOT/$manifest" "$LOG_DIR/image-$manifest" \
+    || die "image dependencies are stale ($manifest); rebuild with --rebuild"
+done
+
+image_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE" 2>/dev/null || true)
+if [ -n "$image_platform" ] && [ "$image_platform" != "linux/$server_arch" ]; then
+  die "image platform $image_platform does not match the docker server architecture linux/$server_arch; rebuild natively"
+fi
+
+resolved_pi=$(docker run --rm --init --platform "$PLATFORM" --entrypoint /bin/cat "$IMAGE" /usr/local/share/pi-cli/version.txt 2>/dev/null || echo unknown)
+printf '%s\n' "$resolved_pi" > "$LOG_DIR/pi-version.txt"
+container_uname=$(docker run --rm --init --platform "$PLATFORM" --entrypoint /bin/uname "$IMAGE" -srm 2>/dev/null || echo unknown)
+container_arch=$(docker run --rm --init --platform "$PLATFORM" --entrypoint /usr/local/bin/node "$IMAGE" -p process.arch 2>/dev/null || echo unknown)
+# node says x64 where the docker daemon says amd64: compare one vocabulary.
+case "$container_arch" in
+  x64|amd64)    container_arch=amd64 ;;
+  arm64|aarch64) container_arch=arm64 ;;
+esac
+printf '%s\n' "$container_uname" > "$LOG_DIR/container-uname.txt"
+printf '%s\n' "$container_arch" > "$LOG_DIR/container-arch.txt"
+log "image $image_id exercises pi $resolved_pi"
+log "container: $container_uname | node arch: $container_arch | server arch: $server_arch"
+if [ "$container_arch" != "$server_arch" ]; then
+  die "the container runs $container_arch while the docker server is $server_arch: that is emulation, not acceptance evidence"
+fi
+
+# The only skips allowed in a terminal run: the three billed live suites, which
+# run separately with PI_WORKFLOW_LIVE=1. Anything else - the read-only sandbox
+# suite, lifecycle, surface, the UI tree - must really run.
+ALLOWED_TERMINAL_SKIPS="$LOG_DIR/allowed-terminal-skips.txt"
+cat > "$ALLOWED_TERMINAL_SKIPS" <<'EOF'
+real parent answers workflow questions, worker delegates, and waiting workflow can Abort
+real models execute old templates, advance pipeline independently and recover after Abort
+cancels a launch before its child starts and runs a read-only step under the sandbox
+EOF
+sort -o "$ALLOWED_TERMINAL_SKIPS" "$ALLOWED_TERMINAL_SKIPS"
+
+skips_in() {
+  grep -E '^ *ok [0-9]+ - .* # SKIP' "$1" 2>/dev/null \
+    | sed -E 's/^ *ok [0-9]+ - (.*) # SKIP.*$/\1/' \
+    | sort || true
+}
+
+fail_suite() { log "$1"; FAILED=1; }
+
+run_suite() {
+  name=$1
+  command=$2
+  suite_dir="$LOG_DIR/$name"
+  suite_log="$suite_dir/logs/suite.log"
+  mkdir -p "$suite_dir/tmp" "$suite_dir/logs" "$suite_dir/sessions"
+  # The container user (uid 1000) writes the exit sentinel at the evidence root,
+  # so the suite dir itself is writable too; the 0700 log root still keeps other
+  # host users out.
+  chmod 777 "$suite_dir"
+  chmod 777 "$suite_dir/tmp" "$suite_dir/logs" "$suite_dir/sessions"
+
+  log "=== $name: $command"
+  # --init: PID 1 reaps the orphans the SIGKILL/watchdog tests leave behind, so a
+  # later "kill -0 <pgid>" cannot be fooled by a zombie nobody reaped.
+  args=( run --rm --init --name "pi-linux-e2e-$name-$$" --platform "$PLATFORM" )
+  args+=( --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined )
+  args+=( -e PI_REQUIRE_READONLY_SANDBOX=1 -e PI_OFFLINE=1 -e TERM=xterm-256color )
+  args+=( -e "PI_LINUX_SUITE=$name" -e "PI_LINUX_SUITE_TIMEOUT=$SUITE_TIMEOUT" -e TMPDIR=/evidence/tmp )
+  args+=( -e "PI_LINUX_EXPECT_ARCH=$server_arch" )
+  if [ -n "$MODEL" ]; then args+=( -e "PI_TEST_MODEL=$MODEL" ); fi
+  if [ "$name" = live ]; then args+=( -e PI_WORKFLOW_LIVE=1 ); fi
+  args+=( -v "$REPO_ROOT:/src:ro" -v "$suite_dir:/evidence" )
+  args+=( -v "$suite_dir/sessions:/home/node/.pi/agent/sessions" )
+  if [ -n "$SECRET_DIR" ]; then args+=( -v "$SECRET_DIR:/run/pi-secret:ro" ); fi
+  args+=( -e "PI_LINUX_COMMAND=$command" "$IMAGE" )
+
+  set +e
+  docker "${args[@]}" 2>&1 | tee "$suite_dir/console.log"
+  status=${PIPESTATUS[0]}
+  set -e
+  printf '%s\n' "$status" > "$suite_dir/exit"
+
+  if [ "$status" -ne 0 ]; then
+    fail_suite "$name: exit $status (log $suite_log)"
+    return 0
+  fi
+
+  case "$name" in
+    unit|terminal|live)
+      if ! grep -q '^# tests ' "$suite_log" 2>/dev/null; then
+        fail_suite "$name: no TAP summary in $suite_log"
+        return 0
+      fi
+      ;;
+    mutations)
+      if ! grep -q 'regression faults detected' "$suite_log" 2>/dev/null || ! grep -q 'Baseline' "$suite_log" 2>/dev/null; then
+        fail_suite "mutations: no baseline/fault summary in $suite_log"
+        return 0
+      fi
+      ;;
+  esac
+
+  case "$name" in
+    unit)
+      skipped=$(skips_in "$suite_log")
+      if [ -n "$skipped" ]; then
+        fail_suite "unit: forbidden skips (the sandbox suites must run on Linux):"
+        printf '%s\n' "$skipped" | sed 's/^/  - /'
+      fi
+      ;;
+    terminal)
+      skips_in "$suite_log" > "$suite_dir/terminal-skips.txt"
+      if ! diff -u "$ALLOWED_TERMINAL_SKIPS" "$suite_dir/terminal-skips.txt" > "$suite_dir/terminal-skips.diff"; then
+        fail_suite "terminal: unexpected skips (only the three live suites may skip):"
+        sed -n '3,40p' "$suite_dir/terminal-skips.diff" | sed 's/^/  /'
+      fi
+      ;;
+    live)
+      skipped=$(skips_in "$suite_log")
+      if [ -n "$skipped" ]; then
+        fail_suite "live: the billed suites skipped instead of running:"
+        printf '%s\n' "$skipped" | sed 's/^/  - /'
+      fi
+      ;;
+  esac
+}
+
+wanted() { [ "$SUITE" = all ] || [ "$SUITE" = "$1" ]; }
+
+if wanted unit;      then run_suite unit      "npm test"; fi
+if wanted mutations; then run_suite mutations "node test/mutations/workflow.mjs"; fi
+if wanted terminal;  then run_suite terminal  "npm run test:integration"; fi
+if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts"; fi
+
+{
+  echo "suite       exit  log"
+  for name in unit mutations terminal live; do
+    if [ -f "$LOG_DIR/$name/exit" ]; then
+      printf '%-11s %-5s %s\n' "$name" "$(cat "$LOG_DIR/$name/exit")" "$LOG_DIR/$name/logs/suite.log"
+    fi
+  done
+  echo
+  echo "image: $image_id"
+  echo "pi: $resolved_pi (requested $PI_CLI_VERSION) | platform: $PLATFORM | model: ${MODEL:-none}"
+  echo "kernel: $container_uname | node arch: $container_arch | docker server arch: $server_arch"
+  echo "evidence: $LOG_DIR/<suite>/{tmp,sessions,logs}"
+} | tee "$LOG_DIR/summary.txt"
+
+if [ "$FAILED" -ne 0 ]; then
+  log "RESULT: FAILED (logs in $LOG_DIR)"
+  exit 1
+fi
+log "RESULT: PASS (logs in $LOG_DIR)"

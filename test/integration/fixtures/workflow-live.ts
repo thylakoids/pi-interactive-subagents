@@ -93,7 +93,7 @@ export default function liveFixture(pi: any) {
 
         const migration = await manager.start({
           source: readFileSync(join(BUNDLED_WORKFLOWS_DIR, 'migrate-files.js'), 'utf8'), reuse: 'none',
-          args: { task: 'Make only these two changes: safe.cjs: rename the private local variable oldValue to newValue without changing outputs (non-risky). risky.cjs: make isAdult inclusive at age 18 by using >= 18 instead of > 18 (risky: exported behavior changes). Do not edit test.cjs. Acceptance: node --test test.cjs must pass. Never modify eligibility.cjs or CONTRACT.md.',
+          args: { task: 'Make only these two changes: safe.cjs: rename the private local variable oldValue to newValue without changing outputs (non-risky). risky.cjs: make isAdult inclusive at age 18 by using >= 18 instead of > 18 (risky: exported behavior changes). Do not edit test.cjs. Per-file verification is independent: for safe.cjs run node --test --test-name-pattern="stable double" test.cjs; for risky.cjs run node --test --test-name-pattern="inclusive boundary" test.cjs. Pipeline branches overlap, so the other file may not be migrated yet: do not classify a pending sibling change as failure of your target file. The caller independently runs the full node --test test.cjs suite after both branches finish; it must pass. Never modify eligibility.cjs or CONTRACT.md, and do not attribute their pre-existing problems to this migration.',
             files: ['safe.cjs', 'risky.cjs'] },
         });
         record('migration-start', { runId: migration.runId });

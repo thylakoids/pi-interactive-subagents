@@ -1,0 +1,13 @@
+# Build context whitelist for test/linux/Dockerfile.
+#
+# BuildKit applies this file to the Dockerfile it sits next to, so the global
+# context rules stay untouched. The image needs exactly three files: the two
+# lockfile inputs and the entrypoint. Everything else - .git, the host's
+# node_modules, local artifacts, logs, .pi config, credentials, and any secret
+# variant someone left under test/linux - must never reach the builder.
+**
+!package.json
+!package-lock.json
+!test
+!test/linux
+!test/linux/entrypoint.sh

@@ -14,12 +14,13 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, openSync, readSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import subagentsExtension from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager, type WorkflowRun } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { readNameRegistry, readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import { surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
+import { waitForSandboxCommand } from '../../helpers/readonly-process.ts';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, label: string, timeout = 240_000) {
@@ -42,10 +43,11 @@ const READONLY_SCHEMA = {
   properties: {
     writeDenied: { type: 'boolean' },
     writeError: { type: 'string' },
+    fifoDenied: { type: 'boolean' },
     testPassed: { type: 'boolean' },
     testSummary: { type: 'string' },
   },
-  required: ['writeDenied', 'writeError', 'testPassed', 'testSummary'],
+  required: ['writeDenied', 'writeError', 'fifoDenied', 'testPassed', 'testSummary'],
 };
 
 const VERIFY_ABORT_COMMAND =
@@ -56,12 +58,23 @@ const VERIFY_ABORT_PROMPT =
   'The step is read-only and the command is meant to keep running until this workflow is cancelled. ' +
   'Do not call any other tool, do not retry, and do not write anywhere else.';
 
-const READONLY_PROMPT =
-  "Call verify_command with this exact command: node -e \"require('node:fs').writeFileSync('protected.txt','tampered')\" " +
-  "It must fail: this step is read-only, so the workspace cannot be written. Record the exact error text. " +
-  "Then call verify_command with this exact command: node --test guard.test.cjs. It must pass. " +
-  "Then call structured_output exactly once with writeDenied=true, writeError set to the exact error text you saw, " +
-  "testPassed=true and testSummary set to a one-line test summary. Do not use any other tool and do not retry a denied write.";
+const READONLY_PROMPT = [
+  'Run exactly these three commands, each in a separate verify_command call, without retrying:',
+  '1. Try a workspace write (it should be denied):',
+  '```sh',
+  `node -e "require('node:fs').writeFileSync('protected.txt','tampered')"`,
+  '```',
+  '2. Try writing to the existing external FIFO (it has a live reader and should be denied):',
+  '```sh',
+  'printf unexpected > restricted.fifo',
+  '```',
+  '3. Run the local test suite (it should pass):',
+  '```sh',
+  'node --test guard.test.cjs',
+  '```',
+  'Then call structured_output once with the actual writeDenied, writeError, fifoDenied, testPassed and testSummary.',
+  'Report observed results, not assumed success. Do not use any other tool or retry a denied write.',
+].join('\n');
 
 export default function protectionFixture(pi: any) {
   subagentsExtension(pi);
@@ -115,6 +128,7 @@ export default function protectionFixture(pi: any) {
         return paneIds().find(id => !before.has(id))!;
       };
 
+      let fifoFd: number | undefined;
       try {
         assert.equal(options.service.isAvailable().ok, true, 'Production subagent service must be available');
         record('start', { model: process.env.PI_TEST_MODEL, pid: process.pid });
@@ -242,6 +256,13 @@ export default function protectionFixture(pi: any) {
         record('resume-passed', { runId: abortRun.runId, resumed: resumedCall.name, snapshot: finalSnapshot.status, journal: finalJournal.map(entry => entry.status) });
 
         // ── Case 3: readOnly step under the verify_command sandbox ────────
+        const fifoPath = join(dir, 'restricted.fifo');
+        execFileSync('mkfifo', [fifoPath]);
+        fifoFd = openSync(fifoPath, constants.O_RDWR | constants.O_NONBLOCK);
+        writeSync(fifoFd, Buffer.from('OUTSIDE-CONTROL'));
+        const control = Buffer.alloc(15);
+        assert.equal(readSync(fifoFd, control), 15);
+        assert.equal(control.toString(), 'OUTSIDE-CONTROL');
         const protectedBefore = readFileSync(join(dir, 'protected.txt'));
         process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = '100';
         const readonlyRun: WorkflowRun = await manager.start({
@@ -274,8 +295,9 @@ export default function protectionFixture(pi: any) {
         // and the bytes on disk are the evidence.
         const structured = readonlyView.result as any;
         assert.equal(structured?.writeDenied, true, 'structured result must report the denied write');
+        assert.equal(structured?.fifoDenied, true, 'the existing FIFO must be protected by runtime permissions');
         assert.equal(structured?.testPassed, true, 'structured result must report a passing local test');
-        assert.match(String(structured?.writeError), /permission|denied|EPERM|not permitted/i);
+        assert.match(String(structured?.writeError), /permission|denied|EPERM|not permitted|EROFS|read.only file system/i);
 
         const loadout = readSubagentLoadout(readonlyCall.sessionFile!)!;
         assert.equal(loadout.readOnly, true, 'the persisted loadout must be read-only');
@@ -298,6 +320,18 @@ export default function protectionFixture(pi: any) {
         assert.ok(toolCalls(readonlyCall.sessionFile!).filter(call => call.name === 'verify_command').length >= 2);
         assert.ok(hasProviderUsage(readonlyCall.sessionFile!), 'the read-only step must show real provider usage');
         assert.equal(readFileSync(join(dir, 'protected.txt')).equals(protectedBefore), true, 'the protected file bytes must be unchanged');
+        const fifoCall = toolCalls(readonlyCall.sessionFile!).find(call => call.name === 'verify_command' && String(call.arguments?.command).includes('restricted.fifo'));
+        assert.ok(fifoCall, 'the model must really attempt the FIFO write');
+        const fifoResult = toolResults(readonlyCall.sessionFile!).find(row => row.message.toolCallId === fifoCall!.id);
+        assert.ok(fifoResult && fifoResult.message.details?.exitCode !== 0, 'the actual FIFO command must fail');
+        assert.match(textOf(fifoResult!.message), /denied|EPERM|not permitted/i);
+        let fifoBytes = 0;
+        try { fifoBytes = readSync(fifoFd, Buffer.alloc(128)); }
+        catch (error: any) { if (error.code !== 'EAGAIN' && error.code !== 'EWOULDBLOCK') throw error; }
+        assert.equal(fifoBytes, 0, 'the live reader must receive no bytes from the sandbox');
+        save('readonly-fifo', { control: control.toString(), receivedBytes: fifoBytes, command: fifoCall!.arguments.command });
+        closeSync(fifoFd);
+        fifoFd = undefined;
         record('readonly-passed', { runId: readonlyRun.runId, tools });
 
         // ── Case 4: Abort while a read-only verify_command is running ─────
@@ -341,18 +375,14 @@ export default function protectionFixture(pi: any) {
         const verifyScratch = /PI_SUBAGENT_VERIFY_SCRATCH='([^']+)'/.exec(readFileSync(verifyLaunchFile, 'utf8'))?.[1];
         assert.ok(verifyScratch, 'the launcher must hand this read-only step a private scratch root');
 
-        let marker = '';
-        await until(() => {
-          if (!existsSync(verifyScratch!)) return false;
-          const commandDir = readdirSync(verifyScratch!).find(name => name.startsWith('cmd-'));
-          if (!commandDir) return false;
-          const candidate = join(verifyScratch!, commandDir, 'started.pid');
-          if (!existsSync(candidate)) return false;
-          marker = candidate;
-          return true;
-        }, 'the sandboxed command to write its pid marker', 120_000);
-        const markerPid = Number(readFileSync(marker, 'utf8').trim());
-        assert.ok(Number.isInteger(markerPid) && markerPid > 0, 'the command must record its own pid');
+        const { ref, scratchDir: commandScratch } = await waitForSandboxCommand({
+          parentScratch: verifyScratch!, markerName: 'started.pid', timeoutMs: 120_000,
+        });
+        const marker = join(commandScratch, 'started.pid');
+        // A PID printed inside Linux's sandbox is not a host PID. The helper
+        // attributes it through TMPDIR and /proc NSpid before ps/kill may use it.
+        const markerPid = ref.hostPid;
+        const markerNamespacePid = ref.namespacePid;
         // view() returns copies, so the object captured before the child
         // launched has no sessionFile yet. Re-read the view now that the child
         // is really running, and require a real session for the checks below.
@@ -382,7 +412,7 @@ export default function protectionFixture(pi: any) {
         assert.match(markerCommand, /started\.pid/, 'the marker pid must be the command this call launched');
         const markerPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(markerPid)], { encoding: 'utf8' }).trim());
         assert.equal(markerPgid, verifyPgid, 'the marker pid must belong to the group being checked');
-        save('readonly-abort-start', { marker, markerPid, pgid: verifyPgid, driverPgid, call: verifyCall, commandAlive, markerCommand, scratchRoot: verifyScratch, launchScript: verifyLaunchFile });
+        save('readonly-abort-start', { marker, markerPid, markerNamespacePid, pgid: verifyPgid, driverPgid, call: verifyCall, commandAlive, markerCommand, scratchRoot: verifyScratch, launchScript: verifyLaunchFile });
         record('readonly-abort-command-started', { pid: markerPid, pgid: verifyPgid, commandAlive });
 
         verifyRun.abort('live protection: abort while verify_command runs');
@@ -465,6 +495,8 @@ export default function protectionFixture(pi: any) {
         record('failed', { message: error?.message, stack: error?.stack });
         manager?.abortAll('live protection failure');
         writeFileSync(join(dir, 'report.json'), JSON.stringify({ ok: false, error: error?.stack ?? String(error) }, null, 2));
+      } finally {
+        if (fifoFd !== undefined) closeSync(fifoFd);
       }
     },
   });

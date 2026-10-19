@@ -21,8 +21,9 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { LINUX_LANDLOCK_EXEC } from "./linux-landlock.ts";
 
 /** The one tool a read-only step may use to execute something. */
 export const VERIFY_COMMAND_TOOL = "verify_command";
@@ -54,7 +55,7 @@ export const MAX_VERIFY_OUTPUT_BYTES = 262_144;
 /** How long a terminated command may still ignore SIGTERM before SIGKILL. */
 const KILL_GRACE_MS = 2_000;
 
-export type VerifyBackend = { kind: "sandbox-exec"; command: string } | { kind: "bwrap"; command: string };
+export type VerifyBackend = { kind: "sandbox-exec"; command: string } | { kind: "bwrap"; command: string; pythonCommand: string };
 
 export type VerifyBackendResolution =
   | { ok: true; backend: VerifyBackend }
@@ -97,30 +98,27 @@ export function verifyToolEnabled(env: NodeJS.ProcessEnv = process.env): boolean
 }
 
 function findExecutable(name: string, env: NodeJS.ProcessEnv, exists: (path: string) => boolean): string | null {
+  const system = ["/usr/bin", "/bin", "/usr/local/bin"].map(dir => join(dir, name)).find(exists);
+  if (system) return system;
   const fromPath = (env.PATH ?? "")
     .split(":")
     .map(entry => entry.trim())
-    .filter(Boolean)
+    .filter(entry => entry.startsWith("/"))
     .map(entry => join(entry, name))
     .find(candidate => exists(candidate));
   if (fromPath) return fromPath;
-  return ["/usr/bin", "/usr/local/bin", "/bin", "/opt/homebrew/bin"].map(dir => join(dir, name)).find(exists) ?? null;
+  return null;
 }
 
 /**
  * Pick a backend that has been verified on the running platform, or refuse.
  *
- * Only macOS is verified: sandbox-exec is a system binary and the shipped
- * profile is exercised by real probes in test/workflow-readonly.test.ts.
- *
- * Linux is deliberately unsupported this round. bwrapArgv below is kept as a
- * starting point, but an installed bwrap binary is not evidence that those
- * flags behave: binding the root read-only, shadowing /tmp and unsharing
- * namespaces has to be validated on a Linux host before a workflow may rely on
- * it. Until then Linux fails closed rather than claiming a sandbox nobody ran.
+ * Linux requires bubblewrap, user namespaces and seccomp. Failure to establish
+ * any isolation layer is fatal; neither platform falls back to a bare shell.
  */
 export function resolveVerifyBackend(probe: {
   platform?: NodeJS.Platform;
+  arch?: string;
   env?: NodeJS.ProcessEnv;
   existsSync?: (path: string) => boolean;
 } = {}): VerifyBackendResolution {
@@ -137,14 +135,16 @@ export function resolveVerifyBackend(probe: {
   }
 
   if (platform === "linux") {
+    if (!['arm64', 'x64'].includes(probe.arch ?? process.arch)) {
+      return { ok: false, reason: "read-only Linux backend requires an arm64 or x64 seccomp ABI; refusing unsandboxed execution" };
+    }
     const installed = findExecutable("bwrap", env, exists);
-    return {
-      ok: false,
-      reason:
-        "read-only backend unsupported on linux: the bubblewrap invocation is implemented but has not been validated on a Linux host, " +
-        "so verify_command stays disabled instead of running unsandboxed" +
-        (installed ? " (bwrap is installed at " + installed + "; enabling it requires validating the sandbox there first)" : " (bubblewrap is not installed either)"),
-    };
+    if (installed) {
+      const pythonCommand = findExecutable('python3', env, exists);
+      if (!pythonCommand) return { ok: false, reason: 'Linux read-only verification requires Python 3 to establish Landlock path-write restrictions; refusing unsandboxed execution' };
+      return { ok: true, backend: { kind: "bwrap", command: installed, pythonCommand } };
+    }
+    return { ok: false, reason: "read-only Linux backend unavailable: install bubblewrap (bwrap), enable user namespaces and seccomp; refusing unsandboxed execution" };
   }
 
   return { ok: false, reason: "read-only backend unsupported on " + platform + ": no verified read-only sandbox exists for this platform, so verify_command stays disabled instead of running unsandboxed" };
@@ -181,32 +181,67 @@ export function sandboxProfile(scratchDir: string): string {
 }
 
 /**
- * The bubblewrap equivalent, kept for a future verified Linux backend: the whole
- * filesystem is bound read-only, /tmp is a tmpfs with the scratch directory
- * bound writable inside it, and namespaces are unshared (network included).
- * Not reachable through resolveVerifyBackend until it is validated on Linux.
+ * Keep /tmp readable: projects and dependencies often live there. Only the
+ * private command directory is rebound writable. A private /dev and /proc must
+ * not expose host devices or processes. FD 3 carries the mandatory socket filter.
  */
-export function bwrapArgv(scratchDir: string, cwd: string, command: string): string[] {
+export function bwrapArgv(scratchDir: string, cwd: string, command: string, pythonCommand = '/usr/bin/python3'): string[] {
   const scratch = assertSafePath(scratchDir, "scratch directory");
   return [
     "--die-with-parent",
     "--unshare-all",
+    "--unshare-user",
+    "--cap-drop", "ALL",
+    "--new-session",
     "--ro-bind", "/", "/",
-    "--dev-bind", "/dev", "/dev",
+    "--dev", "/dev",
+    "--remount-ro", "/dev",
     "--proc", "/proc",
-    "--tmpfs", "/tmp",
+    "--remount-ro", "/proc",
     "--bind", scratch, scratch,
+    "--seccomp", "3",
+    "--json-status-fd", "4",
     "--chdir", assertSafePath(cwd, "working directory"),
     "--",
+    pythonCommand, '-I', '-S', '-c', LINUX_LANDLOCK_EXEC, scratch,
     "/bin/sh", "-c", command,
   ];
+}
+
+/** Linux classic BPF, passed as an inherited read-only FD, never as shell text. */
+export function linuxVerifySeccomp(arch = process.arch): Buffer {
+  const abi = arch === 'arm64' ? { audit: 0xc00000b7, socket: 198 }
+    : arch === 'x64' ? { audit: 0xc000003e, socket: 41 } : null;
+  if (!abi) throw new Error('Unsupported Linux verification seccomp ABI: ' + arch);
+  const instructions: number[][] = [
+    [0x20, 0, 0, 4],                   // seccomp_data.arch
+    [0x15, 1, 0, abi.audit],
+    [0x06, 0, 0, 0x80000000],          // KILL_PROCESS: no compat ABI bypass
+    [0x20, 0, 0, 0],                   // seccomp_data.nr
+  ];
+  if (arch === 'x64') instructions.push([0x45, 0, 1, 0x40000000], [0x06, 0, 0, 0x80000000]);
+  // socketpair remains available for local node --test/child-process IPC.
+  // io_uring socket operations would otherwise bypass the socket syscall rule.
+  for (const syscall of [abi.socket, 425, 426, 427]) {
+    instructions.push([0x15, 0, 1, syscall], [0x06, 0, 0, 0x00050001]); // EPERM
+  }
+  instructions.push([0x06, 0, 0, 0x7fff0000]); // ALLOW
+  const program = Buffer.alloc(instructions.length * 8);
+  instructions.forEach(([code, jt, jf, k], index) => {
+    const offset = index * 8;
+    program.writeUInt16LE(code, offset);
+    program[offset + 2] = jt;
+    program[offset + 3] = jf;
+    program.writeUInt32LE(k, offset + 4);
+  });
+  return program;
 }
 
 function argvFor(backend: VerifyBackend, scratch: string, cwd: string, command: string): string[] {
   if (backend.kind === "sandbox-exec") {
     return ["-p", sandboxProfile(scratch), "/bin/sh", "-c", command];
   }
-  return bwrapArgv(scratch, cwd, command);
+  return bwrapArgv(scratch, cwd, command, backend.pythonCommand);
 }
 
 /**
@@ -370,17 +405,26 @@ export async function runVerifyCommand(input: {
 
   return await new Promise<VerifyResult>((resolve) => {
     let child;
+    let filterFd: number | undefined;
     try {
+      if (backend.kind === 'bwrap') {
+        const filterPath = join(scratch, '.verify-seccomp');
+        writeFileSync(filterPath, linuxVerifySeccomp(), { mode: 0o400, flag: 'wx' });
+        filterFd = openSync(filterPath, 'r');
+        unlinkSync(filterPath);
+      }
       child = spawn(VERIFY_WRAPPER_SHELL, wrapperArgv(ownerPid, backend, scratch, cwd, command), {
         cwd,
         detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: filterFd === undefined ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", filterFd, "pipe"],
         env: childEnv,
       });
     } catch (error: any) {
       cleanup();
       resolve(fail("verify_command could not start " + backend.kind + ": " + (error?.message ?? error)));
       return;
+    } finally {
+      if (filterFd !== undefined) closeSync(filterFd);
     }
 
     const chunks: Buffer[] = [];
@@ -390,6 +434,26 @@ export async function runVerifyCommand(input: {
     let cancelled = false;
     let settled = false;
     let leaderExitCode: number | null = null;
+    let sandboxStarted = backend.kind !== 'bwrap';
+    let policyReady = backend.kind !== 'bwrap';
+    let preamble = Buffer.alloc(0);
+    const readyMarker = Buffer.from('pi-verify-landlock-ready\n');
+    let statusBuffer = '';
+    const statusPipe = backend.kind === 'bwrap' ? child.stdio[4] : null;
+    if (backend.kind === 'bwrap') {
+      // A setup failure is not an executed user command. bubblewrap reports the
+      // sandbox child only after establishing the namespaces and mounts.
+      if (statusPipe && 'on' in statusPipe) statusPipe.on('data', (chunk: Buffer) => {
+        statusBuffer += chunk.toString('utf8');
+        const lines = statusBuffer.split('\n');
+        statusBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          try {
+            if (typeof JSON.parse(line)['child-pid'] === 'number') sandboxStarted = true;
+          } catch { /* malformed status cannot establish a successful sandbox */ }
+        }
+      });
+    }
     let killTimer: NodeJS.Timeout | undefined;
     let reapTimer: NodeJS.Timeout | undefined;
 
@@ -411,7 +475,24 @@ export async function runVerifyCommand(input: {
       truncated = true;
     };
     child.stdout?.on("data", collect);
-    child.stderr?.on("data", collect);
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (policyReady) { collect(chunk); return; }
+      // Only the trusted Landlock bootstrap can reach this point before the
+      // command is exec'd. Its handshake is control data, not command output.
+      preamble = Buffer.concat([preamble, chunk]);
+      let newline: number;
+      while ((newline = preamble.indexOf(10)) >= 0) {
+        const line = preamble.subarray(0, newline + 1);
+        preamble = preamble.subarray(newline + 1);
+        if (line.equals(readyMarker)) policyReady = true;
+        else collect(line);
+        if (policyReady) break;
+      }
+      if (policyReady || preamble.length > readyMarker.length) {
+        collect(preamble);
+        preamble = Buffer.alloc(0);
+      }
+    });
 
     // Single shot, first reason wins. Timeout and abort can fire back to back
     // (the timer fires while the caller is already aborting); a second call would
@@ -445,7 +526,13 @@ export async function runVerifyCommand(input: {
       input.signal?.removeEventListener("abort", onAbort);
       // Whatever happened, nothing from this command may outlive the call.
       if (typeof child.pid === "number") killGroup(child.pid, "SIGKILL");
+      collect(preamble);
       const output = Buffer.concat(chunks).toString("utf8");
+      statusPipe?.destroy();
+      const executed = sandboxStarted && policyReady;
+      if (!executed && !error && !cancelled && !timedOut) {
+        error = 'Linux read-only sandbox could not start: bubblewrap requires user namespaces/seccomp, and Python 3 must establish Landlock. ' + output.trim();
+      }
       cleanup();
       resolve({
         ok: !error,
@@ -460,7 +547,7 @@ export async function runVerifyCommand(input: {
         pid: typeof child.pid === "number" ? child.pid : null,
         scratchDir: scratch,
         ...(error ? { error } : {}),
-        executed: true,
+        executed,
       });
     };
 

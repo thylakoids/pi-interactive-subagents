@@ -21,6 +21,19 @@ const mutants = [
     '    "(deny default)",', '    "(allow default)",', 'runs a real test suite read-only', 'test/workflow-readonly.test.ts'],
   ['verification survives owning Pi death', 'pi-extension/subagents/workflow/readonly.ts',
     '  "  while :; do",', '  "  while false; do",', 'kills its process group when the owning pi process is SIGKILLed', 'test/workflow-readonly.test.ts'],
+  ['Linux root made writable', 'pi-extension/subagents/workflow/readonly.ts',
+    '    "--ro-bind", "/", "/",', '    "--bind", "/", "/",', 'runs a real test suite read-only', 'test/workflow-readonly.test.ts'],
+  ['Linux socket filter removed', 'pi-extension/subagents/workflow/readonly.ts',
+    '    "--seccomp", "3",', '', 'runs a real test suite read-only', 'test/workflow-readonly.test.ts'],
+  ['Linux parent-death cleanup removed', 'pi-extension/subagents/workflow/readonly.ts',
+    '    "--die-with-parent",', '', 'kills its process group when the owning pi process is SIGKILLed', 'test/workflow-readonly.test.ts'],
+  ['Linux io_uring bypass reopened', 'pi-extension/subagents/workflow/readonly.ts',
+    '[abi.socket, 425, 426, 427]', '[abi.socket]', 'Linux seccomp filter', 'test/workflow-readonly.test.ts'],
+  ['Linux setup cancellation becomes a backend error', 'pi-extension/subagents/workflow/readonly.ts',
+    '!executed && !error && !cancelled && !timedOut', '!executed && !error', 'preserves cancel while Linux sandbox setup', 'test/workflow-readonly.test.ts'],
+  ['Linux FIFO write restrictions removed', 'pi-extension/subagents/workflow/linux-landlock.ts',
+    'if libc.syscall(ctypes.c_long(RESTRICT_SELF), ctypes.c_int(ruleset), ctypes.c_uint32(0)) != 0:', 'if False:',
+    'refuses writing to an existing FIFO', 'test/workflow-readonly.test.ts'],
   ['launch cancellation not forwarded', 'pi-extension/subagents/wiring.ts',
     '          ...(request.signal ? { signal: request.signal } : {}),', '', 'forwards the workflow request', 'test/workflow-launch-cancellation.test.ts'],
   ['pending spawn keeps its logical slot', 'pi-extension/subagents/workflow/manager.ts',
@@ -79,12 +92,16 @@ const mutants = [
     " && verdicts.every((entry) => entry && (entry.status === 'supported' || entry.status === 'refuted'))", ''],
 ];
 const sandboxMutants = new Set(['sandbox filesystem default made writable', 'verification survives owning Pi death']);
-const applicable = mutants.filter(([name]) => !sandboxMutants.has(name) ||
-  (process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec')));
-if (applicable.length !== mutants.length) console.log('Not run: macOS sandbox mutation requires a real supported backend.');
+const linuxMutants = new Set(['Linux root made writable', 'Linux socket filter removed', 'Linux parent-death cleanup removed', 'Linux FIFO write restrictions removed']);
+const applicable = mutants.filter(([name]) => {
+  if (sandboxMutants.has(name)) return process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec');
+  return !linuxMutants.has(name) || process.platform === 'linux';
+});
+if (applicable.length !== mutants.length) console.log('Not run: mutations for the other OS backend (never claim simulated sandbox coverage).');
 const execute = (pattern, testFile = 'test/workflow.test.ts') => spawnSync(process.execPath, pattern
   ? ['--test', '--test-timeout=10000', '--test-name-pattern=' + pattern, testFile]
   : ['--test', ...tests], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
+let primaryFailed = false;
 try {
   for (const path of ['pi-extension', 'agents', 'examples', 'skills', 'test', 'package.json', 'config.json.example']) cpSync(join(root, path), join(dir, path), { recursive: true });
   symlinkSync(join(root, 'node_modules'), join(dir, 'node_modules'), 'dir');
@@ -109,4 +126,13 @@ try {
     } finally { writeFileSync(target, source); }
   }
   console.log(applicable.length + '/' + applicable.length + ' regression faults detected');
-} finally { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+} catch (error) {
+  primaryFailed = true;
+  throw error;
+} finally {
+  try { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch (error) {
+    if (!primaryFailed) throw error;
+    console.error('Mutation fixture cleanup also failed:', error);
+  }
+}

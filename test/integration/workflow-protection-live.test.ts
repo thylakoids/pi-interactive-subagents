@@ -109,15 +109,28 @@ function verifyProtectionEvidence(dir: string, tmux: (...args: string[]) => stri
   assert.ok(tools.includes('verify_command'));
   assert.ok(tools.includes('ask_question'));
   const verifyResults = rows(step.sessionFile).filter(row => row.message?.role === 'toolResult' && row.message.toolName === 'verify_command');
-  assert.ok(verifyResults.length >= 2, 'the model must really run verify_command twice');
+  assert.ok(verifyResults.length >= 3, 'the model must really run all three verification commands');
+  for (const result of verifyResults) {
+    assert.equal(result.message.details?.backend, process.platform === 'linux' ? 'bwrap' : 'sandbox-exec');
+  }
   const denial = verifyResults.find(row => row.message.details?.exitCode !== 0);
   assert.ok(denial, 'the write attempt must fail inside the sandbox');
-  assert.match(textOf(denial!.message), /permission|denied|EPERM|not permitted|sandbox/i, 'the transcript must contain the real refusal');
+  assert.match(textOf(denial!.message), /permission|denied|EPERM|not permitted|sandbox|EROFS|read.only file system/i, 'the transcript must contain the real refusal');
   const passing = verifyResults.find(row => row.message.details?.exitCode === 0);
   assert.ok(passing, 'the local test run must succeed under the sandbox');
   assert.match(textOf(passing!.message), /# pass 1|ok 1 -/, 'the transcript must contain the passing test output');
   assert.ok(hasProviderUsage(step.sessionFile), 'the read-only step must have real provider usage');
   assert.equal((readonly.result as any).writeDenied, true);
+  assert.equal((readonly.result as any).fifoDenied, true);
+  const fifoProof = JSON.parse(readFileSync(join(dir, 'readonly-fifo.json'), 'utf8'));
+  assert.equal(fifoProof.control, 'OUTSIDE-CONTROL', 'the FIFO must have had a working outside peer');
+  assert.equal(fifoProof.receivedBytes, 0);
+  const fifoCall = rows(step.sessionFile).flatMap(row => row.message?.role === 'assistant' ? row.message.content ?? [] : [])
+    .find(call => call.type === 'toolCall' && call.name === 'verify_command' && String(call.arguments?.command).includes('restricted.fifo'));
+  assert.ok(fifoCall, 'the real model must attempt the FIFO write');
+  const fifoResult = verifyResults.find(row => row.message.toolCallId === fifoCall.id);
+  assert.ok(fifoResult && fifoResult.message.details?.exitCode !== 0, 'the actual FIFO write must fail');
+  assert.match(textOf(fifoResult.message), /denied|EPERM|not permitted/i);
   assert.equal((readonly.result as any).testPassed, true);
   assert.equal(readFileSync(join(dir, 'protected.txt'), 'utf8'), PROTECTED, 'the protected file bytes must be unchanged');
   assert.equal(readFileSync(join(dir, 'guard.test.cjs'), 'utf8'), GUARD_SOURCE, 'the fixture test must be unchanged');
@@ -139,6 +152,8 @@ function verifyProtectionEvidence(dir: string, tmux: (...args: string[]) => stri
   assert.equal(verifySnapshot.status, 'aborted', 'the cancelled read-only run must be persisted as aborted');
   assert.ok(Number.isInteger(verifyStart.markerPid) && verifyStart.markerPid > 0, 'the command must have recorded its pid');
   assert.equal(verifyStart.commandAlive, true, 'the command must have been alive when Abort landed');
+  assert.ok(Number.isInteger(verifyStart.markerNamespacePid) && verifyStart.markerNamespacePid > 0);
+  if (process.platform === 'linux') assert.notEqual(verifyStart.markerPid, verifyStart.markerNamespacePid, 'Linux must attribute namespace PIDs to host PIDs');
   // Attribution and group safety, checked against real process groups: pi is
   // usually not a group leader, so a pid comparison proves nothing.
   const harnessPgid = Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim());

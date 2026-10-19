@@ -79,7 +79,9 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 **只读验证。** 证据收集、规划、审查和验证步骤可设置 `agent(prompt, { readOnly: true })`；随包 review-changes 的审查/核验以及 migrate-files 的规划/核验已启用，apply 仍可写。运行时移除 write/edit/普通 bash、任意扩展工具和自行委派（普通 worker 不受影响），保留定义中已有的 read/grep/find/ls、ask_question，以及受沙箱约束的 `verify_command`；schema 的 structured_output 照常可用。
 
-`verify_command({ command, timeout_ms? })` 可读取文件，但只能向独立临时 scratch 写入；网络、tmux 和外部应用 IPC 被阻止。macOS 使用 sandbox-exec；本轮未验证的平台明确拒绝命令，绝不退回裸 shell。默认每条命令 120 秒、最多 10 分钟，输出有上限；取消/超时会终止命令进程组，所属 Pi 退出（包括被强制结束）后，独立 watchdog 也会清理该组。需要生成仓库内构建产物或联网的测试会失败，应报告证据缺口或显式把输出配置到临时目录，而不是绕过限制。这不是敌对代码的通用安全容器，也不限制文件读取范围、CPU 或内存；自行脱离进程组的恶意守护进程不在清理保证内。
+`verify_command({ command, timeout_ms? })` 可读取文件，但只能向独立临时 scratch 写入；网络、tmux 和外部应用 IPC 被阻止。macOS 使用 sandbox-exec；Linux（arm64/x64）使用 bubblewrap 的只读挂载、独立 namespaces、能力移除、seccomp socket/异步 socket 系统调用限制，以及 Landlock 路径写权限（包括已有 FIFO）。Linux 需要安装 `bubblewrap`、`procps` 和 `python3`，内核及主机安全策略需允许非特权 user namespaces、seccomp 和 Landlock ABI 1+（Linux 5.13+）；依赖缺失或沙箱建立失败会明确报错，绝不退回裸 shell。`/tmp` 中的项目和依赖保持可读，只有每次调用新建的 scratch 可写。
+
+默认每条命令 120 秒、最多 10 分钟，输出有上限；取消/超时会终止命令进程组，所属 Pi 退出（包括被强制结束）后，独立 watchdog 也会清理该组；Linux 另有 bubblewrap 的 parent-death 和 PID namespace 清理。需要生成仓库内构建产物或联网的测试会失败，应报告证据缺口或显式把输出配置到临时目录，而不是绕过限制。这不是敌对代码的通用安全容器，也不限制文件读取范围、CPU 或内存；macOS 中自行脱离进程组的恶意守护进程不在清理保证内。
 
 只读模式纳入缓存键：不会复用之前可写步骤的答案；Focus 和 subagent_message 恢复原会话时继续限制权限。外部 CLI agent 不支持此模式，会在启动前拒绝。Skip/Abort 在 shell 就绪等待期间会取消启动、关闭已创建的自有 pane，并释放逻辑并发槽；已越过发命令时刻的调用按运行中取消处理。
 
