@@ -14,19 +14,28 @@
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import { readFileSync, writeFileSync } from "node:fs";
 
-type JsonSchema = {
+export type JsonSchema = {
   type?: string;
   properties?: Record<string, JsonSchema>;
+  /** true, false, or a schema for the keys the object may carry. */
+  additionalProperties?: boolean | JsonSchema;
   items?: JsonSchema;
   required?: string[];
   enum?: unknown[];
   description?: string;
 };
 
-/** Minimal JSON Schema → TypeBox conversion for the subset workflows use. */
-function toTypeBox(schema: JsonSchema): any {
+/**
+ * Minimal JSON Schema to TypeBox conversion for the subset workflows use.
+ *
+ * Exported so the parent can validate the sidecar value with the same schema
+ * the child tool layer used: Value.Check(workflowResultSchema(schema), value).
+ */
+export function workflowResultSchema(schema: JsonSchema): any {
+  if (Object.keys(schema).every(key => key === 'description')) return Type.Unknown();
   const withDesc = (value: any) =>
     typeof schema.description === "string" ? { ...value, description: schema.description } : value;
 
@@ -36,16 +45,31 @@ function toTypeBox(schema: JsonSchema): any {
 
   switch (schema.type) {
     case "object": {
+      const declared = schema.properties;
+      const additional = schema.additionalProperties;
+      // An object that declares no properties and no policy is free-form:
+      // JSON Schema allows any keys there, and locking it to {} forces the
+      // child to send an empty object the author never asked for.
+      if (declared === undefined && additional === undefined) {
+        return Type.Object({}, { additionalProperties: true });
+      }
       const properties: Record<string, any> = {};
       const required = new Set(schema.required ?? []);
-      for (const [key, child] of Object.entries(schema.properties ?? {})) {
-        const converted = toTypeBox(child);
+      for (const [key, child] of Object.entries(declared ?? {})) {
+        const converted = workflowResultSchema(child);
         properties[key] = required.has(key) ? converted : Type.Optional(converted);
       }
-      return Type.Object(properties, { additionalProperties: false });
+      // Objects that declare fields keep the closed-by-default contract, and
+      // an explicit additionalProperties is honoured verbatim.
+      const additionalProperties =
+        additional === true ? true
+          : additional === false ? false
+            : additional === undefined ? false
+              : workflowResultSchema(additional);
+      return Type.Object(properties, { additionalProperties });
     }
     case "array":
-      return Type.Array(schema.items ? toTypeBox(schema.items) : Type.Unknown());
+      return Type.Array(schema.items ? workflowResultSchema(schema.items) : Type.Unknown());
     case "number":
       return withDesc(Type.Number());
     case "integer":
@@ -73,7 +97,7 @@ export default function structuredOutputExtension(pi: ExtensionAPI): void {
 
   let parameters: any;
   try {
-    parameters = toTypeBox(schema);
+    parameters = workflowResultSchema(schema);
   } catch {
     // A schema we cannot express is still recorded, so the workflow reports a
     // clear contract error instead of silently returning free text.
@@ -95,6 +119,35 @@ export default function structuredOutputExtension(pi: ExtensionAPI): void {
     ],
     parameters,
     async execute(_toolCallId, params) {
+      // The tool layer validates arguments before calling us, but a direct
+      // caller (a test, another extension, a future transport) does not.
+      // Validate here too so no unvalidated value can ever be recorded.
+      try {
+        if (!Value.Check(parameters, params)) {
+          const first = Value.Errors(parameters, params).First();
+          const where = first?.path || "/";
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                "Structured output does not match the schema at " + where + ": " +
+                (first?.message ?? "invalid value") +
+                ". Correct the arguments and call structured_output again.",
+            }],
+            details: { recorded: false },
+            isError: true,
+          };
+        }
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Could not validate structured output: " + (error?.message ?? error),
+          }],
+          details: { recorded: false },
+          isError: true,
+        };
+      }
       try {
         writeFileSync(resultFile, JSON.stringify({ ok: true, value: params }));
       } catch (error: any) {

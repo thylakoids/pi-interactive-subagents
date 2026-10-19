@@ -35,7 +35,7 @@ export type WorkflowCallStatus =
   | "aborted";
 
 export interface WorkflowAgentOptions {
-  /** Display label; also part of the call key. Defaults to the agent type. */
+  /** Display-only label. Defaults to the agent type; not part of cache identity. */
   label?: string;
   /** Progress phase this call belongs to. */
   phase?: string;
@@ -47,6 +47,14 @@ export interface WorkflowAgentOptions {
   model?: string;
   /** Reasoning effort override, applied as the child's thinking level. */
   effort?: string;
+  /** Enforce read-only tools and OS-sandboxed verification commands. */
+  readOnly?: boolean;
+  /** Run in a persistent detached Git worktree, based on committed HEAD. */
+  isolation?: "worktree";
+  /** Explicit extra attempts after failure; default 0. May repeat side effects. */
+  retries?: number;
+  /** Per-attempt active-time ceiling in ms; omit to keep the default. */
+  stallTimeoutMs?: number;
 }
 
 export interface WorkflowAgentResultMeta {
@@ -89,6 +97,8 @@ export interface WorkflowUsage {
 export interface WorkflowJournalEntry {
   type: "call";
   callKey: string;
+  /** This settlement's uncached tokens (usage may be cumulative across retries). */
+  attemptTokens?: number;
   label: string;
   phase?: string;
   agentType: string;
@@ -108,6 +118,13 @@ export interface WorkflowJournalEntry {
   durationMs?: number;
   error?: string;
   usage?: WorkflowUsage;
+  /**
+   * True when this line was written by replaying a *predecessor* run's answer
+   * (a same-name/same-args start). The value is this run's result, but the
+   * tokens were spent by the run that produced it, so budget accounting must
+   * not charge them again.
+   */
+  replayed?: boolean;
 }
 
 /** One phase entry. A bare string is accepted and read as `{ title }`. */
@@ -158,6 +175,10 @@ export interface WorkflowRunSnapshot {
   result?: unknown;
   error?: string;
   agentCount: number;
+  /** Lifetime uncached-input + output spend, including failed attempts. */
+  spentTokens?: number;
+  /** Lifetime admitted attempts; preserved by resume. */
+  agentAttempts?: number;
   /** Set on resume, pointing back at the run being continued. */
   resumedFrom?: string;
 }

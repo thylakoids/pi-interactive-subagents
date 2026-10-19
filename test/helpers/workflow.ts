@@ -74,14 +74,19 @@ export function fixture(
     sessionId: 'contract', agentDir: dir, service, ...options,
   };
   const manager = new WorkflowManager(config);
+  const managers = new Set([manager]);
   t.after(() => {
-    manager.abortAll('test cleanup');
+    for (const instance of managers) instance.abortAll('test cleanup');
     rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 10 });
     assert.deepEqual(unexpected, [], 'Assertions in scripted agents must not be swallowed as agent failures');
   });
   return {
     dir, calls, stopped, manager, service,
-    reload: () => new WorkflowManager(config),
+    reload: () => {
+      const instance = new WorkflowManager(config);
+      managers.add(instance);
+      return instance;
+    },
     waitForCall(match: (call: WorkflowSubagentRequest) => boolean) {
       const existing = calls.find(match);
       return existing ? Promise.resolve(existing) : new Promise<WorkflowSubagentRequest>(done => listeners.push({ match, done }));

@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, closeSync, constants, existsSync, openSync, readSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import subagentsExtension from '../../../pi-extension/subagents/index.ts';
+import subagentsExtension, { __test__ } from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager, type WorkflowRun } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { readNameRegistry, readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import { surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
@@ -155,6 +155,9 @@ export default function protectionFixture(pi: any) {
         const firstPane = await waitNewPane(panesBeforeSkip, 'skip launch window');
         const firstCall = skipRun.view().calls.find(call => call.label === 'first')!;
         assert.ok(firstCall.name, 'the call must have claimed its agent name before the pane exists');
+        assert.ok(options.service.takenNames().has(firstCall.name!), 'pending workflow launch must reserve its name');
+        assert.ok(__test__.reservedNames.has(firstCall.name!), 'the production adapter must share manual-tool reservations');
+        assert.notEqual(__test__.uniqueRunningName(firstCall.name!), firstCall.name, 'manual naming must avoid a pending workflow name');
         assert.equal(registered(firstCall.name!), false, 'the worker must not be registered during the launch window');
         assert.doesNotMatch(paneCommand(firstPane), /(^|\/)(pi|node)$/, 'the pane must still be a bare shell during the launch window');
         save('skip-window', { pane: firstPane, paneCommand: paneCommand(firstPane), call: firstCall, registered: registered(firstCall.name!) });
@@ -173,6 +176,7 @@ export default function protectionFixture(pi: any) {
         const firstAfter = skippedView.calls.find(call => call.label === 'first')!;
         const successorAfter = skippedView.calls.find(call => call.label === 'successor')!;
         assert.equal(firstAfter.status, 'skipped');
+        assert.equal(__test__.reservedNames.has(firstCall.name!), false, 'cancelled startup must release its reservation');
         assert.equal(successorAfter.status, 'completed', successorAfter.error);
         assert.ok(existsSync(join(dir, 'successor-marker')), 'the queued successor must run a real model');
         assert.equal(existsSync(join(dir, 'first-marker')), false, 'the skipped call must never start');

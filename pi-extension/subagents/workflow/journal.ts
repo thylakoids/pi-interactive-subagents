@@ -55,7 +55,7 @@ export function newSeed(): number {
  * adversarial check is three samples, not one replayed three times — so the
  * caller appends an occurrence ordinal to the returned key.
  */
-export function callKey(parts: {
+export interface CallIdentity {
   kind: string;
   label: string;
   prompt: string;
@@ -64,7 +64,21 @@ export function callKey(parts: {
   model?: string;
   effort?: string;
   readOnly?: boolean;
-}): string {
+  isolation?: "worktree";
+}
+
+/** Display labels are deliberately absent; ordinal suffixes distinguish samples. */
+export function callKey(parts: CallIdentity): string {
+  const basis = [
+    "v2", parts.kind, parts.agent ?? "", parts.model ?? "", parts.effort ?? "",
+    parts.prompt, parts.schema === undefined ? "" : JSON.stringify(parts.schema),
+    parts.readOnly ? "readOnly" : "", parts.isolation ?? "",
+  ].join("\u0000");
+  return createHash("sha256").update(basis).digest("hex").slice(0, 24);
+}
+
+/** Compatibility lookup only: old journals used the cosmetic label as identity. */
+export function legacyCallKey(parts: CallIdentity): string {
   const basis = [
     parts.kind,
     parts.label,
@@ -111,6 +125,7 @@ export function appendJournal(path: string, entry: WorkflowJournalEntry): void {
 
 export interface JournalLoad {
   entries: Map<string, WorkflowJournalEntry>;
+  records: WorkflowJournalEntry[];
   /** Entries physically present before a truncated/corrupt line, for reporting. */
   skippedLines: number;
 }
@@ -122,14 +137,15 @@ export interface JournalLoad {
  */
 export function loadJournal(path: string): JournalLoad {
   const entries = new Map<string, WorkflowJournalEntry>();
+  const records: WorkflowJournalEntry[] = [];
   let skippedLines = 0;
-  if (!existsSync(path)) return { entries, skippedLines };
+  if (!existsSync(path)) return { entries, records, skippedLines };
 
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
   } catch {
-    return { entries, skippedLines };
+    return { entries, records, skippedLines };
   }
 
   for (const line of raw.split("\n")) {
@@ -139,12 +155,13 @@ export function loadJournal(path: string): JournalLoad {
       const parsed = JSON.parse(text) as WorkflowJournalEntry;
       if (parsed?.type === "call" && typeof parsed.callKey === "string") {
         entries.set(parsed.callKey, parsed);
+        records.push(parsed);
       }
     } catch {
       skippedLines++;
     }
   }
-  return { entries, skippedLines };
+  return { entries, records, skippedLines };
 }
 
 /**

@@ -168,7 +168,7 @@ if [ "$container_arch" != "$server_arch" ]; then
   die "the container runs $container_arch while the docker server is $server_arch: that is emulation, not acceptance evidence"
 fi
 
-# The only skips allowed in a terminal run: the three billed live suites, which
+# The only skips allowed in a terminal run: the four billed live suites, which
 # run separately with PI_WORKFLOW_LIVE=1. Anything else - the read-only sandbox
 # suite, lifecycle, surface, the UI tree - must really run.
 ALLOWED_TERMINAL_SKIPS="$LOG_DIR/allowed-terminal-skips.txt"
@@ -176,6 +176,7 @@ cat > "$ALLOWED_TERMINAL_SKIPS" <<'EOF'
 real parent answers workflow questions, worker delegates, and waiting workflow can Abort
 real models execute old templates, advance pipeline independently and recover after Abort
 cancels a launch before its child starts and runs a read-only step under the sandbox
+billed workflows prove cache, schema, worktree, nested limits and stall recovery
 EOF
 sort -o "$ALLOWED_TERMINAL_SKIPS" "$ALLOWED_TERMINAL_SKIPS"
 
@@ -208,7 +209,7 @@ run_suite() {
   args+=( -e "PI_LINUX_SUITE=$name" -e "PI_LINUX_SUITE_TIMEOUT=$SUITE_TIMEOUT" -e TMPDIR=/evidence/tmp )
   args+=( -e "PI_LINUX_EXPECT_ARCH=$server_arch" )
   if [ -n "$MODEL" ]; then args+=( -e "PI_TEST_MODEL=$MODEL" ); fi
-  if [ "$name" = live ]; then args+=( -e PI_WORKFLOW_LIVE=1 ); fi
+  if [ "$name" = live ]; then args+=( -e PI_WORKFLOW_LIVE=1 -e PI_WORKFLOW_REVIEW_LIVE=1 ); fi
   args+=( -v "$REPO_ROOT:/src:ro" -v "$suite_dir:/evidence" )
   args+=( -v "$suite_dir/sessions:/home/node/.pi/agent/sessions" )
   if [ -n "$SECRET_DIR" ]; then args+=( -v "$SECRET_DIR:/run/pi-secret:ro" ); fi
@@ -251,7 +252,7 @@ run_suite() {
     terminal)
       skips_in "$suite_log" > "$suite_dir/terminal-skips.txt"
       if ! diff -u "$ALLOWED_TERMINAL_SKIPS" "$suite_dir/terminal-skips.txt" > "$suite_dir/terminal-skips.diff"; then
-        fail_suite "terminal: unexpected skips (only the three live suites may skip):"
+        fail_suite "terminal: unexpected skips (only the four live suites may skip):"
         sed -n '3,40p' "$suite_dir/terminal-skips.diff" | sed 's/^/  /'
       fi
       ;;
@@ -270,7 +271,7 @@ wanted() { [ "$SUITE" = all ] || [ "$SUITE" = "$1" ]; }
 if wanted unit;      then run_suite unit      "npm test"; fi
 if wanted mutations; then run_suite mutations "node test/mutations/workflow.mjs"; fi
 if wanted terminal;  then run_suite terminal  "npm run test:integration"; fi
-if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts"; fi
+if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts"; fi
 
 {
   echo "suite       exit  log"

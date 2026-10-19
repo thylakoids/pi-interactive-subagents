@@ -5,6 +5,12 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import type { WorkflowRunView } from '../../pi-extension/subagents/workflow/types.ts';
 
+/** Count the blocking branch, not unrelated inspections of its marker file. */
+export function isStallRecoveryCommand(call: any): boolean {
+  return call?.type === 'toolCall' && call.name === 'bash' && typeof call.arguments?.command === 'string'
+    && /\bif test -f first\.pid; then/.test(call.arguments.command) && call.arguments.command.includes('sleep 90');
+}
+
 export const ACCEPTANCE_SOURCE = `const assert = require('node:assert/strict');
 const { test } = require('node:test');
 test('stable double', () => assert.equal(require('./safe.cjs').double(4), 8));

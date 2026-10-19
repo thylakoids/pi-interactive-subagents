@@ -56,6 +56,7 @@ it('adapter forwards the restriction independently of the agent definition', asy
   const surface: any = {
     sessionSnapshot: () => ({ sessionFile: '/tmp/parent.jsonl', sessionDir: '/tmp', sessionId: 'parent' }),
     cwd: () => '/tmp', getArtifactDir: () => '/tmp', registerName() {}, startWidgetRefresh() {},
+    runningSubagents: new Map(), readNameRegistry: () => ({}),
     async launch(_p: any, _c: any, options: any) { forwarded = options; return { id: 'id', name: 'step', sessionFile: '/tmp/step.jsonl' }; },
     async watch() { return { exitCode: 0, summary: 'data', elapsed: 0 }; },
   };

@@ -157,10 +157,12 @@ setInterval(() => {}, 1000);
   }
   for (const kind of ["codex", "claude"]) it(`${kind}: waits for queued follow-ups across separate native turns`, async () => {
     messages.length = 0;
-    await tools.get("subagent").execute("queued", { name: "queued", agent: `test-${kind}`, task: "QUEUED" }, new AbortController().signal, undefined, ctx);
-    const running = [...__test__.runningSubagents.values()].find(r => r.name === "queued")!;
+    const name = `queued-${kind}`;
+    const spawned = await tools.get("subagent").execute("queued", { name, agent: `test-${kind}`, task: "QUEUED" }, new AbortController().signal, undefined, ctx);
+    assert.equal(spawned.details.status, 'started');
+    const running = [...__test__.runningSubagents.values()].find(r => r.name === name)!;
     await until(() => /READY/.test(readScreen(running.surface)), "queued editor ready");
-    const response = await tools.get("subagent_message").execute("queued-steer", { name: "queued", message: "second task" }, new AbortController().signal, undefined, ctx);
+    const response = await tools.get("subagent_message").execute("queued-steer", { name, message: "second task" }, new AbortController().signal, undefined, ctx);
     assert.equal(response.details.status, "steered");
     await until(() => /FIRST_DONE/.test(readScreen(running.surface)), "first turn completed");
     await wait(1100); // Longer than a watcher polling interval.

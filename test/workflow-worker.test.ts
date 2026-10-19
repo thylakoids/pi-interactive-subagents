@@ -87,6 +87,7 @@ it('production workflow adapter always enables the runtime contract, even with l
   const surface: any = {
     sessionSnapshot: () => ({ sessionFile: '/tmp/parent.jsonl', sessionDir: '/tmp', sessionId: 'parent' }),
     cwd: () => '/tmp', getArtifactDir: () => '/tmp', registerName() {}, startWidgetRefresh() {},
+    runningSubagents: new Map(), readNameRegistry: () => ({}),
     async launch(_params: any, _ctx: any, opts: any) { options = opts; return { id: 'id', name: 'step', sessionFile: '/tmp/step.jsonl' }; },
     async watch() { return { exitCode: 0, summary: 'data', elapsed: 0 }; },
   };

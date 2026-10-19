@@ -65,8 +65,8 @@ const WorkflowParams = Type.Object({
   reuse: Type.Optional(
     Type.Union([Type.Literal("auto"), Type.Literal("none")], {
       description:
-        "action=start only. 'auto' (default) replays completed calls from the previous run of the " +
-        "same workflow with the same args; 'none' forces every call to run again.",
+        "action=start only. 'none' (default) starts fresh. Explicit 'auto' replays completed calls " +
+        "from the previous run of the same workflow with the same args; resume continues a specific run.",
     }),
   ),
 });

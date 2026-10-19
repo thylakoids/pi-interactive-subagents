@@ -16,12 +16,14 @@
  *    them on resume.
  */
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { Value } from "@sinclair/typebox/value";
 import { join } from "node:path";
 import type { CodemodeHostCall, CodemodeOutcome } from "@earendil-works/pi-codemode";
 import {
   acquireLock,
   appendJournal,
   callKey as makeCallKey,
+  legacyCallKey as makeLegacyCallKey,
   ensureRunDir,
   journalPath,
   loadJournal,
@@ -39,8 +41,11 @@ import {
   writeJsonAtomic,
 } from "./journal.ts";
 import { defaultConcurrency, runScript } from "./runner.ts";
+import { prepareWorkflowWorktree } from "./worktree.ts";
+import { workflowResultSchema } from "./structured-output.ts";
+import { summarizeSessionStats } from "../session.ts";
 import { isCallSettled, summarizeCalls } from "./state.ts";
-import { WorkflowScriptError, parseScript } from "./script.ts";
+import { WorkflowScriptError, parseScript, readScriptFile, resolveSavedScriptPath } from "./script.ts";
 import type {
   WorkflowAgentOutcome,
   WorkflowAgentResultMeta,
@@ -80,6 +85,14 @@ export interface WorkflowManagerOptions {
   /** Surfaced as a log line for the user. */
 }
 
+interface ScriptScope {
+  namespace: string;
+  agent?: string;
+  phase?: string;
+  occurrences: Map<string, number>;
+  pending: number;
+}
+
 interface CachedCall {
   value?: unknown;
   isNull?: boolean;
@@ -104,6 +117,9 @@ interface LiveCall {
   error?: string;
   usage?: WorkflowUsage;
   cached?: boolean;
+  /** Borrowed from a predecessor run: shown, never charged to this budget. */
+  replayed?: boolean;
+  previousUsage?: WorkflowUsage;
 }
 
 export class WorkflowLimitError extends Error {}
@@ -161,10 +177,18 @@ export class WorkflowRun {
    * abandoned (skipped) while its launch task waits on the agent. The slot is a
    * runtime resource: a watcher that never settles must not hold it until the
    * call ceiling. A skip that lands before the spawn returns is covered too, but
-   * the spawn itself is not cancelled — the slot comes back when it returns and
-   * the late handle is stopped.
+   * the pending spawn is cancelled as well, and any late handle is stopped.
    */
   private readonly abandonment = new Map<string, AbortController>();
+  /**
+   * True when the seeded cache is this run's own journal (a resume): those
+   * tokens were charged to this run's budget. A same-name/same-args start
+   * replays a *predecessor* run's calls instead, and charging them again would
+   * hand the fresh run a budget that its first call may already have spent.
+   */
+  private readonly cachedUsageIsSpent: boolean;
+  /** Call keys whose borrowed answer is already journaled in this run. */
+  private readonly replayedLogged = new Set<string>();
   /**
    * Releases a scheduling slot early. A call holds its slot while its launch
    * task runs, but a call settled before that task returns (skipped, or the run
@@ -186,6 +210,10 @@ export class WorkflowRun {
    * them apart in the journal, in the panel, and in the cache.
    */
   private readonly occurrences = new Map<string, number>();
+  private readonly nestedOccurrences = new Map<string, number>();
+  private nestedCalls = 0;
+  private activeChildren = 0;
+  private historicalSpent = 0;
   private logs: string[] = [];
   /** Notes trimmed off the front of `logs`. */
   private logsDropped = 0;
@@ -213,6 +241,9 @@ export class WorkflowRun {
       lockPath?: string;
       resumedFrom?: string;
       budgetTotal?: number;
+      cachedUsageIsSpent?: boolean;
+      priorSpent?: number;
+      priorAttempts?: number;
     },
   ) {
     this.manager = managerOptions;
@@ -222,6 +253,7 @@ export class WorkflowRun {
     this.source = params.source;
     this.lockPath = params.lockPath;
     this.cache = params.cache;
+    this.cachedUsageIsSpent = params.cachedUsageIsSpent === true;
     this.executionStartedWall = Date.now();
 
     this.runDir = ensureRunDir(managerOptions.baseDir, params.runId);
@@ -270,8 +302,11 @@ export class WorkflowRun {
         error: entry.entry.error,
         usage: entry.entry.usage,
         cached: true,
+        replayed: entry.entry.replayed === true,
       });
     }
+    this.historicalSpent = Math.max(0, (params.priorSpent ?? 0) - this.budgetView().spent);
+    this.launchedAgents = params.priorAttempts ?? 0;
   }
 
   get signal(): AbortSignal {
@@ -313,9 +348,11 @@ export class WorkflowRun {
   // ── script globals ──────────────────────────────────────────────────────
 
   /** Dispatch one call from the VM. Always answers, so the script never hangs. */
-  async dispatch(call: CodemodeHostCall, deliver: (outcome: CodemodeOutcome) => void): Promise<void> {
+  async dispatch(call: CodemodeHostCall, deliver: (outcome: CodemodeOutcome) => void, scope?: ScriptScope): Promise<void> {
+    const scopedAgent = scope && call.name === '__wfBridgeAgent';
+    if (scopedAgent) scope.pending++;
     try {
-      const answer = await this.handle(call);
+      const answer = await this.handle(call, scope);
       deliver(answer);
     } catch (error: any) {
       const message = error?.message ?? String(error);
@@ -332,16 +369,17 @@ export class WorkflowRun {
       } else {
         deliver({ ok: false, message: `internal error in ${call.name}(): ${message}` });
       }
-    }
+    } finally { if (scopedAgent) scope.pending--; }
   }
 
-  private async handle(call: CodemodeHostCall): Promise<CodemodeOutcome> {
+  private async handle(call: CodemodeHostCall, scope?: ScriptScope): Promise<CodemodeOutcome> {
     const first = firstArg(call);
     switch (call.name) {
       case "__wfBridgeAgent":
-        return { ok: true, value: await this.runAgentCall(first) };
+        return { ok: true, value: await this.runAgentCall(first, scope) };
       case "__wfBridgePhase":
-        this.setPhase(stringArg(first));
+        if (scope) scope.phase = `${scope.namespace}: ${stringArg(first)}`;
+        else this.setPhase(stringArg(first));
         return { ok: true, value: null };
       case "__wfBridgeLog":
         this.note(stringArg(first));
@@ -356,6 +394,7 @@ export class WorkflowRun {
         return { ok: true, value: { total: view.total, spent: view.spent, remaining: view.remaining } };
       }
       case "__wfBridgeWorkflow":
+        if (scope) throw new WorkflowScriptError("Maximum nested workflow depth is one: a child cannot nest another workflow.");
         return { ok: true, value: await this.runNestedCall(first) };
       default:
         return { ok: false, message: `unknown workflow primitive \`${call.name}\`` };
@@ -363,10 +402,10 @@ export class WorkflowRun {
   }
 
   /** Resolve the script-side handle for `agent(prompt, opts)`. */
-  private async runAgentCall(raw: unknown): Promise<unknown> {
+  private async runAgentCall(raw: unknown, scope?: ScriptScope): Promise<unknown> {
     const parsed = parseAgentArgs(raw);
     const defined = this.manager.service.allowedAgents();
-    const requestedAgent = parsed.opts.agent ?? this.meta.agent;
+    const requestedAgent = parsed.opts.agent ?? (scope ? scope.agent : this.meta.agent);
     // Keep user-provided legacy definitions; only the removed bundled name is
     // an alias. Authorization still checks the effective worker definition.
     const legacyAlias = requestedAgent === "workflow-subagent" && defined.unknown(requestedAgent);
@@ -399,8 +438,8 @@ export class WorkflowRun {
     }
 
     let label = parsed.opts.label?.trim() || (legacyAlias ? "workflow-subagent" : agentType);
-    const content = {
-      kind: "agent",
+    const identity = {
+      kind: scope ? `agent:${scope.namespace}` : "agent",
       label,
       prompt: parsed.prompt,
       schema: parsed.opts.schema,
@@ -408,18 +447,49 @@ export class WorkflowRun {
       model: parsed.opts.model,
       effort: parsed.opts.effort,
       ...(parsed.opts.readOnly ? { readOnly: true } : {}),
+      ...(parsed.opts.isolation ? { isolation: parsed.opts.isolation } : {}),
     };
-    let base = makeCallKey(content);
-    if (!requestedAgent && agentType === "worker") {
-      const legacyLabel = parsed.opts.label?.trim() || "workflow-subagent";
-      const legacyBase = makeCallKey({ ...content, agent: "workflow-subagent", label: legacyLabel });
-      const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key === prefix || key.startsWith(prefix + "-"));
-      // Old default calls used the legacy agent (and sometimes its name as the
-      // label). Reuse that namespace across resume, including failed ordinal 0.
-      if (!hasNamespace(base) && hasNamespace(legacyBase)) { base = legacyBase; label = legacyLabel; }
+    let base = makeCallKey(identity);
+    const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key === prefix || key.startsWith(prefix + "-"));
+    // Old journals keyed a call by its cosmetic label. When the current key has
+    // no namespace, look under the legacy algorithm before treating this as new
+    // work, trying the shapes an older run could have written: its own label,
+    // the removed default name, and the worker/workflow-subagent alias. An
+    // isolated call never falls back — it must not replay a call that ran in the
+    // workspace instead of in its worktree.
+    if (!hasNamespace(base)) {
+      // The removed default agent was recorded under its own name in current
+      // journals too, so try the aliases under this algorithm first — an
+      // isolated call included, because the key already carries the isolation.
+      const aliasAgents = requestedAgent ? [identity.agent] : [identity.agent, "worker", "workflow-subagent"];
+      const alias = aliasAgents
+        .map(agent => makeCallKey({ ...identity, agent }))
+        .find(candidate => hasNamespace(candidate));
+      if (alias) {
+        base = alias;
+      } else if (parsed.opts.isolation !== "worktree") {
+        // Old journals keyed a call by its cosmetic label. Try the shapes an
+        // older run could have written; an isolated call never falls back here,
+        // because that would replay a call that ran in the workspace.
+        const legacyAgents = [identity.agent];
+        const legacyLabels = [label];
+        if (!requestedAgent) {
+          legacyAgents.push("worker", "workflow-subagent");
+          legacyLabels.push("workflow-subagent");
+        }
+        const legacy = legacyAgents
+          .flatMap(agent => legacyLabels.map(legacyLabel => ({ agent, legacyLabel })))
+          .map(candidate => ({
+            ...candidate,
+            key: makeLegacyCallKey({ ...identity, agent: candidate.agent, label: candidate.legacyLabel }),
+          }))
+          .find(candidate => hasNamespace(candidate.key));
+        if (legacy) { base = legacy.key; label = legacy.legacyLabel; }
+      }
     }
-    const occurrence = this.occurrences.get(base) ?? 0;
-    this.occurrences.set(base, occurrence + 1);
+    const occurrences = scope?.occurrences ?? this.occurrences;
+    const occurrence = occurrences.get(base) ?? 0;
+    occurrences.set(base, occurrence + 1);
     const key = occurrenceKey(base, occurrence);
 
     if (!this.predecessorLogged && this.cache.size > 0) {
@@ -430,10 +500,11 @@ export class WorkflowRun {
     }
     const cached = this.cache.get(key);
     if (cached) {
+      const replayed = cached.entry.replayed === true || !this.cachedUsageIsSpent;
       this.live.set(key, {
         callKey: key,
         label,
-        phase: parsed.opts.phase ?? this.phase,
+        phase: parsed.opts.phase ?? scope?.phase ?? this.phase,
         agentType,
         status: cached.entry.status,
         requestedAt: this.now(),
@@ -446,14 +517,35 @@ export class WorkflowRun {
         model: cached.entry.model,
         usage: cached.entry.usage,
         cached: true,
+        replayed,
       });
+      // A borrowed answer must exist in *this* run's journal: a later resume of
+      // this run reads only its own journal, and without the line the call would
+      // look unfinished and be re-run — repeating whatever side effects the
+      // predecessor's agent already had. The line is marked so budget accounting
+      // and a following reuse still treat its tokens as somebody else's.
+      if (!this.cachedUsageIsSpent && !this.replayedLogged.has(key)) {
+        try {
+          appendJournal(this.journalFile, {
+            ...cached.entry,
+            type: "call",
+            callKey: key,
+            label,
+            prompt: parsed.prompt,
+            replayed: true,
+          });
+          this.replayedLogged.add(key);
+        } catch (error: any) {
+          throw new WorkflowScriptError(`Could not persist borrowed workflow result: ${error?.message ?? error}`);
+        }
+      }
       return cached.value ?? null;
     }
 
     const liveCall: LiveCall = {
       callKey: key,
       label,
-      phase: parsed.opts.phase ?? this.phase,
+      phase: parsed.opts.phase ?? scope?.phase ?? this.phase,
       agentType,
       status: "queued",
       requestedAt: this.now(),
@@ -463,6 +555,7 @@ export class WorkflowRun {
     this.launchedAgents++;
     this.assertAgentBudget();
     this.assertBudget();
+    this.persistSnapshot(true);
 
     const promise = new Promise<WorkflowAgentOutcome>((resolve) => {
       const list = this.waiters.get(key) ?? [];
@@ -471,7 +564,19 @@ export class WorkflowRun {
     });
 
     this.enqueue(key, async () => {
-      const outcome = await this.launchAgent(liveCall, parsed);
+      let outcome: WorkflowAgentOutcome;
+      try {
+        outcome = await this.launchWithRetries(liveCall, parsed);
+      } catch (error) {
+        // launchAgent reports its own failures; a rejection here means even that
+        // report failed (the same full disk that broke the launch). The waiter
+        // must still be resolved — a pending waiter hangs the script forever —
+        // and a rejected enqueue task would escape as an unhandled rejection.
+        if (error instanceof WorkflowBudgetExceededError || error instanceof WorkflowLimitError) {
+          this.failRun(error.message);
+          outcome = { ok: false, status: 'aborted', value: null, error: error.message };
+        } else outcome = this.settleLaunchFailure(liveCall, error);
+      }
       const waiters = this.waiters.get(key) ?? [];
       this.waiters.delete(key);
       for (const resolve of waiters) resolve(outcome);
@@ -497,10 +602,62 @@ export class WorkflowRun {
         ? ((raw as { name: string }).name)
         : stringArg(raw);
     if (!name.trim()) throw new WorkflowScriptError("workflow() requires a saved workflow name.");
-    throw new WorkflowScriptError(
-      `workflow("${name}") is not available: nested workflows are not supported by this build yet. ` +
-        "Express the child steps inline in this script instead.",
-    );
+    if (++this.nestedCalls > 64 || this.activeChildren >= 16) {
+      throw new WorkflowLimitError("Nested workflow limit: at most 64 child invocations and 16 concurrent child scripts per run.");
+    }
+    const args = raw && typeof raw === "object" ? (raw as { args?: unknown }).args ?? {} : {};
+    const base = sha256(JSON.stringify([name, args])).slice(0, 24);
+    const occurrence = this.nestedOccurrences.get(base) ?? 0;
+    this.nestedOccurrences.set(base, occurrence + 1);
+    const namespace = occurrenceKey(base, occurrence);
+    const nestedDir = join(this.runDir, "nested");
+    const saved = join(nestedDir, namespace + ".js");
+    let source: string;
+    if (existsSync(saved)) source = readScriptFile(saved);
+    else {
+      const path = resolveSavedScriptPath(name, { cwd: this.manager.cwd, agentDir: this.manager.agentDir });
+      if (!path) throw new WorkflowScriptError(`No saved child workflow "${name}".`);
+      source = readScriptFile(path);
+      parseScript(source, path);
+      mkdirSync(nestedDir, { recursive: true });
+      writeFileSync(saved, source, "utf8");
+    }
+    const parsed = parseScript(source, saved);
+    const scope: ScriptScope = { namespace, agent: parsed.meta.agent, phase: parsed.meta.name, occurrences: new Map(), pending: 0 };
+    this.activeChildren++;
+    try {
+      const result = await runScript({
+        code: wrapScript(parsed.body), args, startedAt: this.snapshot.startedAt,
+        seed: (this.snapshot.seed ^ Number.parseInt(base.slice(0, 8), 16)) >>> 0,
+        signal: this.signal, limits: { runTimeoutMs: this.scriptTimeoutMs }, maxItemsPerBatch: MAX_ITEMS_PER_BATCH,
+        onCall: (call, deliver) => { void this.dispatch(call, deliver, scope); },
+      });
+      if (result.ok && scope.pending > 0 && !this.signal.aborted) {
+        const message = `Child workflow "${name}" returned with unawaited agent() calls.`;
+        this.failRun(message);
+        throw new WorkflowScriptError(message);
+      }
+      if (!result.ok) throw new WorkflowScriptError(`Child workflow "${name}" failed: ${result.error?.message ?? "unknown error"}`);
+      return result.value ?? null;
+    } finally { this.activeChildren--; }
+  }
+
+  private async launchWithRetries(call: LiveCall, parsed: ParsedAgentArgs): Promise<WorkflowAgentOutcome> {
+    for (let attempt = 0; ; attempt++) {
+      const outcome = await this.launchAgent(call, parsed);
+      if (outcome.status !== 'failed' || attempt >= (parsed.opts.retries ?? 0) || this.signal.aborted) return outcome;
+      this.assertBudget();
+      this.launchedAgents++;
+      this.assertAgentBudget();
+      this.persistSnapshot(true);
+      call.previousUsage = call.usage;
+      call.status = 'queued';
+      call.error = undefined;
+      call.finishedAt = undefined;
+      call.sessionFile = undefined;
+      call.sessionId = undefined;
+      this.note(`${call.label}: retry ${attempt + 1}/${parsed.opts.retries}`);
+    }
   }
 
   // ── agent scheduling ────────────────────────────────────────────────────
@@ -590,7 +747,8 @@ export class WorkflowRun {
     for (const start of queue) start();
     for (const live of this.live.values()) {
       if (!isCallSettled(live.status)) {
-        this.recordOutcome(live, { ok: false, status: "aborted", value: null, error: reason });
+        try { this.recordOutcome(live, { ok: false, status: "aborted", value: null, error: reason }); }
+        catch { live.status = 'aborted'; live.error = reason; live.finishedAt = this.now(); }
       }
     }
     for (const [key, waiters] of this.waiters) {
@@ -623,30 +781,18 @@ export class WorkflowRun {
     liveCall.startedAt = this.now();
 
     // Structured results go through a sidecar: schema file in, result file out,
-    // both scoped to this call so parallel calls cannot collide.
+    // both scoped to this call so parallel calls cannot collide. The writes are
+    // issued inside the try below: a full disk or an unwritable run directory
+    // must settle this call like any other launch failure.
     const callDir = join(this.runDir, "calls", liveCall.callKey);
-    mkdirSync(callDir, { recursive: true });
     let schemaFile: string | undefined;
     let resultFile: string | undefined;
-    if (parsed.opts.schema) {
-      schemaFile = join(callDir, "schema.json");
-      resultFile = join(callDir, "result.json");
-      writeJsonAtomic(schemaFile, parsed.opts.schema);
-      // A retry of this call must not inherit the previous attempt's answer: a
-      // child that never calls structured_output would otherwise be reported as
-      // having returned the old value.
-      try {
-        unlinkSync(resultFile);
-      } catch {
-        // No previous result; nothing to clear.
-      }
-    }
 
     const task = parsed.opts.schema
       ? `${parsed.prompt}\n\nReturn the result by calling structured_output exactly once with your final answer.`
       : parsed.prompt;
 
-    const name = this.uniqueName(liveCall.label);
+    let name = this.uniqueName(liveCall.label);
     liveCall.name = name;
 
     // Registered before the spawn so a skip that lands while the pane is still
@@ -656,6 +802,33 @@ export class WorkflowRun {
     this.abandonment.set(liveCall.callKey, abandonment);
 
     try {
+      mkdirSync(callDir, { recursive: true });
+      if (parsed.opts.schema) {
+        schemaFile = join(callDir, "schema.json");
+        resultFile = join(callDir, "result.json");
+        writeJsonAtomic(schemaFile, parsed.opts.schema);
+        // A retry of this call must not inherit the previous attempt's answer:
+        // a child that never calls structured_output would otherwise be
+        // reported as having returned the old value.
+        try {
+          unlinkSync(resultFile);
+        } catch {
+          // No previous result; nothing to clear.
+        }
+      }
+
+      const cwd = parsed.opts.isolation === 'worktree'
+        ? (await prepareWorkflowWorktree({ cwd: this.manager.cwd, runDir: this.runDir, callKey: liveCall.callKey, signal: abandonment.signal })).cwd
+        : this.manager.cwd;
+      if (abandonment.signal.aborted || this.signal.aborted) {
+        return { ok: false, status: liveCall.status, value: null, error: liveCall.error };
+      }
+      // Worktree preparation yielded: another run may have claimed our proposed
+      // display name. Recheck immediately before spawn reserves it synchronously.
+      if (this.manager.service.takenNames().has(name)) {
+        name = this.uniqueName(liveCall.label);
+        liveCall.name = name;
+      }
       const handle = await this.manager.service.spawn({
         agentType: liveCall.agentType,
         ...(parsed.opts.readOnly ? { readOnly: true } : {}),
@@ -672,7 +845,7 @@ export class WorkflowRun {
           parsed.opts.schema && this.manager.structuredOutputExtension
             ? [this.manager.structuredOutputExtension]
             : undefined,
-        cwd: this.manager.cwd,
+        cwd,
         // Cancels a spawn whose call is settled before the pane exists. The
         // launcher closes anything it opened and never starts the child.
         signal: abandonment.signal,
@@ -702,7 +875,7 @@ export class WorkflowRun {
       const ended = await withRunAbort(
         completion,
         this.abortController.signal,
-        this.callTimeoutMs,
+        parsed.opts.stallTimeoutMs ?? this.callTimeoutMs,
         () => this.manager.service.status(handle.name)?.kind === "waiting",
         this.waitAllowanceMs,
         abandonment.signal,
@@ -742,7 +915,7 @@ export class WorkflowRun {
           status: "failed",
           value: null,
           error:
-            `agent ran for ${formatMinutes(this.callTimeoutMs)} of work without finishing and was stopped` +
+            `agent ran for ${formatMinutes(parsed.opts.stallTimeoutMs ?? this.callTimeoutMs)} of work without finishing and was stopped` +
             waitBudgetHint(this.waitAllowanceMs) +
             "; the call limit is the run's per-call ceiling, not a script deadline. " +
             "Split the task, raise PI_WORKFLOW_CALL_TIMEOUT_MS, or run it outside the workflow.",
@@ -784,6 +957,13 @@ export class WorkflowRun {
       }
 
       const value = parsed.opts.schema ? structured?.value ?? null : result.summary;
+      if (parsed.opts.schema && !Value.Check(workflowResultSchema(parsed.opts.schema), value)) {
+        return this.recordOutcome(liveCall, {
+          ok: false, status: 'failed', value: null, error: 'structured output does not match the schema',
+          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
+          completion: result,
+        });
+      }
       return this.recordOutcome(liveCall, {
         ok: true,
         status: "completed",
@@ -801,6 +981,30 @@ export class WorkflowRun {
     } finally {
       this.abandonment.delete(liveCall.callKey);
       this.running.delete(liveCall.callKey);
+    }
+  }
+
+  /**
+   * Settle a call whose launch threw before it could report an outcome.
+   *
+   * The normal path records the failure and journals it; here that recording is
+   * what threw (an unwritable journal). The call still settles in memory so the
+   * script receives its null and the run can finish, and a second throw would
+   * leave the waiter pending and surface as another unhandled rejection. A call
+   * a skip or abort already decided keeps that decision.
+   */
+  private settleLaunchFailure(liveCall: LiveCall, error: unknown): WorkflowAgentOutcome {
+    const message = error instanceof Error ? error.message : String(error);
+    if (liveCall.status === 'skipped' || liveCall.status === 'aborted') {
+      return { ok: false, status: liveCall.status, value: null, error: liveCall.error ?? message };
+    }
+    try {
+      return this.recordOutcome(liveCall, { ok: false, status: "failed", value: null, error: message });
+    } catch {
+      liveCall.status = "failed";
+      liveCall.finishedAt = this.now();
+      liveCall.error = message;
+      return { ok: false, status: "failed", value: null, error: message };
     }
   }
 
@@ -827,12 +1031,14 @@ export class WorkflowRun {
     liveCall.finishedAt = finishedAt;
     liveCall.error = params.error;
     liveCall.sessionId = params.session?.sessionId;
-    liveCall.usage = params.session?.usage;
+    const observed = params.session?.usage ?? usageFromSession(liveCall.sessionFile);
+    if (observed) liveCall.usage = addUsage(liveCall.previousUsage, observed);
     liveCall.model = params.session?.model;
 
     const entry: WorkflowJournalEntry = {
       type: "call",
       callKey: liveCall.callKey,
+      attemptTokens: observed?.totalTokens ?? 0,
       label: liveCall.label,
       phase: liveCall.phase,
       agentType: liveCall.agentType,
@@ -853,8 +1059,10 @@ export class WorkflowRun {
     };
     // Write before the script can observe the value: a crash must never leave a
     // result that was consumed but not recorded.
-    appendJournal(this.journalFile, entry);
     this.snapshot.agentCount = this.live.size;
+    this.snapshot.spentTokens = this.budgetView().spent;
+    this.snapshot.agentAttempts = this.launchedAgents;
+    appendJournal(this.journalFile, entry);
     this.persistSnapshot();
 
     return { ok: params.ok, status: params.status, value: params.value ?? null, error: params.error };
@@ -895,6 +1103,10 @@ export class WorkflowRun {
         void this.dispatch(call, deliver);
       },
     });
+
+    if (result.ok && (this.waiters.size > 0 || this.activeChildren > 0) && !this.signal.aborted) {
+      this.failRun('Workflow returned with unawaited agent() or workflow() calls; await all child work before returning.');
+    }
 
     if (this.snapshot.status === "running") {
       const aborted = this.abortController.signal.aborted;
@@ -945,9 +1157,12 @@ export class WorkflowRun {
   skip(callKey: string): boolean {
     const live = this.live.get(callKey);
     if (!live || isCallSettled(live.status)) return false;
+    const attemptUsage = usageFromSession(live.sessionFile);
+    live.usage = addUsage(live.previousUsage, attemptUsage) ?? live.usage;
     const entry: WorkflowJournalEntry = {
       type: "call",
       callKey,
+      attemptTokens: attemptUsage?.totalTokens ?? 0,
       label: live.label,
       phase: live.phase,
       agentType: live.agentType,
@@ -960,6 +1175,7 @@ export class WorkflowRun {
       finishedAt: this.now(),
       valueIsNull: true,
       error: "skipped by user",
+      ...(live.usage ? { usage: live.usage } : {}),
     };
     appendJournal(this.journalFile, entry);
     const handle = this.running.get(callKey);
@@ -975,6 +1191,9 @@ export class WorkflowRun {
     live.status = "skipped";
     live.finishedAt = this.now();
     live.error = "skipped by user";
+    this.snapshot.spentTokens = this.budgetView().spent;
+    this.snapshot.agentAttempts = this.launchedAgents;
+    this.persistSnapshot(true);
     return true;
   }
 
@@ -1011,6 +1230,8 @@ export class WorkflowRun {
   }
 
   private persistSnapshot(force = false): void {
+    this.snapshot.spentTokens = this.budgetView().spent;
+    this.snapshot.agentAttempts = this.launchedAgents;
     const now = this.now();
     if (!force && now - this.lastSnapshotAt < 1_000) return;
     this.lastSnapshotAt = now;
@@ -1028,8 +1249,15 @@ export class WorkflowRun {
 
   /** Token budget snapshot: shared state the script reads through `budget`. */
   budgetView(): { total: number | null; spent: number; remaining: number } {
-    let spent = 0;
-    for (const call of this.live.values()) spent += call.usage?.totalTokens ?? 0;
+    let spent = this.historicalSpent;
+    for (const call of this.live.values()) {
+      // Borrowed tokens were spent by the run that produced the answer: a
+      // replayed entry stays out of this budget, including after a resume of the
+      // run that borrowed it.
+      if (call.replayed) continue;
+      if (call.cached && !this.cachedUsageIsSpent) continue; // legacy journals
+      spent += call.usage?.totalTokens ?? 0;
+    }
     const total = this.snapshot.budgetTotal ?? null;
     return {
       total,
@@ -1122,15 +1350,8 @@ export class WorkflowManager {
   /**
    * Start a new run from script text.
    *
-   * If an earlier run of the *same* workflow with the *same args* exists, its
-   * journal seeds this run's cache: unchanged calls replay instantly and only
-   * edited calls actually execute. That is what makes iterating on a workflow
-   * cheap, and it is why resuming does not require the caller to remember a run
-   * id.
-   *
-   * `reuse: 'none'` opts out. Without it a re-run with different args would
-   * silently answer from the previous run — the opposite of the independent
-   * sample the caller asked for.
+   * Fresh unless reuse:auto explicitly asks for the latest same-name, same-args
+   * completed results. Resume continues one specific run instead.
    */
   async start(params: {
     source: string;
@@ -1140,8 +1361,10 @@ export class WorkflowManager {
   }): Promise<WorkflowRun> {
     const runId = newRunId();
     const parsed = parseScript(params.source, runId);
+    // Fresh by default: a start is a new run unless the caller explicitly asks
+    // for the previous answers with reuse: 'auto'.
     const predecessor =
-      params.reuse === "none" ? null : this.findResumablePredecessor(parsed.meta.name, params.args);
+      params.reuse === "auto" ? this.findResumablePredecessor(parsed.meta.name, params.args) : null;
     const run = new WorkflowRun(this.options, {
       runId,
       meta: parsed.meta,
@@ -1191,6 +1414,10 @@ export class WorkflowManager {
     }
     const source = edited ?? readFileSync(scriptFile, "utf8");
 
+    // Parse before taking the lock: a syntax error is an author mistake, and a
+    // lock taken before it would strand the run as permanently unresumable.
+    const parsed = parseScript(source, runId);
+
     const lock = acquireLock(runDir);
     if (!lock.ok) {
       throw new WorkflowScriptError(
@@ -1200,31 +1427,46 @@ export class WorkflowManager {
     }
 
     // An edited script is persisted so a second resume starts from the edit;
-    // the run's own snapshot records it too.
-    const parsed = parseScript(source, runId);
-    if (edited) writeFileSync(scriptFile, source, "utf8");
-    const { entries, skippedLines } = loadJournal(journalPath(runDir));
-    const cache = new Map<string, CachedCall>();
-    for (const [key, entry] of entries) {
-      if (entry.status !== "completed") continue;
-      cache.set(key, { value: entry.value, isNull: entry.valueIsNull, entry });
+    // the run's own snapshot records it too. Everything below holds the lock:
+    // it either ends in a running run that owns it (finish() releases it) or
+    // releases it in the catch. A failure in between must not strand the lock,
+    // or the same process could never resume this run again.
+    let skippedLines = 0;
+    let run: WorkflowRun;
+    try {
+      if (edited) writeFileSync(scriptFile, source, "utf8");
+      const journal = loadJournal(journalPath(runDir));
+      skippedLines = journal.skippedLines;
+      const cache = new Map<string, CachedCall>();
+      for (const [key, entry] of journal.entries) {
+        if (entry.status !== "completed") continue;
+        cache.set(key, { value: entry.value, isNull: entry.valueIsNull, entry });
+      }
+      const args = overrides && "args" in overrides ? overrides.args : snapshot.args;
+      run = new WorkflowRun(this.options, {
+        runId,
+        meta: snapshot.meta,
+        scriptSource: parsed.body,
+        source,
+        args,
+        seed: snapshot.seed,
+        startedAt: snapshot.startedAt,
+        cache,
+        lockPath: lock.path,
+        resumedFrom: snapshot.resumedFrom,
+        // A run's budget is part of what it is: resuming must not silently
+        // upgrade an unbounded run to one that stops, nor drop a ceiling.
+        budgetTotal: snapshot.budgetTotal ?? this.options.budgetTotal,
+        // The cache came from this run's own journal, so its tokens are already
+        // spent from this budget.
+        cachedUsageIsSpent: true,
+        priorSpent: Math.max(snapshot.spentTokens ?? 0, journal.records.reduce((total, entry) => total + (entry.replayed ? 0 : entry.attemptTokens ?? entry.usage?.totalTokens ?? 0), 0)),
+        priorAttempts: Math.max(snapshot.agentAttempts ?? 0, journal.records.filter(entry => !entry.replayed).length),
+      });
+    } catch (error) {
+      releaseLock(lock.path);
+      throw error;
     }
-    const args = overrides && "args" in overrides ? overrides.args : snapshot.args;
-    const run = new WorkflowRun(this.options, {
-      runId,
-      meta: snapshot.meta,
-      scriptSource: parsed.body,
-      source,
-      args,
-      seed: snapshot.seed,
-      startedAt: snapshot.startedAt,
-      cache,
-      lockPath: lock.path,
-      resumedFrom: snapshot.resumedFrom,
-      // A run's budget is part of what it is: resuming must not silently
-      // upgrade an unbounded run to one that stops, nor drop a ceiling.
-      budgetTotal: snapshot.budgetTotal ?? this.options.budgetTotal,
-    });
     if (skippedLines > 0) {
       run.note(`ignored ${skippedLines} incomplete journal line(s) from the previous run`);
     }
@@ -1350,6 +1592,12 @@ interface ParsedAgentArgs {
     model?: string;
     effort?: string;
     readOnly?: boolean;
+    /** Run this call in its own git worktree. */
+    isolation?: "worktree";
+    /** Extra attempts after the first one fails; 0 (the default) never retries. */
+    retries?: number;
+    /** Busy-time ceiling for one attempt; 0 (the default) uses the run's limit. */
+    stallTimeoutMs?: number;
   };
 }
 
@@ -1394,12 +1642,19 @@ function parseAgentArgs(raw: unknown): ParsedAgentArgs {
  * a typo like `schemas:` or `modle:` would otherwise be dropped in silence and
  * the call would run with defaults the author did not ask for.
  */
-const KNOWN_AGENT_OPTS = new Set(["prompt", "label", "phase", "schema", "agent", "agentType", "model", "effort", "readOnly"]);
+const KNOWN_AGENT_OPTS = new Set([
+  "prompt", "label", "phase", "schema", "agent", "agentType", "model", "effort", "readOnly",
+  "isolation", "retries", "stallTimeoutMs",
+]);
+
+/** Bounds for the opt-in retry policy; anything outside is an author mistake. */
+export const MAX_AGENT_RETRIES = 5;
+export const MIN_STALL_TIMEOUT_MS = 1_000;
+export const MAX_STALL_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 /** Options that exist in Claude Code but have no pi equivalent yet. */
 const UNSUPPORTED_AGENT_OPTS: Record<string, string> = {
-  isolation: "worktree isolation is not implemented in pi",
-  timeout: "per-call timeouts are not implemented in pi",
+  timeout: "use stallTimeoutMs for a per-call ceiling",
 };
 
 function normalizeOpts(record: Record<string, unknown>): ParsedAgentArgs["opts"] {
@@ -1407,6 +1662,33 @@ function normalizeOpts(record: Record<string, unknown>): ParsedAgentArgs["opts"]
   if (record.readOnly !== undefined) {
     if (typeof record.readOnly !== "boolean") throw new WorkflowScriptError("agent() readOnly must be a boolean.");
     opts.readOnly = record.readOnly;
+  }
+  if (record.isolation !== undefined) {
+    if (record.isolation !== "worktree") {
+      throw new WorkflowScriptError(
+        "agent() isolation must be \'worktree\' when set; got " + JSON.stringify(record.isolation) + ".",
+      );
+    }
+    opts.isolation = "worktree";
+  }
+  if (record.retries !== undefined) {
+    const retries = record.retries;
+    if (typeof retries !== "number" || !Number.isInteger(retries) || retries < 0 || retries > MAX_AGENT_RETRIES) {
+      throw new WorkflowScriptError(
+        "agent() retries must be an integer between 0 and " + MAX_AGENT_RETRIES + "; got " + JSON.stringify(retries) + ".",
+      );
+    }
+    opts.retries = retries;
+  }
+  if (record.stallTimeoutMs !== undefined) {
+    const stall = record.stallTimeoutMs;
+    if (typeof stall !== "number" || !Number.isFinite(stall) || stall < MIN_STALL_TIMEOUT_MS || stall > MAX_STALL_TIMEOUT_MS) {
+      throw new WorkflowScriptError(
+        "agent() stallTimeoutMs must be between " + MIN_STALL_TIMEOUT_MS + " and " + MAX_STALL_TIMEOUT_MS + " ms; got " +
+          JSON.stringify(stall) + ". Omit it to use the run's per-call ceiling.",
+      );
+    }
+    opts.stallTimeoutMs = stall;
   }
   if (typeof record.label === "string") opts.label = record.label;
   if (typeof record.phase === "string") opts.phase = record.phase;
@@ -1508,6 +1790,27 @@ function inferAgentType(
 ): string | undefined {
   if (allowed.includes(DEFAULT_WORKFLOW_AGENT)) return DEFAULT_WORKFLOW_AGENT;
   return allowed.find((name) => kindOf(name) !== "cli") ?? allowed[0];
+}
+
+function addUsage(previous?: WorkflowUsage, current?: WorkflowUsage): WorkflowUsage | undefined {
+  if (!previous && !current) return undefined;
+  const combined: WorkflowUsage = { ...previous, ...current };
+  for (const key of ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'totalTokens', 'cost'] as const) {
+    if (previous?.[key] !== undefined || current?.[key] !== undefined) combined[key] = (previous?.[key] ?? 0) + (current?.[key] ?? 0);
+  }
+  return combined;
+}
+
+function usageFromSession(path?: string): WorkflowUsage | undefined {
+  if (!path) return undefined;
+  let stats;
+  try { stats = summarizeSessionStats(path); } catch { return undefined; }
+  if (!stats) return undefined;
+  return {
+    ...(stats.model ? { model: stats.model } : {}), inputTokens: stats.inputTokens, outputTokens: stats.outputTokens,
+    cacheReadTokens: stats.cacheReadTokens, cacheWriteTokens: stats.cacheWriteTokens,
+    totalTokens: stats.inputTokens + stats.outputTokens, cost: stats.cost,
+  };
 }
 
 function readStructuredResult(path?: string): { value?: unknown; error?: string } | undefined {

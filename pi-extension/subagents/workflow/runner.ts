@@ -36,7 +36,8 @@ export const DEFAULT_LIMITS: ScriptLimits = {
  * so the authoring contract and the runtime cannot drift apart.
  */
 export const WORKFLOW_GLOBAL_DECLARATIONS = `declare function agent(prompt: string, opts?: {
-  label?: string; phase?: string; schema?: object; agent?: string; agentType?: string; model?: string; effort?: string; readOnly?: boolean;
+  label?: string; phase?: string; schema?: object; agent?: string; agentType?: string; model?: string; effort?: string; readOnly?: boolean; isolation?: 'worktree';
+  retries?: number; stallTimeoutMs?: number;
 }): Promise<any>;
 /** Run every thunk concurrently and resolve with their results (a barrier). Failures resolve to null. */
 declare function parallel(thunks: Array<() => Promise<any>>): Promise<any[]>;
@@ -44,7 +45,7 @@ declare function parallel(thunks: Array<() => Promise<any>>): Promise<any[]>;
 declare function pipeline(items: any[], ...stages: Array<(prev: any, item: any, index: number) => Promise<any>>): Promise<any[]>;
 declare function phase(title: string): Promise<void>;
 declare function log(message: string): Promise<void>;
-/** Reserved: nested workflows are not supported and this always throws. */
+/** Execute a saved child workflow under this run's cancellation and limits. */
 declare function workflow(name: string, args?: any): Promise<any>;
 /** The args value this run was started with. */
 declare const args: any;
@@ -147,7 +148,10 @@ const pipeline = (items, ...stages) => {
 };
 const phase = (title) => __wfBridgePhase(title);
 const log = (message) => __wfBridgeLog(message);
-const workflow = (name, runArgs) => __wfBridgeWorkflow({ name: name, args: runArgs });
+const workflow = (name, runArgs) => __wfBridgeWorkflow({ name: name, args: runArgs }).then(async (value) => {
+  await __wfRefreshBudget();
+  return value;
+});
 const args = __WF_ARGS__;
 const budget = {
   total: __wfBudgetState.total,

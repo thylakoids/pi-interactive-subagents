@@ -59,6 +59,9 @@ export interface SubagentPluginSurface {
   steer(running: RunningSubagent, message: string): Promise<{ ok: true } | { error: string }>;
   resolveRunning(name: string): { running: RunningSubagent } | { error: string };
   runningSubagents: Map<string, RunningSubagent>;
+  /** Shared with manual launches, including names whose panes are still opening. */
+  reservedNames?: Set<string>;
+  closeSurface?: (surface: string) => void;
   registerName(artifactDir: string, name: string, value: { sessionFile: string; sessionId?: string }): void;
   readNameRegistry(artifactDir: string): Record<string, { sessionFile: string; sessionId?: string }>;
   getArtifactDir(sessionDir: string, sessionId: string): string;
@@ -87,6 +90,15 @@ export interface SubagentPluginSurface {
  */
 export function createWorkflowSubagentService(surface: SubagentPluginSurface): WorkflowSubagentService {
   const watches = new Map<string, AbortController>();
+  const reserved = surface.reservedNames ?? new Set<string>();
+  const close = surface.closeSurface ?? closeSurfaceTree;
+  const takenNames = () => {
+    const names = new Set(reserved);
+    for (const running of surface.runningSubagents.values()) names.add(running.name);
+    const { sessionDir, sessionId } = surface.sessionSnapshot();
+    for (const name of Object.keys(surface.readNameRegistry(surface.getArtifactDir(sessionDir, sessionId)))) names.add(name);
+    return names;
+  };
 
   return {
     isAvailable() {
@@ -105,82 +117,94 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       };
     },
 
-    takenNames() {
-      const names = new Set<string>();
-      for (const running of surface.runningSubagents.values()) names.add(running.name);
-      const { sessionDir, sessionId } = surface.sessionSnapshot();
-      for (const name of Object.keys(surface.readNameRegistry(surface.getArtifactDir(sessionDir, sessionId)))) {
-        names.add(name);
-      }
-      return names;
-    },
+    takenNames,
 
     async spawn(request: WorkflowSubagentRequest): Promise<WorkflowSubagentHandle> {
-      const snapshot = surface.sessionSnapshot();
-      const extraEnv: Record<string, string> = {};
-      if (request.schemaFile) extraEnv.PI_SUBAGENT_SCHEMA_FILE = request.schemaFile;
-      if (request.resultFile) extraEnv.PI_SUBAGENT_RESULT_FILE = request.resultFile;
+      if (takenNames().has(request.name)) throw new Error('Subagent name is already in use: ' + request.name);
+      // Claim before the first await. Other workflows and the manual tool must
+      // see the same pending name, not just launches already in the registry.
+      reserved.add(request.name);
+      let ownedRunning: RunningSubagent | undefined;
+      try {
+        const snapshot = surface.sessionSnapshot();
+        const extraEnv: Record<string, string> = {};
+        if (request.schemaFile) extraEnv.PI_SUBAGENT_SCHEMA_FILE = request.schemaFile;
+        if (request.resultFile) extraEnv.PI_SUBAGENT_RESULT_FILE = request.resultFile;
 
-      const extraExtensions = [...(request.extraExtensions ?? [])];
-      if (request.schemaFile && !extraExtensions.includes(STRUCTURED_OUTPUT_EXTENSION)) {
-        extraExtensions.push(STRUCTURED_OUTPUT_EXTENSION);
-      }
+        const extraExtensions = [...(request.extraExtensions ?? [])];
+        if (request.schemaFile && !extraExtensions.includes(STRUCTURED_OUTPUT_EXTENSION)) {
+          extraExtensions.push(STRUCTURED_OUTPUT_EXTENSION);
+        }
 
-      const running = await surface.launch(
-        {
-          agent: request.agentType,
-          task: request.task,
-          name: request.name,
-          ...(request.model ? { model: request.model } : {}),
-          ...(request.cwd ? { cwd: request.cwd } : {}),
-        },
-        {
-          sessionManager: {
-            getSessionFile: () => snapshot.sessionFile,
-            getSessionId: () => snapshot.sessionId,
-            getSessionDir: () => snapshot.sessionDir,
+        const running = await surface.launch(
+          {
+            agent: request.agentType,
+            task: request.task,
+            name: request.name,
+            ...(request.model ? { model: request.model } : {}),
+            ...(request.cwd ? { cwd: request.cwd } : {}),
           },
-          cwd: surface.cwd(),
-        },
-        {
-          extraExtensions,
-          extraEnv,
-          // Effort rides the internal channel: it applies to whichever model
-          // the definition pins, so combining it with a model here would need
-          // that model first.
-          ...(request.effort ? { thinking: request.effort } : {}),
-          // A workflow child is read by a program and watched by nobody: its
-          // final message is data, and it must end on its own.
-          workflow: true,
-          ...(request.readOnly ? { readOnly: true } : {}),
-          outputIsData: true,
-          nonInteractive: true,
-          ...(request.signal ? { signal: request.signal } : {}),
-        },
-      );
+          {
+            sessionManager: {
+              getSessionFile: () => snapshot.sessionFile,
+              getSessionId: () => snapshot.sessionId,
+              getSessionDir: () => snapshot.sessionDir,
+            },
+            cwd: surface.cwd(),
+          },
+          {
+            extraExtensions,
+            extraEnv,
+            // Effort rides the internal channel: it applies to whichever model
+            // the definition pins, so combining it with a model here would need
+            // that model first.
+            ...(request.effort ? { thinking: request.effort } : {}),
+            // A workflow child is read by a program and watched by nobody: its
+            // final message is data, and it must end on its own.
+            workflow: true,
+            ...(request.readOnly ? { readOnly: true } : {}),
+            outputIsData: true,
+            nonInteractive: true,
+            ...(request.signal ? { signal: request.signal } : {}),
+          },
+        );
 
-      surface.registerName(surface.getArtifactDir(snapshot.sessionDir, snapshot.sessionId), running.name, {
-        sessionFile: running.sessionFile,
-        sessionId: getSessionId(running.sessionFile) ?? undefined,
-      });
-      surface.startWidgetRefresh();
-
-      const controller = new AbortController();
-      watches.set(running.id, controller);
-      running.abortController = controller;
-      const completion = surface
-        .watch(running, controller.signal)
-        .then((result) => toCompletion(result))
-        .finally(() => {
-          watches.delete(running.id);
+        ownedRunning = running;
+        surface.registerName(surface.getArtifactDir(snapshot.sessionDir, snapshot.sessionId), running.name, {
+          sessionFile: running.sessionFile,
+          sessionId: getSessionId(running.sessionFile) ?? undefined,
         });
+        surface.startWidgetRefresh();
 
-      return {
-        id: running.id,
-        name: running.name,
-        sessionFile: running.sessionFile,
-        completion,
-      };
+        const controller = new AbortController();
+        watches.set(running.id, controller);
+        running.abortController = controller;
+        const completion = surface
+          .watch(running, controller.signal)
+          .then((result) => toCompletion(result))
+          .finally(() => {
+            watches.delete(running.id);
+          });
+
+        return {
+          id: running.id,
+          name: running.name,
+          sessionFile: running.sessionFile,
+          completion,
+        };
+      } catch (error) {
+        if (ownedRunning) {
+          watches.get(ownedRunning.id)?.abort();
+          watches.delete(ownedRunning.id);
+          try { close(ownedRunning.surface); } catch { /* only the failed launch's owned surface */ }
+          if (surface.runningSubagents.get(ownedRunning.id) === ownedRunning) {
+            surface.runningSubagents.delete(ownedRunning.id);
+          }
+        }
+        throw error;
+      } finally {
+        reserved.delete(request.name);
+      }
     },
 
     async steer(name: string, message: string) {
@@ -198,7 +222,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       try { writeFileSync(`${resolved.running.sessionFile}.workflow-aborted`, "aborted"); } catch {}
       try { unlinkSync(`${resolved.running.sessionFile}.ask`); } catch {}
       try {
-        closeSurfaceTree(resolved.running.surface);
+        close(resolved.running.surface);
       } catch {
         // Pane already gone.
       }

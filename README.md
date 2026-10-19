@@ -123,11 +123,12 @@ const reviews = await pipeline(REVIEWERS,
   `verify-claims` adversarial voting, `deep-research` a full search/fetch/verify/synthesis
   chain, and `iterative-refinement` bounded budget-aware iteration. Project and global
   scripts override bundled templates of the same name.
-- **Deterministic replay.** Calls are journaled by content hash — label, prompt, schema, agent,
-  model and effort — so re-running the same script with the same args replays finished calls
-  instead of redoing them, and editing a call re-runs exactly that call. Three identical calls
+- **Deterministic replay.** Calls are journaled by content hash — prompt, schema, agent,
+  model, effort, permissions and isolation — so resume replays finished calls, while
+  editing a label does not repeat their side effects. Three identical calls
   are three calls, not one replayed three times. `workflow({ action: "resume", runId })` picks
-  up an interrupted run; `reuse: "none"` forces every call to run again.
+  up an interrupted run. Start runs fresh by default; explicit `reuse: "auto"` opts into
+  replay from the latest same-name, same-args run without charging its historical usage.
 - **Nothing fails quietly.** A dead agent resolves to `null` for that call only — as it does in
   Claude Code — while a malformed one (unknown agent, misspelled option, unsatisfiable schema)
   fails the run before it spends anything. The settled report names every call that came back
@@ -145,7 +146,7 @@ const reviews = await pipeline(REVIEWERS,
   once when the run settles. The main context never holds the intermediate results.
 
 Scripts see `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget` and
-`workflow` (nested workflows are currently unsupported). There is no filesystem, network
+`workflow` (saved child scripts share parent cancellation and limits). There is no filesystem, network
 or timer access. `Date.now()` and parameterless `new Date()` stay fixed at the persisted
 run start; `performance.now()` stays zero. `Math.random()` is seeded, but concurrent
 branches can consume it in different orders: do not use shared randomness for call keys.

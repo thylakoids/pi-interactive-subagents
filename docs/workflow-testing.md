@@ -6,12 +6,12 @@ Run these against one frozen checkout, after all writers have handed off:
 npm test
 node test/mutations/workflow.mjs
 PI_TEST_MODEL=provider/model npm run test:integration
-PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts
+PI_WORKFLOW_LIVE=1 PI_WORKFLOW_REVIEW_LIVE=1 PI_TEST_MODEL=provider/model node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts
 ```
 
 Run the integration commands inside tmux; otherwise the legacy lifecycle and
 surface suites skip. They require configured provider credentials and
-make billed model calls. The three workflow live suites are otherwise skipped.
+make billed model calls. The four workflow live suites are otherwise skipped.
 Test agent definitions inherit the selected parent model; they must not pin a
 different provider behind `PI_TEST_MODEL`.
 `PI_TEST_PI` can select an absolute Pi executable. Test launchers remove npm's
@@ -39,6 +39,10 @@ the package's peer Pi binary for the user's installed runtime.
   read-only mounts alone do not prevent on Linux.
   It also aborts after a real verification command has started and checks the
   command's process group, not just the disappearance of its tmux pane.
+- The review live suite checks fresh starts, explicit reuse, disk resume after
+  borrowing cached calls, label-only edits, free-form structured objects, real
+  isolated writes, nested scripts/depth errors, default-no-retry and opt-in
+  stall recovery. It requires all feature probes, not optional subtest gates.
 - Sandbox lifecycle regressions kill an actual owning process while its command
   is running; direct AbortSignal tests alone cannot prove parent-death cleanup.
 - A prompt echoed on screen is not evidence of a tool call. Missing session
@@ -47,6 +51,35 @@ the package's peer Pi binary for the user's installed runtime.
 Keep full logs and exit codes. Do not pipe a test command into `tail` and report
 the pipeline's exit status as the test result. A failed or interrupted run is
 not validation of the final tree; fix it and rerun the affected suite.
+
+## Review regressions: test the boundaries, not just the stubs
+
+The issue review exposed gaps in the old coverage, not merely missing happy-path
+examples. Scripted subagents returned valid values and successful launches, so
+they could not expose a filesystem exception before spawn, a failing journal
+write, a pending name collision, or a real provider rejecting a nested schema.
+Tests for cache replay did not distinguish a new run's budget from a resumed
+run's lifetime spend, and treated display labels as part of execution identity.
+
+- Launch regressions fault the actual call directory and journal, bound the
+  wait, assert the script proceeds, and check no unhandled rejection escapes.
+- Reservation regressions hold a launch at an observed gate and use the real
+  manual naming function; live probes also check the production adapter shares
+  the same pending-name set before the child is registered.
+- Schema regressions validate the registered tool's parameters, invoke execute,
+  and check the bytes written. The parent independently validates sidecars;
+  merely creating a result file is not proof of a valid structured answer.
+- Cache regressions reload the manager from disk, rename labels, preserve
+  independent repeated samples, and exercise old journal keys. Fresh starts,
+  explicit cross-run reuse, and same-run resume have separate spend assertions.
+- Worktree regressions use real Git repositories and compare the parent dirty
+  state before/after; mock cwd propagation alone cannot prove isolation or
+  preservation of untracked work and commits.
+
+Mutation checks deliberately restore selected old faults and require a
+behavioral assertion failure. A green count alone does not show sensitivity;
+inspect what action occurred, what observable state changed, and what would
+make each assertion fail.
 
 The bundled code-review and migration verification steps now enforce readOnly
 at runtime, not just through prompts. Sandboxed commands require a verified backend - macOS `sandbox-exec`, or
@@ -63,7 +96,7 @@ credible on a real Linux kernel with unprivileged user namespaces. The image in
 
 ```sh
 PI_TEST_MODEL=provider/model test/linux/run              # build if needed, run everything
-PI_TEST_MODEL=provider/model test/linux/run --suite live  # the three billed suites only
+PI_TEST_MODEL=provider/model test/linux/run --suite live  # the four billed suites only
 test/linux/run --suite unit                               # no model needed
 test/linux/run --rebuild --suite-timeout 7200
 ```

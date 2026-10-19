@@ -25,6 +25,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  closeSurfaceTree,
   shellEscape,
   currentTree,
   startSurfaceProcess,
@@ -1218,6 +1219,13 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   return `${base}-${n}`;
 }
 
+function reserveRunningName(base: string, registryNames: Set<string>, exact = false): string {
+  const name = uniqueRunningName(base, registryNames);
+  if (exact && name !== base) throw new Error(`Subagent name is already in use: ${base}`);
+  reservedNames.add(name);
+  return name;
+}
+
 function resolveRunningByName(name: string):
   | { running: RunningSubagent }
   | { error: string } {
@@ -1392,6 +1400,7 @@ export const __test__ = {
   getToolExtensionPath,
   resolveRunningByName,
   uniqueRunningName,
+  reserveRunningName,
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
@@ -2172,13 +2181,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // every name already in the registry — so names stay unique across the
         // whole session, running or finished. Reserve the chosen name
         // synchronously (before any await) so parallel spawns don't collide.
-        let reservedName: string | null = null;
-        if (!params.name?.trim()) {
-          const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
-        }
+        const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+        const explicitName = params.name?.trim();
+        const reservedName = reserveRunningName(explicitName || params.agent, registryNames, Boolean(explicitName));
+        params.name = reservedName;
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
@@ -2723,6 +2729,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       steer: steerSubagent,
       resolveRunning: resolveRunningByName,
       runningSubagents,
+      reservedNames,
+      closeSurface: closeSurfaceTree,
       registerName,
       readNameRegistry,
       getArtifactDir,

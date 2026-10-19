@@ -607,11 +607,11 @@ return await agent('scan', { label: 'scan' });
     assert.equal(first.status, "completed", first.error);
     const afterFirst = service.spawns.length;
 
-    const sameArgs = await (await manager.start({ source: script, args: { target: "a" } })).execute();
+    const sameArgs = await (await manager.start({ source: script, args: { target: "a" }, reuse: "auto" })).execute();
     assert.equal(service.spawns.length, afterFirst, "the same args still reuse completed calls");
     assert.equal(sameArgs.resumedFrom, first.runId);
 
-    const newArgs = await (await manager.start({ source: script, args: { target: "b" } })).execute();
+    const newArgs = await (await manager.start({ source: script, args: { target: "b" }, reuse: "auto" })).execute();
     assert.equal(service.spawns.length, afterFirst + 1, "different args must run for real");
     assert.equal(newArgs.resumedFrom, undefined);
 
@@ -655,7 +655,7 @@ return one;
 
     const edited = SCRIPT.replace("agent('summary-a'", "agent('summary-a-edited'");
     const rerunCount = service.spawns.length;
-    const second = await manager.start({ source: edited, args: {} });
+    const second = await manager.start({ source: edited, args: {}, reuse: 'auto' });
     const secondView = await second.execute();
 
     const newSpawns = service.spawns.slice(rerunCount);
@@ -702,7 +702,7 @@ return { results, direct };
     service.structured.set("analyse", { verdict: "real", confidence: 0.9 });
     const manager = createManager();
     const script = `export const meta = { name: 'schema-flow', description: 'x' }
-const out = await agent('analyse this', { label: 'analyse', schema: { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] } });
+const out = await agent('analyse this', { label: 'analyse', schema: { type: 'object', properties: { verdict: { type: 'string' }, confidence: { type: 'number' } }, required: ['verdict'] } });
 return out;
 `;
     const run = await manager.start({ source: script, args: {} });
@@ -1412,7 +1412,7 @@ return await agent('scan', { label: 'scan' });
     rename(first, "wf-zzzzzz000001");
     rename(second, "wf-aaaaaa000002");
 
-    const third = await (await manager.start({ source: script, args: {} })).execute();
+    const third = await (await manager.start({ source: script, args: {}, reuse: "auto" })).execute();
     assert.equal(third.status, "completed", third.error);
     assert.equal(third.resumedFrom, "wf-aaaaaa000002", "the newest run is the one to replay");
     assert.equal(third.result, "new-answer");
@@ -1695,16 +1695,16 @@ return 'ok';
     assert.equal(service.spawns.length, 0, "a typo must not reach the scheduler");
   });
 
-  it("names worktree isolation as unsupported rather than ignoring it", async () => {
+  it("rejects an invalid worktree isolation option rather than ignoring it", async () => {
     service = new FakeSubagentService();
     const manager = createManager();
     const script = `export const meta = { name: 'isolation', description: 'x' }
-await agent('one', { label: 'one', isolation: 'worktree' });
+await agent('one', { label: 'one', isolation: 'unknown' });
 return 'ok';
 `;
     const view = await (await manager.start({ source: script, args: {} })).execute();
     assert.equal(view.status, "failed");
-    assert.match(String(view.error), /isolation.*not implemented/);
+    assert.match(String(view.error), /isolation.*worktree/);
   });
 
   it("rejects an unsatisfiable schema before spending a model call", async () => {

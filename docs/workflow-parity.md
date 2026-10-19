@@ -4,7 +4,7 @@
 
 ## 1. 调查方法与证据来源
 
-- 对象：`/Users/liyulong/.local/share/claude/versions/2.1.299`（Mach-O arm64 可执行文件，247,931,696 字节，sha256 前缀 `ba5ab7b8`）。
+- 对象：本机安装的 Claude Code 2.1.299 可执行文件（以下以 `$CLAUDE_BINARY` 指代）（Mach-O arm64 可执行文件，247,931,696 字节，sha256 前缀 `ba5ab7b8`）。
 - 该二进制由 Bun 编译，整个 JS bundle 以明文形式嵌在可执行文件里：模块源码带 `// @bun @bytecode` 头，虚拟文件表里有 2,649 条 `file:///$bunfs/root/chunk-*.js` 路径。用 `grep -a -b -o` 定位字节偏移，再用 `tail -c +偏移 | head -c 长度` 切片即可取出原文；无需反编译，也没有件是压缩或混淆到不可读的。
 - 只读操作：先复制一份二进制副本，所有 grep/切片都在副本上做，原文件未被改动（复制后 `cmp` 一致）。
 - 没有可用的源码仓库。下文第 2 节的全部结论来自该二进制内嵌的文本与代码；引号内的英文句子是二进制文本原文（源码里的转义序列 `—` 等已还原成字符），并已标明出处性质。第 3 节起为本仓库源码（相对路径）。
@@ -99,9 +99,9 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 ### 3.5 journal 与 resume
 
-`journal.ts` 每个 run 一份 `journal.jsonl`，一行一次调用，键是内容哈希 `callKey = sha256(kind \0 label \0 agent \0 model \0 effort \0 prompt \0 schema)` 前 24 位（与完成顺序无关，乱序完成也能在 resume 时对上）；同一份内容在一次 run 里第 N 次出现会带上序号（`<hash>-1`、`-2`…），所以三个一模一样的 refuter 是三个调用而不是一个。model/effort 进键是必要的：把验证阶段换成强模型必须真的重跑，而不是把便宜模型的答案换个标签重放。条目在结果落定之后、交给脚本之前追加并落盘；解析失败的行只计数丢弃（只有最后一行可能残缺）。run 目录另有 `script.js`（原文）、`snapshot.json`（meta/args/seed/startedAt/status/result）、`output.json`、`lock`（`openSync wx`，持有者进程已死、或空锁超过 5 秒则回收）。
+`journal.ts` 每个 run 一份 `journal.jsonl`，一行一次调用，键是内容哈希 `callKey = sha256(v2 \0 kind \0 agent \0 model \0 effort \0 prompt \0 schema \0 readOnly \0 isolation)` 前 24 位（与完成顺序无关，乱序完成也能在 resume 时对上）；同一份内容在一次 run 里第 N 次出现会带上序号（`<hash>-1`、`-2`…），所以三个一模一样的 refuter 是三个调用而不是一个。model/effort 进键是必要的：把验证阶段换成强模型必须真的重跑，而不是把便宜模型的答案换个标签重放。条目在结果落定之后、交给脚本之前追加并落盘；解析失败的行只计数丢弃（只有最后一行可能残缺）。run 目录另有 `script.js`（原文）、`snapshot.json`（meta/args/seed/startedAt/status/result）、`output.json`、`lock`（`openSync wx`，持有者进程已死、或空锁超过 5 秒则回收）。
 
-- `start`：新建 run 时自动找同名工作流、**且 args 相同**的最近一次可复用 run，把其中所有 `completed` 条目按 callKey 注入缓存——未改动的调用直接回放，并记一条日志说明复用了几个调用；`reuse: 'none'` 关掉它。要求 args 相同是因为 args 不在键里：参数变了还复用，等于拿上一次的答案回答新问题。
+- `start`：默认全新执行；只有显式 `reuse: 'auto'` 才找同名工作流、**且 args 相同**的最近一次可复用 run，把其中 `completed` 条目按 callKey 注入缓存。新 run 不重复计算历史用量。要求 args 相同是因为 args 不在键里：参数变了还复用，等于拿上一次的答案回答新问题。
 - `resume`：从磁盘读 snapshot 与 journal，重建缓存后重跑脚本；只回放 `completed`，失败/跳过/中止不回放（重试要真的重试）；拒绝仍在跑的 run（有锁或进程内未结束）。因此 resume 可以跨进程。可以传 `args` 覆盖、传 `script` 换上改过的脚本（写回 run 目录，下次 resume 继续用），预算沿用快照。
 - 与 Claude Code 的差别：回放不按“最长不变量前缀”，而是按调用的内容键全局命中；脚本本身仍是整段重新执行，只是已完成的 `agent()` 在宿主侧回放。
 
@@ -109,7 +109,7 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 `budget.total` 来自 `PI_WORKFLOW_TOKEN_BUDGET`（manager 选项或 start 参数），默认 `null`；`spent()` 累加本次 run 各调用的 `usage.totalTokens`；`remaining()` 在 `total === null` 时返回 `Infinity`。
 
-`spent()` / `remaining()` 返回**同步数字**（不是 Promise），并且在每次 `agent()` 结束后由 prelude 刷新——`while (budget.total && budget.remaining() > 50_000)` 这种写法必须真的能比较。超限有中止路径：下一个 `agent()` 抛 `WorkflowBudgetExceededError`，run 失败（不是只拒绝那一次调用——那样 `parallel` 会把异常吞成 `null`，循环继续跑到墙钟）。单位是子代理的**总** token（输入+输出）；CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。
+`spent()` / `remaining()` 返回**同步数字**（不是 Promise），并且在每次 `agent()` 结束后由 prelude 刷新——`while (budget.total && budget.remaining() > 50_000)` 这种写法必须真的能比较。超限有中止路径：下一个 `agent()` 抛 `WorkflowBudgetExceededError`，run 失败（不是只拒绝那一次调用——那样 `parallel` 会把异常吞成 `null`，循环继续跑到墙钟）。单位是子代理的**未缓存输入 + 输出** token，cacheRead/cacheWrite 单列，不等于货币费用；CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。
 
 ### 3.7 通知与可观测性
 
@@ -128,15 +128,15 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 | 行为 | Claude Code | 本实现 | 差异说明 |
 |---|---|---|---|
 | 脚本语言与 meta | 纯 JS（非 TS）；`export const meta = {name, description, phases:[{title, detail?}], whenToUse?, ...}`（纯字面量） | 纯 JS；`export const meta = {name, description, phases: Array<string \| {title, detail?, model?}>, whenToUse?, agent?}`（纯 JSON 字面量，`export` 被改写为 `const`） | phases 两种写法都接受；本实现多一个默认 agent 字段；`list` 展示 `whenToUse`；校验方式不同（JSON 字面量解析 vs 专用 validator） |
-| `agent()` 参数 | label、phase、schema、model、effort、isolation:`worktree`、agentType | label、phase、schema、agent / agentType（同名）、model、effort | 本实现无 worktree 隔离（传 `isolation` 明确报“未实现”，不静默忽略）；`effort` 与 `model` 分开下传，因此 `{ effort: 'low' }` 单独可用；未知选项一律报错 |
+| `agent()` 参数 | label、phase、schema、model、effort、isolation:`worktree`、agentType | label、phase、schema、agent / agentType（同名）、model、effort、readOnly、isolation:worktree | worktree 保留 edits/commits，不自动 merge/reset；`effort` 与 `model` 分开下传，因此 `{ effort: 'low' }` 单独可用；未知选项一律报错 |
 | parallel / pipeline | 宿主提供的原语；pipeline 无 barrier、抛错项变 null；文档默认 pipeline | 同一语义，在脚本 prelude 内实现（纯 Promise 编排），`agent()` 是唯一跨宿主调用 | 语义一致，实现位置不同；两边都把 pipeline 作为默认写法 |
-| 结构化输出 | 强制调用 `StructuredOutput` 工具，ajv 在工具层校验并在不匹配时重试；`agent()` 返回校验后的对象 | 子代理加载 `structured-output` 扩展，把结果写入 sidecar `result.json`；JSON Schema 子集转 TypeBox | 本实现没有 ajv 级全量校验与“模型重试纠正”；缺结果/写失败时该次调用记为 failed；schema 转换有损（未覆盖的类型退化为 Unknown） |
-| journal 与 resume | journal.jsonl；resume 按“最长不变量前缀”回放；仅同会话，需显式 `resumeFromRunId`；无 journal 时手工续写 | journal.jsonl；按键回放（键含 label/prompt/schema/agent/model/effort + 出现次序）；磁盘 journal + 锁，可跨进程 resume；`start` 在同名**且同 args** 时复用上一次的 completed 条目 | 回放粒度不同（前缀 vs 键）；本实现多出跨进程 resume 与隐式复用，并可 `reuse:'none'` 关掉；相同内容的多次调用不再折叠成一个 |
+| 结构化输出 | 强制调用 `StructuredOutput` 工具，ajv 在工具层校验并在不匹配时重试；`agent()` 返回校验后的对象 | 子代理加载 `structured-output` 扩展，把结果写入 sidecar `result.json`；JSON Schema 子集转 TypeBox | 本实现没有 ajv 级全量校验与“模型重试纠正”；缺结果/写失败时该次调用记为 failed；子/父两层使用同一转换器校验；未声明 properties 的嵌套对象自由，显式 additionalProperties 生效，仍不是全量 JSON Schema |
+| journal 与 resume | journal.jsonl；resume 按“最长不变量前缀”回放；仅同会话，需显式 `resumeFromRunId`；无 journal 时手工续写 | journal.jsonl；按键回放（键含 prompt/schema/agent/model/effort/readOnly/isolation + 出现次序，label 仅展示）；磁盘 journal + 锁，可跨进程 resume；`start` 仅显式 `reuse:auto` 且同名同 args 时复用 | 回放粒度不同（前缀 vs 键）；本实现支持跨进程 resume 与显式可选的跨 run 复用；相同内容的多次调用不再折叠成一个 |
 | 并发上限 | `min(16, max(2, CPUs-2))`；`CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` 可覆盖 | 同一公式；`PI_WORKFLOW_MAX_CONCURRENT_AGENTS` 可覆盖（也认 CC 那个变量名） | 数值一致，覆盖口也一致 |
 | 单次 items 上限 | 单个 parallel/pipeline 最多 4,096 项，超出显式报错 | `MAX_ITEMS_PER_BATCH = 4096`，由 prelude 中的 `__wfCheckBatch` 在调用前校验并抛错 | 数值一致；报错文案不同 |
 | agent 总数上限 | 生命周期 1,000（`WorkflowAgentCapError`，附预算循环提示） | `MAX_AGENTS_PER_RUN = 1000`，按**实际启动次数**计，超出抛 `WorkflowLimitError`，run 失败 | 数值一致；本实现按启动次数而不是去重后的键数，否则反复发同一个调用的死循环撞不到上限 |
-| 嵌套 | 允许一层：子工作流里再调 `workflow()` 才抛错 | 未实现：`workflow()` 桥接直接抛错（“nested workflows are not supported by this build yet”） | 本实现是 0 层 |
-| 预算 | 来自用户 “+500k” 指令的共享池；硬上限，超限抛 `WorkflowBudgetExceededError` | `budget.total` 来自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 null）；`spent()`/`remaining()` 是**同步数字**、每次 `agent()` 后刷新；超限让 run 失败 | 本实现没有可共享的按轮预算池；单位是总 token（输入+输出）而非输出 token；同样强制中止 |
+| 嵌套 | 允许一层：子工作流里再调 `workflow()` 才抛错 | 一层已保存子脚本；共享父 run 的调度、预算、取消与 journal | 子脚本也运行在隔离 VM 中，最多 64 次 child 调用 / 16 个并发 child VM |
+| 预算 | 来自用户 “+500k” 指令的共享池；硬上限，超限抛 `WorkflowBudgetExceededError` | `budget.total` 来自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 null）；`spent()`/`remaining()` 是**同步数字**、每次 `agent()` 后刷新；超限让 run 失败 | 本实现没有可共享的按轮预算池；单位是未缓存输入+输出 token，缓存读取单列而不重复计入；同样强制中止 |
 | 取消 / 跳过 | 跳过 → `null`；死掉的 agent → `null`；kill/pause + 恢复提示；用量限额自动暂停等待 | 跳过 → `null`；**失败/死掉的 agent → `null`**（记 failed，面板显示错误，落定消息按名字列出）；参数写错则整 run 失败；abort 停止运行中 agent 并中止 VM；无暂停态 | 失败语义已对齐 CC；本实现无 rate-limit 暂停与 pause 恢复，多出逐 agent 的交互干预 |
 | 通知 | `<task-notification>` XML（task-id/status/summary/recovery/diagnostics/usage 等）+ “Dynamic workflow … completed/failed/was stopped” | `pi.sendMessage` 自定义消息（customType `workflow_result`），纯文本：状态、完成数、tokens、错误、按名字列出没有返回值的调用、run/script/journal 路径与各 agent 的 session 文件、查看/恢复提示；结果 JSON 截断到 4,000 字符并标出 output.json | 传输方式与结构不同；本实现也点名了每个“空结果”的调用，而不是只给计数 |
 | 可观测性 | `/workflows` 进度页、task 进度事件（phase/log/agent 状态）、transcript 目录与 journal；子代理无交互面板 | Subagents 框附 workflow 摘要；`/workflow` 与快捷键打开居中树形面板，按 workflow/phase/call/action 导航，可 Focus/Skip/Abort/Resume，磁盘旧 run 也能打开；交互直接在真实 tmux pane 中进行 | 本实现的可观测性与可操作性更强（正是本插件的取舍：更重、可看可接管） |
@@ -144,13 +144,13 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 
 ## 5. 已知差异与后续工作
 
-- **嵌套未实现**：prelude 与工具描述声明了 `workflow(name, args)`，桥接层直接抛错，工具描述里已明说“声明了但总是抛错，请内联”。要么实现子 run（复用 manager、共享并发与计数），要么彻底从全局声明里去掉。
-- **逐次调用超时**：`timeoutMs` 已从脚本 API 中移除（它此前只被解析、从未下传），调用粒度的超时由子代理自身的重试/卡住状态与整体 `scriptTimeoutMs` 兜底；传进来会被当作未知选项报错，而不是静默丢弃。
-- **预算强制但单位自定**：`PI_WORKFLOW_TOKEN_BUDGET` 超限会让 run 失败。单位是子代理的**总** token（输入+输出），不是 CC 的输出 token——CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。差异是刻意的，已写进 `docs/workflow.md`。
+- **嵌套一层**：`workflow(name, args)` 从项目、全局或随包脚本解析，首次执行保存源副本以便恢复。child 不占 agent 并发槽；其 agent 共享父预算、并发和取消，不会因单槽等待造成死锁。child 再嵌套会报错。
+- **显式重试与逐次上限**：`retries` 默认 0，仅显式 0..5 允许失败后额外尝试；`stallTimeoutMs` 控制单次尝试的活跃时间，不是 token 进展检测。等待提问按独立等待时限处理；Abort/Skip 不重试。重试保留同一 worktree，可能重复副作用；历史尝试计入预算。旧 `timeoutMs` 仍拒绝，避免静默忽略。
+- **预算强制但单位自定**：`PI_WORKFLOW_TOKEN_BUDGET` 超限会让 run 失败。单位是子代理的**未缓存输入 + 输出** token，cacheRead/cacheWrite 单列，不等于货币费用，不是 CC 的输出 token——CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。差异是刻意的，已写进 `docs/workflow.md`。
 - **resume 语义与 CC 不同**：本实现按键全局回放，脚本若有文本之外的副作用（写文件、外部状态），回放的等价性与 CC 的“前缀”模型不同。这是刻意的取舍（按键回放才能跨进程 resume），已文档化；键里现在包含 model/effort 与出现次序。
 - **无用量限额暂停**：CC 在 rate limit 时暂停工作流、限额恢复后重跑等待中的 agent；本实现下这是一次普通失败（子代理内部的自动重试不受影响）。**在 pi 里做不到**：`WorkflowSubagentCompletion` 只暴露 exitCode/summary/error/usage，没有限额信号，得先把信号从子会话里传出来。
 - **内置模板与运行前审批**：CC 有特殊内置 `deep-research` 和展示阶段/权限的运行前对话框；本实现有六个普通、可覆盖的随包脚本，没有独立的内置执行特权或启动前审批。模板使用既有 agent allowlist 与子代理权限模型，`deep-research` 还要求可用的 `researcher` 类 agent。
-- **无 worktree 隔离**：并行改文件的 agent 会互相踩；CC 的 `isolation:'worktree'` 没有对应实现。传 `isolation` 会被明确拒绝（“未实现”），而不是静默忽略。
+- **worktree 保留而非自动整合**：`isolation:'worktree'` 从 committed HEAD 创建 detached worktree；不复制主工作区未提交状态。取消/恢复保留修改与提交，不自动 merge/reset/clean，不是敌对代码安全容器。
 - **指导仍是启发式而非固定场景表**：六种形状、默认 pipeline、schema 条件和规模建议降低选择空间，但模型仍可能在明确不适用的任务上误用 workflow；opt-in 门槛、实际输入约束和测试中的模板契约用于限制这一点。
 
 ## 如何自行复核

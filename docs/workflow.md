@@ -64,18 +64,18 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 | 全局 | 签名 | 说明 |
 | --- | --- | --- |
-| `agent` | `agent(prompt, opts?)` → `Promise` | 启动一个交互式子代理。`opts`：`label`（面板行标题，也参与恢复键）、`phase`（阶段归属）、`schema`（结构化结果）、`agent` / `agentType`（子代理类型，两个名字等价）、`model`（模型覆盖）、`effort`（思考强度，取值 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）。不认识的选项会在启动任何子代理之前报错——拼错的 `schemas:` 不会静默变成“用默认值跑”。 |
+| `agent` | `agent(prompt, opts?)` → `Promise` | 启动一个交互式子代理。`opts`：`label`（仅面板行标题，不参与恢复键）、`phase`（阶段归属）、`schema`（结构化结果）、`agent` / `agentType`（子代理类型，两个名字等价）、`model`（模型覆盖）、`effort`（思考强度，取值 `off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`）。不认识的选项会在启动任何子代理之前报错——拼错的 `schemas:` 不会静默变成“用默认值跑”。 |
 | `parallel` | `parallel(thunks)` → `Promise` | 并发跑一组 `() => Promise`，全部结束后统一返回（barrier）。失败的项返回 `null`，不影响其他项。 |
 | `pipeline` | `pipeline(items, ...stages)` → `Promise` | 每个 item 独立依次走完所有 stage，stage 之间没有 barrier——快的 item 可以先进入下一阶段。stage 签名 `(prev, item, index)`（第一个 stage 的 `prev` 就是 item），返回值传给下一个 stage。任一步失败，该 item 整体为 `null`。 |
 | `phase` | `phase(title)` → `Promise` | 设置 run 当前的阶段名（面板显示）。 |
 | `log` | `log(message)` → `Promise` | 记录一条运行日志。 |
-| `workflow` | `workflow(name, args?)` | 声明存在，但当前版本不支持嵌套：调用会直接报错。把子步骤内联写进当前脚本。 |
+| `workflow` | `workflow(name, args?)` | 执行已保存的子工作流，共享父 run 的取消及限制。 |
 | `args` | 任意 JSON 值 | 启动时传入的数据。 |
-| `budget` | `{ total, spent(), remaining() }` | 运行 token 预算，单位是子代理的**总** token（输入+输出）。`spent()` / `remaining()` 返回**数字**（不是 Promise），并且在每次 `agent()` 结束后刷新，所以 `while (budget.total && budget.remaining() > 50_000)` 这种写法是对的。`total` 取自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 `null`，此时 `remaining()` 为 `Infinity`）。**超限会中止 run**：预算用完后下一个 `agent()` 直接让 run 失败，脚本自己按 `remaining()` 收敛才能优雅结束。 |
+| `budget` | `{ total, spent(), remaining() }` | 运行 token 预算，单位是子代理的**未缓存输入 + 输出** token（cacheRead/cacheWrite 单独记录，不重复计入；不等于账单金额）。`spent()` / `remaining()` 返回**数字**（不是 Promise），并且在每次 `agent()` / `workflow()` 结束后刷新，所以 `while (budget.total && budget.remaining() > 50_000)` 这种写法是对的。`total` 取自 `PI_WORKFLOW_TOKEN_BUDGET`（未设置时为 `null`，此时 `remaining()` 为 `Infinity`）。**超限会中止 run**：预算用完后下一个 `agent()` 直接让 run 失败，脚本自己按 `remaining()` 收敛才能优雅结束。 |
 
 **默认用 `pipeline`，不要用 `parallel`。** 除非下一步真的需要**全部**之前的结果（全量去重、跨项比较、发现“什么都没找到”后提前退出），否则让 pipeline 逐项推进——阶段之间没有 barrier。宿主按实际完成顺序交付调用结果，单项完成后的预算刷新也不等待无关的慢调用；`pipeline` 最终返回的数组仍按输入项顺序排列，`parallel` 仍等待整组完成。
 
-**结构化结果必须用 `schema`。** `agent(prompt, { schema })` 返回的是子代理通过 `structured_output` 工具提交并被校验的对象，不是自由文本；要在结果上做分支就必须用它。子代理完成时若没有调用 `structured_output`，该调用判为失败（错误文本：`the agent finished without calling structured_output`）。schema 用常用 JSON Schema 子集：`type`（object / array / string / number / integer / boolean）、`properties`、`required`、`items`、`enum`、`description`。根必须是 `{ type: 'object', properties: {...} }`，且 `required` 里的字段必须在 `properties` 里——不满足的 schema 在任何子代理启动之前就报错，而不是等烧完模型调用才失败。运行时会给 prompt 自动附加一句“用 structured_output 返回结果”，prompt 里不用重复。
+**结构化结果必须用 `schema`。** `agent(prompt, { schema })` 返回的是子代理通过 `structured_output` 工具提交并被校验的对象，不是自由文本；要在结果上做分支就必须用它。子代理完成时若没有调用 `structured_output`，该调用判为失败（错误文本：`the agent finished without calling structured_output`）。schema 用常用 JSON Schema 子集：`type`（object / array / string / number / integer / boolean）、`properties`、`required`、`items`、`enum`、`description`、`additionalProperties`。未声明 properties 的嵌套 object 可返回任意字段；声明字段的对象默认闭合，显式 additionalProperties 可覆盖。根必须是 `{ type: 'object', properties: {...} }`，且 `required` 里的字段必须在 `properties` 里——不满足的 schema 在任何子代理启动之前就报错，而不是等烧完模型调用才失败。运行时会给 prompt 自动附加一句“用 structured_output 返回结果”，prompt 里不用重复。
 
 **只读验证。** 证据收集、规划、审查和验证步骤可设置 `agent(prompt, { readOnly: true })`；随包 review-changes 的审查/核验以及 migrate-files 的规划/核验已启用，apply 仍可写。运行时移除 write/edit/普通 bash、任意扩展工具和自行委派（普通 worker 不受影响），保留定义中已有的 read/grep/find/ls、ask_question，以及受沙箱约束的 `verify_command`；schema 的 structured_output 照常可用。
 
@@ -84,6 +84,12 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 默认每条命令 120 秒、最多 10 分钟，输出有上限；取消/超时会终止命令进程组，所属 Pi 退出（包括被强制结束）后，独立 watchdog 也会清理该组；Linux 另有 bubblewrap 的 parent-death 和 PID namespace 清理。需要生成仓库内构建产物或联网的测试会失败，应报告证据缺口或显式把输出配置到临时目录，而不是绕过限制。这不是敌对代码的通用安全容器，也不限制文件读取范围、CPU 或内存；macOS 中自行脱离进程组的恶意守护进程不在清理保证内。
 
 只读模式纳入缓存键：不会复用之前可写步骤的答案；Focus 和 subagent_message 恢复原会话时继续限制权限。外部 CLI agent 不支持此模式，会在启动前拒绝。Skip/Abort 在 shell 就绪等待期间会取消启动、关闭已创建的自有 pane，并释放逻辑并发槽；已越过发命令时刻的调用按运行中取消处理。
+
+**子工作流。** `workflow(name, args)` 解析项目 `.pi/workflows`、全局或随包脚本，首次执行把脚本保存到 `<runDir>/nested/`，恢复时使用该副本。支持一层嵌套；child 再调用 workflow 会让 run 失败。child 的普通 agent 与父 run 共用 journal、预算、取消和并发槽，child VM 本身不占 agent 槽；每个 run 最多调用 64 个 child、同时运行 16 个 child VM。必须 await 所有子任务后再 return，不支持以 workflow 脚本偷偷启动脱管后台工作。
+
+**隔离写入。** `agent(prompt, { isolation: 'worktree' })` 从当前仓库的已提交 HEAD 创建 detached Git worktree，目录为 `<runDir>/worktrees/<callKey>`。主工作区的未提交修改和未跟踪文件不会被复制；隔离只避免意外互相覆盖，不是文件读取或恶意程序安全边界。不同调用各有一个工作树；重试/恢复同一调用复用其原工作树，保留修改、未跟踪文件和内部提交。Abort 不删除工作树，也不自动 merge、reset 或 clean。非 Git 项目会明确失败。运行结束后自行检查、测试并整合所需改动；查看调用的工作目录与保留工件，不能假定结果已经写回主仓库。
+
+**显式重试。** `agent(prompt, { retries: 1, stallTimeoutMs: 60000 })` 允许失败后额外执行一次。`retries` 默认 0，可设置 0–5；重复执行可能重复写文件或外部副作用，必须由脚本作者明确 opt-in，不能把重试当成事务回滚。`stallTimeoutMs` 是单次尝试的活跃时间上限，不是模型 token 进展检测；可为 1000–21600000 毫秒，省略则使用默认值。提问等待由独立等待时限控制，不按工作时间误杀；Skip/Abort 不触发下一次重试。所有实际尝试仍受运行预算及调用数上限约束。每次尝试分别写 journal 并保留会话路径；同一 call 的最后一条 usage 累计之前的尝试，不能把该 call 的每条累计值再次求和。失败尝试的消耗也会在 resume 后保留。
 
 **错误语义。** 一个子代理**死掉或失败**，只是这次调用落为 `null`，其他项继续——`parallel` / `pipeline` 如此，裸 `await agent(...)` 也如此，所以按 Claude Code 写的脚本（不包 `try/catch`，用 `.filter(Boolean)` 过滤）在这里行为一致。`null` 不等于“没事发生”：该调用仍记为 `failed`，面板上是 `✗`，run 的日志里会写一行 `… resolved to null`，落定消息里按名字列出所有“没有返回值的调用”。
 
@@ -249,10 +255,11 @@ Critique → Revise，直到验收或轮数/调用/token guard 触顶。`args`�
 
 ## 恢复与缓存
 
-调用按**内容 + 出现次序**记账：`callKey` 是 label + prompt + schema + agent + model + effort 的哈希，与完成顺序无关；同一份内容在一次 run 里出现第 N 次会带上序号。由此：
+调用按**内容 + 出现次序**记账：`callKey` 是 prompt + schema + agent + model + effort + readOnly + isolation 的哈希；label 仅用于展示，与完成顺序无关；同一份内容在一次 run 里出现第 N 次会带上序号。由此：
 
-- **同名同参重跑（start）自动复用。** 再次 start 同一个 workflow、且 `args` 相同，会找到上一次含完成记录的同类 run，把其中 `completed` 的调用按 callKey 直接复用：没改过的调用不会再起 agent，面板上标 `(cached)`。归属看 `meta.name`（不是文件名）**加上 `args`**——`args` 不在键里，所以参数变了就不再复用（否则会拿上一次的答案回答新问题）。想强制不复用，传 `reuse: 'none'`。
-- **改过的调用重跑。** label / prompt / schema / agent / model / effort 任一变化都会改变内容键；内容没变的调用继续复用。model 和 effort 也在键里，所以把某个验证阶段从便宜模型换成强模型，会真的重跑，而不是把便宜模型的答案换个标签重放。
+- **start 默认全新执行。** 即使同名同参也会重新启动子代理。只有显式传 `reuse: 'auto'` 时，才查找同 `meta.name` 且 `args` 相同的最近可复用 run，重放其中的 `completed` 调用；历史用量不挤占新 run 的预算。`reuse: 'none'` 与默认行为相同。继续某次具体执行请用 `resume`。
+- **改 label 不重跑。** 新格式调用键不包含展示标签；重复相同内容仍按出现序号保留独立样本。旧版本含 label 的 journal 继续兼容原标签回放，修改旧记录标签可能重新执行。
+- **改过的调用重跑。** prompt / schema / agent / model / effort / readOnly / isolation 任一变化都会改变内容键；内容没变的调用继续复用。model 和 effort 也在键里，所以把某个验证阶段从便宜模型换成强模型，会真的重跑，而不是把便宜模型的答案换个标签重放。
 - **完全相同的多次调用是多个调用。** 三个一模一样的 refuter 是三个样本，不是同一个答案重放三遍——否则「3 票里 2 票确认」这种写法会失效。
 
 **resume 用 runId 恢复一次具体的 run**：重新执行该 run 目录里的 `script.js`，重放 journal 里所有 `completed` 的调用，只补跑未完成的。适用于进程被杀（状态 `interrupted`）、中止（`aborted`）、失败（`failed`）之后：
@@ -356,7 +363,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 
 3. 结构化结果失败最常见的原因是子代理没调用 `structured_output`（`calls/<callKey>/result.json` 缺失），常见于 prompt 太含糊，或 schema 超出了支持子集。
 4. 想看子代理的完整对话：journal 里每个调用带 `sessionFile` / `sessionId`，指向它自己的 pi 会话；也可以按名字用 `subagent_message` 把它叫回来追问。
-5. 修好脚本或输入后：同名重跑（已完成调用自动复用）或 resume 那个 runId。
+5. 修好脚本或输入后：全新 start，或显式 `reuse: 'auto'` 复用同名同参结果，或 resume 那个 runId。
 6. `snapshot.json` 状态是 `running` 但已经没有进程在跑 → `interrupted`，直接 resume。
 
 注意：`script.js`、`snapshot.json`、`journal.jsonl` 里保存了完整 prompt 和结果文本，可能包含敏感内容。
