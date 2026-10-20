@@ -3,10 +3,10 @@
  * read-only step that runs a real sandboxed command.
  *
  * Everything here uses the production extension, the production subagent
- * service, real tmux panes and a real provider model. The only test hooks are
- * timing: PI_SUBAGENT_SHELL_READY_DELAY_MS holds the launch window open long
+ * service, real tmux panes and a real provider model. Timing hooks: PI_SUBAGENT_SHELL_READY_DELAY_MS holds the launch window open long
  * enough to observe a pane that exists while its worker is not yet registered,
- * and PI_WORKFLOW_MAX_CONCURRENT_AGENTS=1 keeps the second call queued.
+ * and PI_WORKFLOW_MAX_CONCURRENT_AGENTS=1 keeps the second call queued. A separate
+ * running-tool case replaces the journal path with a directory to fault its write.
  *
  * Evidence is written to the retained directory for independent inspection:
  * events.jsonl (timeline), one <case>.json per run view, report.json, the
@@ -14,13 +14,14 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, closeSync, constants, existsSync, openSync, readSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, existsSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, rmdirSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import subagentsExtension, { __test__ } from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager, type WorkflowRun } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { readNameRegistry, readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import { surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
 import { waitForSandboxCommand } from '../../helpers/readonly-process.ts';
+import { findVerificationProbeResult, hasPassingGuardOutput, isSkipIoCommand } from '../live-evidence.ts';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, label: string, timeout = 240_000) {
@@ -189,6 +190,30 @@ export default function protectionFixture(pi: any) {
         );
         record('skip-passed', { runId: skipRun.runId, closeMs: skipCloseMs, successor: successorAfter.name });
 
+        // Skip must still stop a real tool if writing its audit record fails.
+        process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = '0';
+        const ioCommand = 'echo STARTED > skip-io-started; sleep 5; echo ESCAPED > skip-io-escaped';
+        const ioPrompt = `Use bash to execute exactly this command, then reply DONE:\n\`\`\`sh\n${ioCommand}\n\`\`\``;
+        const ioRun = await manager.start({ source: script('live-skip-io', `return await agent(${JSON.stringify(ioPrompt)});`), args: {} });
+        const ioExecution = ioRun.execute();
+        await until(() => existsSync(join(dir, 'skip-io-started')), 'real writable command starts before Skip');
+        const ioCall = ioRun.view().calls[0];
+        assert.ok(ioCall.sessionFile && hasProviderUsage(ioCall.sessionFile));
+        assert.ok(toolCalls(ioCall.sessionFile!).some(isSkipIoCommand),
+          'the model must enter the full blocking command, not just create the marker');
+        const ioJournal = join(ioRun.runDir, 'journal.jsonl');
+        mkdirSync(ioJournal);
+        try { assert.equal(ioRun.skip(ioCall.callKey), true); }
+        finally { rmdirSync(ioJournal); }
+        const ioView = await ioExecution;
+        assert.equal(ioView.status, 'completed', ioView.error);
+        assert.equal(ioView.calls[0].status, 'skipped');
+        assert.ok(ioView.logs.some(message => message.includes('could not persist Skip')));
+        await delay(6000);
+        assert.equal(existsSync(join(dir, 'skip-io-escaped')), false, 'a failed journal append cannot allow the cancelled tool to continue');
+        save('skip-io', ioView);
+        record('skip-io-passed', { runId: ioRun.runId });
+
         // ── Case 2: Abort inside the launch window, then Resume ───────────
         process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = '20000';
         const panesBeforeAbort = new Set(paneIds());
@@ -315,18 +340,18 @@ export default function protectionFixture(pi: any) {
         const verifyResults = toolResults(readonlyCall.sessionFile!)
           .filter(row => row.message.toolName === 'verify_command');
         assert.ok(verifyResults.length >= 2, 'the model must really run verify_command twice');
-        const denial = verifyResults.find(row => row.message.details?.exitCode !== 0);
+        const verificationCalls = toolCalls(readonlyCall.sessionFile!);
+        const denial = findVerificationProbeResult(verificationCalls, verifyResults, 'write');
         assert.ok(denial, 'the write attempt must fail inside the sandbox');
-        assert.match(textOf(denial!.message), /permission|denied|EPERM|not permitted|sandbox/i, 'the transcript must contain the real refusal');
-        const passing = verifyResults.find(row => row.message.details?.exitCode === 0);
+        assert.match(textOf(denial!.message), /permission|denied|EPERM|EACCES|not permitted|EROFS|read.only file system/i, 'the transcript must contain the real refusal');
+        const passing = findVerificationProbeResult(verificationCalls, verifyResults, 'test');
         assert.ok(passing, 'the local test run must succeed under the sandbox');
-        assert.match(textOf(passing!.message), /# pass 1|ok 1 -/, 'the transcript must contain the passing test output');
+        assert.ok(hasPassingGuardOutput(textOf(passing!.message)), 'the transcript must contain the passing test output');
         assert.ok(toolCalls(readonlyCall.sessionFile!).filter(call => call.name === 'verify_command').length >= 2);
         assert.ok(hasProviderUsage(readonlyCall.sessionFile!), 'the read-only step must show real provider usage');
         assert.equal(readFileSync(join(dir, 'protected.txt')).equals(protectedBefore), true, 'the protected file bytes must be unchanged');
-        const fifoCall = toolCalls(readonlyCall.sessionFile!).find(call => call.name === 'verify_command' && String(call.arguments?.command).includes('restricted.fifo'));
-        assert.ok(fifoCall, 'the model must really attempt the FIFO write');
-        const fifoResult = toolResults(readonlyCall.sessionFile!).find(row => row.message.toolCallId === fifoCall!.id);
+        const fifoResult = findVerificationProbeResult(verificationCalls, verifyResults, 'fifo');
+        const fifoCall = verificationCalls.find(call => call.id === fifoResult?.message.toolCallId);
         assert.ok(fifoResult && fifoResult.message.details?.exitCode !== 0, 'the actual FIFO command must fail');
         assert.match(textOf(fifoResult!.message), /denied|EPERM|not permitted/i);
         let fifoBytes = 0;

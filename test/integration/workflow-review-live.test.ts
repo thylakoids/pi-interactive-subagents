@@ -11,7 +11,7 @@ import { readSubagentLoadout } from '../../pi-extension/subagents/session.ts';
 import { integrationRuntime } from './runtime.ts';
 import { integrationModel } from './model.ts';
 import { cleanupSession } from './cleanup.ts';
-import { isStallRecoveryCommand } from './live-evidence.ts';
+import { isCacheEffectCommand, isStallRecoveryCommand } from './live-evidence.ts';
 
 const rows = (file: string): any[] => readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
 const json = (file: string) => JSON.parse(readFileSync(file, 'utf8'));
@@ -104,7 +104,7 @@ it('billed workflows prove cache, schema, worktree, nested limits and stall reco
   assert.equal(readFileSync(join(dir, 'cache-effects'), 'utf8'), 'effect\neffect\n');
   for (const call of [first, second]) {
     const messages = rows(call.sessionFile).filter(row => row.type === 'message').map(row => row.message);
-    const bash = messages.filter(m => m.role === 'assistant').flatMap(m => m.content ?? []).filter(p => p.type === 'toolCall' && p.name === 'bash' && p.arguments?.command?.includes('cache-effects'));
+    const bash = messages.filter(m => m.role === 'assistant').flatMap(m => m.content ?? []).filter(isCacheEffectCommand);
     assert.equal(bash.length, 1, 'one real side-effect command per fresh session');
     assert.ok(messages.some(m => m.role === 'toolResult' && m.toolCallId === bash[0].id && !m.isError));
   }
@@ -221,8 +221,18 @@ it('billed workflows prove cache, schema, worktree, nested limits and stall reco
     assert.equal(snapshot.status, 'completed');
     assert.deepEqual(snapshot.result, value.result);
   }
+  const terminal = view('terminal-failure-first');
+  assert.equal(terminal.status, 'failed');
+  assert.match(terminal.error, /budget exhausted/);
+  assert.equal(terminal.calls.length, 2);
+  assert.equal(terminal.calls[0].status, 'completed');
+  assert.ok(terminal.calls[0].usage.totalTokens > 1);
+  assert.equal(terminal.calls[1].status, 'aborted');
+  assert.equal(terminal.calls[1].sessionFile, undefined);
+  assert.equal(readFileSync(join(dir, 'terminal-charge'), 'utf8').trim(), 'charged');
+  evidence({ ...terminal, calls: [terminal.calls[0]] });
   assert.deepEqual(report.checks, ['fresh-first', 'fresh-second', 'explicit-reuse', 'borrowed-resume', 'renamed-resume', 'nested-schema',
-    'worktree', 'worktree-resume', 'nested-saved', 'nested-limit', 'nested-author-error', 'stall-default', 'stall-retry']);
+    'worktree', 'worktree-resume', 'nested-saved', 'nested-limit', 'nested-author-error', 'stall-default', 'stall-retry', 'terminal-failure-first']);
 });
 
 function assertObject(actual: unknown, expected: unknown): boolean {

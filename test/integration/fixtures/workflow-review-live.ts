@@ -199,6 +199,29 @@ export default function reviewLive(pi: any) {
         }
         await stallProbe(false);
         await stallProbe(true);
+        const notifications: string[] = [];
+        manager = new WorkflowManager({ ...options, onSettled: view => notifications.push(view.status) });
+        const terminal = await manager.start({ args: {}, budgetTotal: 1, source: script('live-terminal-owner',
+          `await agent(${JSON.stringify(prompt('echo charged > terminal-charge'))}); return await agent('Must not launch after budget exhaustion');`) });
+        const dispatch = terminal.dispatch.bind(terminal);
+        let observedWindow = false;
+        terminal.dispatch = async (...args) => {
+          await dispatch(...args);
+          if (!observedWindow && terminal.view().status === 'failed') {
+            assert.equal(terminal.isFinished(), false, 'observe failure before VM settlement');
+            observedWindow = true;
+            terminal.abort('late obsolete Abort');
+          }
+        };
+        const terminalView = await terminal.execute();
+        assert.equal(observedWindow, true, 'real model usage must trigger the actual budget failure');
+        assert.equal(terminalView.status, 'failed');
+        assert.match(terminalView.error ?? '', /budget exhausted/);
+        assert.deepEqual(notifications, ['failed']);
+        assert.equal(new WorkflowManager(options).inspect(terminal.runId)!.status, 'failed');
+        assert.equal(readFileSync(join(dir, 'terminal-charge'), 'utf8').trim(), 'charged');
+        save('terminal-failure-first', terminalView);
+        checks.push('terminal-failure-first');
         writeFileSync(join(dir, 'report.json'), JSON.stringify({ ok: true, checks }, null, 2));
       } catch (error: any) {
         manager?.abortAll('review live failure');

@@ -403,6 +403,7 @@ export class WorkflowRun {
 
   /** Resolve the script-side handle for `agent(prompt, opts)`. */
   private async runAgentCall(raw: unknown, scope?: ScriptScope): Promise<unknown> {
+    if (this.signal.aborted) return null;
     const parsed = parseAgentArgs(raw);
     const defined = this.manager.service.allowedAgents();
     const requestedAgent = parsed.opts.agent ?? (scope ? scope.agent : this.meta.agent);
@@ -713,7 +714,7 @@ export class WorkflowRun {
 
   /** Stop a run that cannot continue, with the same teardown as an abort. */
   private failRun(message: string): void {
-    if (this.finished) return;
+    if (this.finished || this.status !== "running") return;
     this.status = "failed";
     this.error = message;
     this.snapshot.status = "failed";
@@ -1147,10 +1148,14 @@ export class WorkflowRun {
   }
 
   abort(reason = "aborted by user"): void {
-    if (this.finished) return;
+    if (this.finished || this.status !== "running") return;
     this.status = "aborted";
     this.error = reason;
+    this.snapshot.status = "aborted";
+    this.snapshot.error = reason;
+    this.snapshot.finishedAt = this.now();
     this.teardown(reason);
+    this.persistSnapshot(true);
   }
 
   /** Mark a queued or running call as skipped by the user. */
@@ -1177,7 +1182,15 @@ export class WorkflowRun {
       error: "skipped by user",
       ...(live.usage ? { usage: live.usage } : {}),
     };
-    appendJournal(this.journalFile, entry);
+    try {
+      appendJournal(this.journalFile, entry);
+    } catch (error: any) {
+      // Cancellation must still stop work when its audit write fails.
+      this.note(`could not persist Skip for ${live.label}: ${error?.message ?? String(error)}`);
+    }
+    live.status = "skipped";
+    live.finishedAt = entry.finishedAt;
+    live.error = "skipped by user";
     const handle = this.running.get(callKey);
     if (handle) this.manager.service.stop(handle.name);
     // Stop the launch task from waiting on a watcher that may never settle: the
@@ -1188,9 +1201,6 @@ export class WorkflowRun {
     const waiters = this.waiters.get(callKey);
     this.waiters.delete(callKey);
     if (waiters) for (const resolve of waiters) resolve({ ok: false, status: "skipped", value: null, error: "skipped by user" });
-    live.status = "skipped";
-    live.finishedAt = this.now();
-    live.error = "skipped by user";
     this.snapshot.spentTokens = this.budgetView().spent;
     this.snapshot.agentAttempts = this.launchedAgents;
     this.persistSnapshot(true);
@@ -1382,8 +1392,14 @@ export class WorkflowManager {
     // still matters because it is what blocks a second process from resuming
     // the run while this one is live.
     const lock = acquireLock(run.runDir);
-    if (lock.ok) run.setLockPath(lock.path);
-    writeFileSync(scriptPath(run.runDir), params.source, "utf8");
+    if (!lock.ok) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);
+    run.setLockPath(lock.path);
+    try {
+      writeFileSync(scriptPath(run.runDir), params.source, "utf8");
+    } catch (error) {
+      releaseLock(lock.path);
+      throw error;
+    }
     this.runs.set(runId, run);
     return run;
   }
@@ -1403,25 +1419,13 @@ export class WorkflowManager {
     }
 
     const runDir = ensureRunDir(this.options.baseDir, runId);
-    const snapshot = loadSnapshot(runDir);
-    if (!snapshot) {
-      throw new WorkflowScriptError(`No snapshot for run ${runId}.`);
-    }
     const scriptFile = scriptPath(runDir);
     const edited = overrides?.source?.trim() ? overrides.source : undefined;
-    if (!edited && !existsSync(scriptFile)) {
-      throw new WorkflowScriptError(`Run ${runId} has no stored script; cannot resume.`);
-    }
-    const source = edited ?? readFileSync(scriptFile, "utf8");
-
-    // Parse before taking the lock: a syntax error is an author mistake, and a
-    // lock taken before it would strand the run as permanently unresumable.
-    const parsed = parseScript(source, runId);
 
     const lock = acquireLock(runDir);
     if (!lock.ok) {
       throw new WorkflowScriptError(
-        `Run ${runId} is locked by live process ${lock.ownerPid || "unknown"} — it is still executing. ` +
+        `Run ${runId} is locked by process ${lock.ownerPid || "unknown"}${lock.reason ? ` (${lock.reason})` : ""}. ` +
           "Abort it first, or resume after it settles. A lock left by a dead process is reclaimed automatically.",
       );
     }
@@ -1434,6 +1438,15 @@ export class WorkflowManager {
     let skippedLines = 0;
     let run: WorkflowRun;
     try {
+      // Read the entire recovery input only after ownership: another process
+      // can finish/edit between a pre-lock read and this successful acquire.
+      const snapshot = loadSnapshot(runDir);
+      if (!snapshot) throw new WorkflowScriptError(`No snapshot for run ${runId}.`);
+      if (!edited && !existsSync(scriptFile)) {
+        throw new WorkflowScriptError(`Run ${runId} has no stored script; cannot resume.`);
+      }
+      const source = edited ?? readFileSync(scriptFile, "utf8");
+      const parsed = parseScript(source, runId);
       if (edited) writeFileSync(scriptFile, source, "utf8");
       const journal = loadJournal(journalPath(runDir));
       skippedLines = journal.skippedLines;
@@ -1477,7 +1490,7 @@ export class WorkflowManager {
 
   abort(runId: string, reason?: string): boolean {
     const run = this.runs.get(runId);
-    if (!run) return false;
+    if (!run || run.status !== "running" || run.isFinished()) return false;
     run.abort(reason);
     return true;
   }

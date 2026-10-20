@@ -183,6 +183,8 @@ export default function (pi: ExtensionAPI) {
   // lands through `input`, including replies steered into the current run.
   // A new agent turn alone may just be a delegated child result, not an answer.
   let awaitingAnswer = false;
+  let questionCallId: string | undefined;
+  const blockedWhileWaiting = new Set<string>();
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -194,8 +196,10 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event) => {
     recorder.input();
+    const blocked = awaitingAnswer ? [...blockedWhileWaiting] : [];
+    blockedWhileWaiting.clear();
     // A submitted message is the orchestrator's (or a human's) reply — the
     // pending ask_question has been answered, however it was delivered. Clear
     // here, not only on agent_start, because a reply steered in *mid-run* is
@@ -205,10 +209,19 @@ export default function (pi: ExtensionAPI) {
     // though the answer already arrived and was consumed. (The `input` event
     // fires for mid-run steers because prompt() emits it before queueing.)
     awaitingAnswer = false;
+    questionCallId = undefined;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    if (shouldMarkUserTookOver(agentStarted)) userTookOver = true;
+    if (blocked.length > 0) {
+      return {
+        action: "transform" as const,
+        text: event.text + `\n\n[Runtime note: while waiting for this reply, calls to ${JSON.stringify(blocked)} were blocked and NOT executed. ` +
+          "No background task was started by those attempts and no result is pending for them. " +
+          "If those operations are still needed under the reply above, issue them again now.]",
+        images: event.images,
+      };
+    }
   });
 
   pi.on("before_agent_start", () => {
@@ -300,7 +313,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", (event) => {
-    if (awaitingAnswer) return { block: true, reason: "Waiting for the parent orchestrator to reply to ask_question. Stop and wait; do not guess or continue." };
+    if (awaitingAnswer) {
+      blockedWhileWaiting.add(event.toolName);
+      return { block: true, reason: `${event.toolName} was NOT executed or queued. No background task was started and no result is pending for this attempt. ` +
+        "Waiting for the parent orchestrator to reply to ask_question. Stop and wait; after the reply, issue this operation again if still needed." };
+    }
+    // Tool batches may run concurrently. Reserve the wait before ask_question
+    // executes, so a sibling call cannot slip through the same batch's gate.
+    if (event.toolName === "ask_question") {
+      awaitingAnswer = true;
+      questionCallId = event.toolCallId;
+    }
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
   });
 
@@ -309,6 +332,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
+    if (event.toolName === "ask_question" && event.toolCallId === questionCallId && event.isError) {
+      awaitingAnswer = false;
+      questionCallId = undefined;
+      blockedWhileWaiting.clear();
+    }
     recorder.toolResult((event as any).toolCallId, (event as any).toolName);
   });
 
@@ -367,6 +395,7 @@ export default function (pi: ExtensionAPI) {
       // "waiting" phase. The parent's watcher picks up the `.ask` signal and
       // notifies the orchestrator, who replies via subagent_message.
       awaitingAnswer = true;
+      questionCallId = _toolCallId;
       recorder.askQuestion();
       const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",

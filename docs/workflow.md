@@ -97,7 +97,7 @@ meta 只能是字面量（单引号、无引号键、尾逗号都接受；不允
 
 子代理看不到本次对话，每个 prompt 都要自包含。
 
-**默认子代理。** `agent()` 没点名时使用普通 `worker`，`meta.agent` 和 `opts.agent` 照常覆盖。workflow 是执行模式，不是专用 agent 定义：运行时保留提问能力及定义中允许的自行委派，仅禁用嵌套 workflow；步骤不依赖用户手动操作，但可通过 ask_question 等待主模型回复，完成后自动退出、仅保留父会话 lineage，并将“直接返回步骤结果 / schema 最后调用 structured_output”的约束追加到系统提示。主模型收到问题后用 subagent_message 回复，子代理在同一会话继续；委派结果通知不会误清除待回答问题。等待期间可 Abort，同时关闭派生子窗格；迟到回复不会重新启动已中止步骤，需显式 Focus 或 Resume。并发与 agent 数上限只统计脚本直接发出的 agent() 调用，自行委派的调用属于子代理，不能将直接调用上限当作整棵委派树的上限。旧脚本的 `workflow-subagent` 名称在没有用户同名定义时映射到 worker；用户同名定义保留。旧默认调用的 journal 缓存键也兼容，resume 不会因此重跑已完成步骤。
+**默认子代理。** `agent()` 没点名时使用普通 `worker`，`meta.agent` 和 `opts.agent` 照常覆盖。workflow 是执行模式，不是专用 agent 定义：运行时保留提问能力及定义中允许的自行委派，仅禁用嵌套 workflow；步骤不依赖用户手动操作，但可通过 ask_question 等待主模型回复；等待期间被拦截的工具不会执行或排队，回复上下文会明确提醒按需重新调用，不能把被拒绝的委派当成已启动的后台任务。完成后自动退出、仅保留父会话 lineage，并将“直接返回步骤结果 / schema 最后调用 structured_output”的约束追加到系统提示。主模型收到问题后用 subagent_message 回复，子代理在同一会话继续；委派结果通知不会误清除待回答问题。等待期间可 Abort，同时关闭派生子窗格；迟到回复不会重新启动已中止步骤，需显式 Focus 或 Resume。并发与 agent 数上限只统计脚本直接发出的 agent() 调用，自行委派的调用属于子代理，不能将直接调用上限当作整棵委派树的上限。旧脚本的 `workflow-subagent` 名称在没有用户同名定义时映射到 worker；用户同名定义保留。旧默认调用的 journal 缓存键也兼容，resume 不会因此重跑已完成步骤。
 
 ## 编写指导与渐进披露
 
@@ -268,7 +268,7 @@ Critique → Revise，直到验收或轮数/调用/token guard 触顶。`args`�
 workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 ```
 
-面板里展开 run 并选择 `Resume workflow` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁自动回收（空锁超过几秒也算废弃）。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
+面板里展开 run 并选择 `Resume workflow` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁通过独占接管自动回收；无法识别持有者的空锁或损坏锁不会仅因时间久而被抢占，需人工检查（原持有者可能只是暂停或 I/O 卡住），竞争接管不会覆盖新持有者。若接管进程恰好在关键区被杀，残留的 `lock.reclaim` 会明确拒绝再次接管；需要先确认没有任何执行/恢复进程，再人工检查并移除该空目录，不能在运行中强行删锁。snapshot、脚本和 journal 在持锁后读取；journal 读取发生 I/O 错误会拒绝恢复，不能当作空历史继续执行。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
 
 **跳过的调用不会被当作已完成重放。** 只有 `completed` 进缓存；`skipped`（面板里手动跳过）和 `failed` 都不会在 resume 或重跑时“冒充”完成——它们会真正重新执行。被跳过时脚本拿到 `null` 并继续，这是用户的决定，不是错误。
 
@@ -311,8 +311,8 @@ Workflows
 动作直接位于树中，没有独立动作菜单：
 
 - **Focus**：运行中的 agent 切到原 tmux pane；已结束的 agent 重新打开原始会话及历史，不自动发送消息。有现存会话 pane 时复用，不创建重复进程。成功后关闭弹窗。Pi 会话沿用原模型、身份和工具权限，但保持交互模式；原生 CLI 会话按原 native session ID 打开。会话或权限快照缺失时明确报错。继续与单个 agent 交互不会替换 workflow 已记录的结果。
-- **Skip**：仅 queued/running 调用提供。确认后停止该调用，脚本立即收到 `null` 并继续；恢复时会重新执行。排队任务没有会话时不提供 Focus。
-- **Abort workflow**：仅运行中 run 提供。确认后中止脚本及运行中的 agents，保留完成记录。
+- **Skip**：仅 queued/running 调用提供。确认后停止该调用，脚本立即收到 `null` 并继续；恢复时会重新执行。即使 journal 写入失败也继续执行取消，并在 run 日志中提示持久化错误。排队任务没有会话时不提供 Focus。
+- **Abort workflow**：仅运行中 run 提供。确认后中止脚本及运行中的 agents，保留完成记录。终态遵循先到先得：已发生的失败不被迟到的 Abort 覆盖，已确认的 Abort 也不被迟到的预算错误覆盖；终态立即写入 snapshot。
 - **Resume workflow**：仅 failed/aborted/interrupted run 提供。确认后重放脚本，复用 completed 调用，其余调用重新执行；不是让原进程从停止的指令继续。
 
 Skip、Abort、Resume 使用同一框内的确认页，默认选中 `Cancel`。确认期间目标已结束时拒绝过期动作并显示原因。message/stop 操作不放入面板，用户可在真实 pane 中交互。日志、完整用量和返回值仍可通过 status、journal 与 output 文件查看。
@@ -330,7 +330,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 - 并发：每个 run 同时最多 `min(16, CPU 核数 − 2)` 个 agent（下限 2），超出的调用排队；`PI_WORKFLOW_MAX_CONCURRENT_AGENTS` 可以覆盖（每个 agent 是一个真实窗格，机器忙的时候调小）。
 - 单次 `parallel` / `pipeline` 最多 4096 项；单个 run 最多 1000 个 `agent()` 调用，再开会被拒绝（`Workflow exceeded 1000 agents in one run`）。按**实际启动次数**计，不是按去重后的键——否则一个反复发同一个调用的死循环永远撞不到这个上限。
 - 设了 `PI_WORKFLOW_TOKEN_BUDGET` 时，预算用尽会让 run 失败（而不是只报个数继续跑）。
-- 不支持嵌套：`workflow()` 调用直接报错；子步骤写进当前脚本。
+- 支持一层嵌套：child 不能再调用 `workflow()`；每个 run 最多 64 个 child 调用、同时 16 个 child VM，并共享父 run 的预算与 agent 并发限制。
 - 需要 tmux；pi 会话必须有持久化 session 文件，否则 start 直接以 `Cannot run a workflow: …` 拒绝。
 - `agent()` 只能使用当前会话允许的 agent 定义（与 `subagent` 工具同一套 allowlist），都不满足时会报错。
 - 超时是两层的，都不按整轮的墙钟算：脚本自身 30 分钟没有任何进展、且没有未结算的调用，才中止整轮；单个 `agent()` 调用累计运行 60 分钟仍未结束则以 `failed` 结算，脚本拿到 `null` 继续，其他调用和整轮都不受影响。等待 `ask_question` 回复（状态 `waiting`）默认不设上限：等待是 run 自己要来的状态，进程退出由 watcher 结算，运行时不会在无法证明失联时猜它死掉；只有显式设置 `PI_WORKFLOW_WAIT_TIMEOUT_MS`（毫秒，`0` 关闭）才给等待设上限，超出的等待时间开始计入上面的 60 分钟。`PI_WORKFLOW_CALL_TIMEOUT_MS` 改单调用上限，`0` 关闭。
@@ -349,7 +349,8 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 | `output.json` | 脚本 `return` 的值（`{ ok: true, value: … }`，仅成功时存在） |
 | `calls/<callKey>/schema.json` | 传给该子代理的 JSON Schema（仅结构化调用） |
 | `calls/<callKey>/result.json` | 子代理通过 `structured_output` 回传的结果（仅结构化调用）；缺失 = 它完成时没调用该工具 |
-| `lock` | 运行期间持有，防止两个进程同时执行同一个 run；进程死后自动回收 |
+| `lock` | 运行期间持有，包含持有者 PID 与随机 ownership token，防止两个进程同时执行同一个 run；死锁通过独占接管回收 |
+| `lock.reclaim/` | 仅接管期间存在的互斥目录；若接管进程被杀后残留，拒绝自动删除，需要确认没有执行者后人工处理 |
 
 定位失败：
 

@@ -47,5 +47,5 @@ it('real parent answers workflow questions, worker delegates, and waiting workfl
   assert.ok(existsSync(join(dir, 'report.json')), 'Timed out; inspect retained sessions and events in ' + dir);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
   assert.equal(report.ok, true, report.error);
-  assert.deepEqual(report.checks, ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected']);
+  assert.deepEqual(report.checks, ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry']);
 });

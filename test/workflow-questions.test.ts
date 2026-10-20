@@ -42,6 +42,10 @@ it('question waits across delegated notifications, retries failed delivery, and 
   const running: any = { id: 'question-test', name: 'waiting-worker', agent: 'worker', task: 'task', surface: '%unit-test', startTime: Date.now(), sessionFile, statusState: createStatusState({ source: 'pi', startTimeMs: Date.now() }) };
   __test__.runningSubagents.set(running.id, running);
   emit('agent_start');
+  assert.equal(emit('tool_call', {toolName:'ask_question',toolCallId:'ask'})[0], undefined);
+  const sibling = emit('tool_call', {toolName:'subagent',toolCallId:'parallel-delegate'})[0];
+  assert.equal(sibling?.block, true, 'a sibling tool must be blocked before ask_question execute has started');
+  assert.match(sibling.reason, /NOT executed or queued/);
   await tools.get('ask_question').execute('ask', { question: 'Which token?' });
   assert.equal(JSON.parse(readFileSync(sessionFile + '.ask', 'utf8')).question, 'Which token?');
   end(); assert.equal(exits, 0);
@@ -56,16 +60,36 @@ it('question waits across delegated notifications, retries failed delivery, and 
   assert.equal(existsSync(sessionFile + '.ask'), false);
   // A delegated child result can start a turn, but it is not the parent's answer.
   emit('agent_start');
-  assert.equal(emit('tool_call', { toolName: 'bash' })[0]?.block, true);
+  const blocked = emit('tool_call', { toolName: 'bash' })[0];
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.reason, /NOT executed or queued/);
+  assert.equal(emit('tool_call', { toolName: 'subagent' })[0]?.block, true);
   end(); assert.equal(exits, 0);
   let reply = '';
+  let transformed: any;
+  const images = [{ type: 'image', data: 'test-image', mimeType: 'image/png' }];
   const result = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'secret-token' }, (_surface: string, message: string) => {
-    reply = message; emit('input', { text: message }); emit('agent_start');
+    reply = message; transformed = emit('input', { text: message, images })[0]; emit('agent_start');
   });
   assert.equal(result.details.status, 'steered');
   assert.equal(reply, 'secret-token');
+  assert.ok(transformed, 'reply must explain that blocked tool attempts never executed');
+  assert.equal(transformed.action, 'transform');
+  assert.ok(transformed.text.startsWith('secret-token'));
+  assert.match(transformed.text, /"bash"/);
+  assert.match(transformed.text, /"subagent"/);
+  assert.match(transformed.text, /no result is pending/i);
+  assert.match(transformed.text, /issue them again/);
+  assert.equal(transformed.images, images, 'a reply transformation must retain attachments');
+  assert.equal(emit('input', { text: 'ordinary follow-up' })[0], undefined, 'the notice is scoped to the pending question');
   assert.notEqual(emit('tool_call', { toolName: 'bash' })[0]?.block, true);
   end(); assert.equal(exits, 1, 'Reply completes the same child rather than leaving it parked');
+  emit('tool_call', {toolName:'ask_question',toolCallId:'failed-ask'});
+  assert.equal(emit('tool_call', {toolName:'read'})[0]?.block, true);
+  emit('tool_result', {toolName:'ask_question',toolCallId:'older-ask',isError:true});
+  assert.equal(emit('tool_call', {toolName:'read'})[0]?.block, true, 'an unrelated late error cannot clear a newer wait');
+  emit('tool_result', {toolName:'ask_question',toolCallId:'failed-ask',isError:true});
+  assert.notEqual(emit('tool_call', {toolName:'read'})[0]?.block, true, 'a failed question must release its reserved wait');
   // A question/reply already queued before Abort must not resurrect the step.
   await tools.get('ask_question').execute('ask-after', { question: 'Another question?' });
   writeFileSync(sessionFile + '.workflow-aborted', 'aborted');

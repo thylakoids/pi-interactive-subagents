@@ -11,6 +11,41 @@ export function isStallRecoveryCommand(call: any): boolean {
     && /\bif test -f first\.pid; then/.test(call.arguments.command) && call.arguments.command.includes('sleep 90');
 }
 
+/** Recognize the cache probe's append, not inspections mentioning its file. */
+const CACHE_EFFECT_APPEND = /(?:^|[;\n]|&&|\|\|)\s*printf\s+['"]effect\\+n['"]\s*>>\s*(?:cache-effects|'cache-effects'|"cache-effects")(?=\s*(?:[;\n]|&&|\|\||$))/;
+export function isCacheEffectCommand(call: any): boolean {
+  return call?.type === 'toolCall' && call.name === 'bash' && typeof call.arguments?.command === 'string'
+    && CACHE_EFFECT_APPEND.test(call.arguments.command);
+}
+
+const SKIP_IO_SEQUENCE = /(?:^|[;\n]|&&|\|\|)\s*echo\s+STARTED\s*>\s*skip-io-started\s*(?:;|\n|&&)\s*sleep\s+5\s*(?:;|\n|&&)\s*echo\s+ESCAPED\s*>\s*skip-io-escaped(?=\s*(?:;|\n|&&|\|\||$))/;
+export function isSkipIoCommand(call: any): boolean {
+  return call?.type === 'toolCall' && call.name === 'bash' && typeof call.arguments?.command === 'string'
+    && SKIP_IO_SEQUENCE.test(call.arguments.command);
+}
+
+/** Correlate each sandbox probe to its own execution, never the first exit=0. */
+export function findVerificationProbeResult(calls: any[], results: any[], probe: 'test' | 'write' | 'fifo'): any {
+  const patterns = {
+    test: /(?:^|[;\n]|&&|\|\|)\s*node\s+--test\s+(?:\.\/)?guard\.test\.cjs(?=\s*(?:[;\n]|&&|\|\||$))/,
+    write: /\bwriteFileSync\s*\(\s*['"]protected\.txt['"]\s*,/,
+    fifo: /(?:^|[;\n]|&&|\|\|)\s*printf\s+(?:unexpected|'unexpected'|"unexpected")\s*>\s*(?:restricted\.fifo|'restricted\.fifo'|"restricted\.fifo")(?=\s*(?:[;\n]|&&|\|\||$))/,
+  };
+  const ids = new Set(calls.filter(call => call?.type === 'toolCall' && call.name === 'verify_command'
+    && typeof call.arguments?.command === 'string' && patterns[probe].test(call.arguments.command)).map(call => call.id));
+  return results.find(row => {
+    const message = row.message;
+    const details = message?.details;
+    return message?.role === 'toolResult' && message.toolName === 'verify_command' && ids.has(message.toolCallId)
+      && !message.isError && details?.ok === true && !details.timedOut && !details.cancelled
+      && typeof details.exitCode === 'number' && (probe === 'test' ? details.exitCode === 0 : details.exitCode !== 0);
+  });
+}
+
+export function hasPassingGuardOutput(text: string): boolean {
+  return /^# pass 1\r?$/m.test(text) && /^# fail 0\r?$/m.test(text);
+}
+
 export const ACCEPTANCE_SOURCE = `const assert = require('node:assert/strict');
 const { test } = require('node:test');
 test('stable double', () => assert.equal(require('./safe.cjs').double(4), 8));

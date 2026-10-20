@@ -1,6 +1,6 @@
 /** Live-provider probes: production service, real child sessions, unmodified templates. */
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import subagentsExtension from '../../../pi-extension/subagents/index.ts';
@@ -93,7 +93,7 @@ export default function liveFixture(pi: any) {
 
         const migration = await manager.start({
           source: readFileSync(join(BUNDLED_WORKFLOWS_DIR, 'migrate-files.js'), 'utf8'), reuse: 'none',
-          args: { task: 'Make only these two changes: safe.cjs: rename the private local variable oldValue to newValue without changing outputs (non-risky). risky.cjs: make isAdult inclusive at age 18 by using >= 18 instead of > 18 (risky: exported behavior changes). Do not edit test.cjs. Per-file verification is independent: for safe.cjs run node --test --test-name-pattern="stable double" test.cjs; for risky.cjs run node --test --test-name-pattern="inclusive boundary" test.cjs. Pipeline branches overlap, so the other file may not be migrated yet: do not classify a pending sibling change as failure of your target file. The caller independently runs the full node --test test.cjs suite after both branches finish; it must pass. Never modify eligibility.cjs or CONTRACT.md, and do not attribute their pre-existing problems to this migration.',
+          args: { task: 'Make only these two changes: safe.cjs: rename the private local variable oldValue to newValue without changing outputs (non-risky). risky.cjs: make isAdult inclusive at age 18 by using >= 18 instead of > 18 (risky: exported behavior changes). Do not edit test.cjs. Do not stage or commit changes. Acceptance is the requested target-file edit and the named per-file test, not Git cleanliness, a commit, or reproducing historical baseline claims from another agent. Per-file verification is independent: for safe.cjs run node --test --test-name-pattern="stable double" test.cjs; for risky.cjs run node --test --test-name-pattern="inclusive boundary" test.cjs. Pipeline branches overlap, so the other file may not be migrated yet: do not classify a pending sibling change as failure of your target file. The caller independently runs the full node --test test.cjs suite after both branches finish; it must pass. Never modify eligibility.cjs or CONTRACT.md, and do not attribute their pre-existing problems to this migration.',
             files: ['safe.cjs', 'risky.cjs'] },
         });
         record('migration-start', { runId: migration.runId });
@@ -175,10 +175,23 @@ export default function liveFixture(pi: any) {
         save('aborted-disk', disk);
         record('abort-passed', { runId: recovery.runId, stoppedChild: oldPane });
 
+        const journal = join(aborted.runDir, 'journal.jsonl');
+        renameSync(journal, journal + '.saved');
+        mkdirSync(journal);
+        await assert.rejects(new WorkflowManager(options).resume(recovery.runId), /EISDIR|directory/);
+        rmdirSync(journal);
+        renameSync(journal + '.saved', journal);
+        const deadPid = Number(execFileSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' }).trim());
+        const lock = join(aborted.runDir, 'lock');
+        writeFileSync(lock, '{');
+        utimesSync(lock, new Date(0), new Date(0));
+        await assert.rejects(new WorkflowManager(options).resume(recovery.runId), /manual inspection/);
+        writeFileSync(join(aborted.runDir, 'lock'), JSON.stringify({ pid: deadPid }));
         writeFileSync(join(dir, 'allow-resume'), 'release');
         appendFileSync(join(aborted.runDir, 'journal.jsonl'), '{"type":"call","callKey":"interrupted-write');
         manager = diskManager; // Reload state rather than relying on in-memory cache.
         const resumed = await manager.resume(recovery.runId);
+        await assert.rejects(new WorkflowManager(options).resume(recovery.runId), /locked/);
         const restored = await resumed.execute();
         save('resumed', restored);
         verifySessions(restored);

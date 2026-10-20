@@ -10,6 +10,7 @@ import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
 import { readSubagentLoadout } from '../../pi-extension/subagents/session.ts';
 import { cleanupSession } from './cleanup.ts';
 import { integrationModel } from './model.ts';
+import { findVerificationProbeResult, hasPassingGuardOutput, isSkipIoCommand } from './live-evidence.ts';
 
 const PROTECTED = 'PROTECTED-CONTENT: a read-only step must never change these bytes.\n';
 const GUARD_SOURCE = `const assert = require('node:assert/strict');
@@ -37,7 +38,7 @@ function verifyProtectionEvidence(dir: string, tmux: (...args: string[]) => stri
   assert.deepEqual(report.checks, ['skip-launch-window', 'abort-launch-window', 'resume-after-abort', 'readonly-verify', 'readonly-abort-verify']);
 
   const events = rows(join(dir, 'events.jsonl')).map(event => event.event);
-  for (const required of ['skip-window-proven', 'skip-passed', 'abort-window-proven', 'abort-window-passed', 'resume-passed', 'readonly-passed', 'readonly-abort-command-started', 'readonly-abort-passed', 'all-passed']) {
+  for (const required of ['skip-window-proven', 'skip-passed', 'skip-io-passed', 'abort-window-proven', 'abort-window-passed', 'resume-passed', 'readonly-passed', 'readonly-abort-command-started', 'readonly-abort-passed', 'all-passed']) {
     assert.ok(events.includes(required), 'the timeline must record ' + required);
   }
 
@@ -71,6 +72,16 @@ function verifyProtectionEvidence(dir: string, tmux: (...args: string[]) => stri
   assert.deepEqual(journal(skip.runDir, first.callKey).map((entry: any) => entry.status), ['skipped']);
   assert.equal(successor.status, 'completed');
   assert.ok(hasProviderUsage(successor.sessionFile), 'the successor must have real provider usage');
+
+  const skipIO = JSON.parse(readFileSync(join(dir, 'skip-io.json'), 'utf8'));
+  assert.equal(skipIO.status, 'completed');
+  assert.equal(skipIO.calls[0].status, 'skipped');
+  assert.ok(hasProviderUsage(skipIO.calls[0].sessionFile));
+  assert.ok(rows(skipIO.calls[0].sessionFile).some(row => Array.isArray(row.message?.content) && row.message.content.some(isSkipIoCommand)),
+  'the cancelled command must be an actual model tool call');
+  assert.equal(readFileSync(join(dir, 'skip-io-started'), 'utf8').trim(), 'STARTED');
+  assert.equal(existsSync(join(dir, 'skip-io-escaped')), false);
+  assert.ok(skipIO.logs.some((message: string) => message.includes('could not persist Skip')));
 
   // Case 2: aborted during launch, then resumed for real. The run directory is
   // shared, so the abort evidence must be the copy the driver saved *before*
@@ -113,22 +124,20 @@ function verifyProtectionEvidence(dir: string, tmux: (...args: string[]) => stri
   for (const result of verifyResults) {
     assert.equal(result.message.details?.backend, process.platform === 'linux' ? 'bwrap' : 'sandbox-exec');
   }
-  const denial = verifyResults.find(row => row.message.details?.exitCode !== 0);
+  const verificationCalls = rows(step.sessionFile).flatMap(row => row.message?.role === 'assistant' ? row.message.content ?? [] : []);
+  const denial = findVerificationProbeResult(verificationCalls, verifyResults, 'write');
   assert.ok(denial, 'the write attempt must fail inside the sandbox');
-  assert.match(textOf(denial!.message), /permission|denied|EPERM|not permitted|sandbox|EROFS|read.only file system/i, 'the transcript must contain the real refusal');
-  const passing = verifyResults.find(row => row.message.details?.exitCode === 0);
+  assert.match(textOf(denial!.message), /permission|denied|EPERM|EACCES|not permitted|EROFS|read.only file system/i, 'the transcript must contain the real refusal');
+  const passing = findVerificationProbeResult(verificationCalls, verifyResults, 'test');
   assert.ok(passing, 'the local test run must succeed under the sandbox');
-  assert.match(textOf(passing!.message), /# pass 1|ok 1 -/, 'the transcript must contain the passing test output');
+  assert.ok(hasPassingGuardOutput(textOf(passing!.message)), 'the transcript must contain the passing test output');
   assert.ok(hasProviderUsage(step.sessionFile), 'the read-only step must have real provider usage');
   assert.equal((readonly.result as any).writeDenied, true);
   assert.equal((readonly.result as any).fifoDenied, true);
   const fifoProof = JSON.parse(readFileSync(join(dir, 'readonly-fifo.json'), 'utf8'));
   assert.equal(fifoProof.control, 'OUTSIDE-CONTROL', 'the FIFO must have had a working outside peer');
   assert.equal(fifoProof.receivedBytes, 0);
-  const fifoCall = rows(step.sessionFile).flatMap(row => row.message?.role === 'assistant' ? row.message.content ?? [] : [])
-    .find(call => call.type === 'toolCall' && call.name === 'verify_command' && String(call.arguments?.command).includes('restricted.fifo'));
-  assert.ok(fifoCall, 'the real model must attempt the FIFO write');
-  const fifoResult = verifyResults.find(row => row.message.toolCallId === fifoCall.id);
+  const fifoResult = findVerificationProbeResult(verificationCalls, verifyResults, 'fifo');
   assert.ok(fifoResult && fifoResult.message.details?.exitCode !== 0, 'the actual FIFO write must fail');
   assert.match(textOf(fifoResult.message), /denied|EPERM|not permitted/i);
   assert.equal((readonly.result as any).testPassed, true);

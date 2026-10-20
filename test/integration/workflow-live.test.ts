@@ -34,14 +34,14 @@ it('real models execute old templates, advance pipeline independently and recove
   }
   writeFileSync(join(dir, 'CONTRACT.md'), 'isAdult(age) must return true for age >= 18 and false below 18.\n');
   writeFileSync(join(dir, 'eligibility.cjs'), 'exports.isAdult = age => age >= 18;\n');
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
-  git('init', '-q');
-  git('add', 'eligibility.cjs', 'CONTRACT.md');
-  git('-c', 'user.name=Workflow Test', '-c', 'user.email=workflow-test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'seed test contract');
-  writeFileSync(join(dir, 'eligibility.cjs'), 'exports.isAdult = age => age > 18;\n');
   writeFileSync(join(dir, 'safe.cjs'), 'exports.double = x => { const oldValue = x * 2; return oldValue; };\n');
   writeFileSync(join(dir, 'risky.cjs'), 'exports.isAdult = age => age > 18;\n');
   writeFileSync(join(dir, 'test.cjs'), ACCEPTANCE_SOURCE);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+  git('init', '-q');
+  git('add', 'eligibility.cjs', 'CONTRACT.md', 'safe.cjs', 'risky.cjs', 'test.cjs');
+  git('-c', 'user.name=Workflow Test', '-c', 'user.email=workflow-test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'seed test contract');
+  writeFileSync(join(dir, 'eligibility.cjs'), 'exports.isAdult = age => age > 18;\n');
   const pane = tmux('new-session', '-d', '-s', session, '-x', '140', '-y', '42', '-P', '-F', '#{pane_id}');
   const runtime = integrationRuntime();
   const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_WORKFLOW_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_WORKFLOW_MAX_CONCURRENT_AGENTS=4 PI_SUBAGENT_SHELL_READY_DELAY_MS=100 ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/workflow-live.ts'))} --session ${shellEscape(join(dir, 'parent.jsonl'))} 2>${shellEscape(join(dir, 'startup-error.log'))}; status=$?; echo $status >${shellEscape(join(dir, 'parent-exit.txt'))}; sleep 120`;

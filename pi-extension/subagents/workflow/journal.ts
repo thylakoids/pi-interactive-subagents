@@ -13,7 +13,7 @@
  * still replays the same results. Entries are appended only after the value is
  * known, so a truncated last line is always the one to discard.
  */
-import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import type { WorkflowJournalEntry, WorkflowMeta, WorkflowRunSnapshot } from "./types.ts";
@@ -150,13 +150,14 @@ export function loadJournal(path: string): JournalLoad {
   const entries = new Map<string, WorkflowJournalEntry>();
   const records: WorkflowJournalEntry[] = [];
   let skippedLines = 0;
-  if (!existsSync(path)) return { entries, records, skippedLines };
-
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
-  } catch {
-    return { entries, records, skippedLines };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { entries, records, skippedLines };
+    // An unreadable existing journal is not an empty history: treating it as
+    // one would execute already-settled side effects again during recovery.
+    throw error;
   }
 
   for (const line of raw.split("\n")) {
@@ -180,47 +181,70 @@ export function loadJournal(path: string): JournalLoad {
  * the run, which is what stops a second resume from re-running a live script.
  * A lock whose owner pid is gone is treated as stale and reclaimed.
  */
-export function acquireLock(runDir: string): { ok: true; path: string } | { ok: false; ownerPid: number } {
+type LockResult = { ok: true; path: string } | { ok: false; ownerPid: number; reason?: string };
+const ownedLocks = new Map<string, string>();
+
+export function acquireLock(runDir: string): LockResult {
   const path = join(runDir, "lock");
-  const payload = JSON.stringify({ pid: process.pid, at: Date.now() });
+  const token = randomBytes(16).toString("hex");
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), token });
+  if (createLock(path, payload, token)) return { ok: true, path };
+
+  // Serialize stale-owner inspection AND replacement. Overwriting a stale file
+  // directly lets two rescuers both acquire it, even if each uses wx initially.
+  const guard = `${path}.reclaim`;
   try {
-    const fd = openSync(path, "wx");
-    writeSync(fd, payload);
-    closeSync(fd);
-    return { ok: true, path };
-  } catch {
+    mkdirSync(guard);
+  } catch (error: any) {
+    if (error?.code !== "EEXIST") throw error;
+    return { ok: false, ownerPid: 0, reason: "another recovery owns lock.reclaim; an abandoned recovery guard requires manual inspection" };
+  }
+  try {
+    // The previous owner may have released while we were acquiring the guard.
+    if (createLock(path, payload, token)) return { ok: true, path };
     const existing = readJson<{ pid?: number }>(path);
-    const ownerPid = typeof existing?.pid === "number" ? existing.pid : 0;
-    if (ownerPid > 0 && !isProcessAlive(ownerPid)) return reclaimLock(path, payload, ownerPid);
-    // An unreadable lock is one whose owner died between creating the file and
-    // writing its pid. It must not block the run forever — but the write is
-    // immediate, so only an old one is treated as abandoned.
-    if (ownerPid === 0 && isAbandonedLock(path)) return reclaimLock(path, payload, 0);
-    return { ok: false, ownerPid };
+    const ownerPid = Number.isSafeInteger(existing?.pid) && existing!.pid! > 0 ? existing!.pid! : 0;
+    if (ownerPid === 0) {
+      return { ok: false, ownerPid, reason: "lock owner is unreadable; manual inspection required" };
+    }
+    if (isProcessAlive(ownerPid)) {
+      return { ok: false, ownerPid };
+    }
+    unlinkSync(path);
+    // A fresh acquire can win after unlink; wx, never overwrite, decides ownership.
+    return createLock(path, payload, token) ? { ok: true, path } : { ok: false, ownerPid: 0 };
+  } finally {
+    rmdirSync(guard);
   }
 }
 
-function reclaimLock(path: string, payload: string, ownerPid: number): { ok: true; path: string } | { ok: false; ownerPid: number } {
+function createLock(path: string, payload: string, token: string): boolean {
+  let fd: number;
   try {
-    writeFileSync(path, payload, "utf8");
-    return { ok: true, path };
-  } catch {
-    return { ok: false, ownerPid };
+    fd = openSync(path, "wx");
+  } catch (error: any) {
+    if (error?.code === "EEXIST") return false;
+    throw error;
   }
-}
-
-/** A lock with no readable owner is stale once it is older than the write. */
-function isAbandonedLock(path: string, graceMs = 5_000): boolean {
   try {
-    return Date.now() - statSync(path).mtimeMs > graceMs;
-  } catch {
-    return false;
+    writeFileSync(fd, payload, "utf8");
+    fsyncSync(fd);
+    ownedLocks.set(path, token);
+    return true;
+  } catch (error) {
+    unlinkSync(path);
+    throw error;
+  } finally {
+    closeSync(fd);
   }
 }
 
 export function releaseLock(path: string): void {
+  const token = ownedLocks.get(path);
+  if (!token) return;
+  ownedLocks.delete(path);
   try {
-    unlinkSync(path);
+    if (readJson<{ token?: string }>(path)?.token === token) unlinkSync(path);
   } catch {
     // Already gone.
   }

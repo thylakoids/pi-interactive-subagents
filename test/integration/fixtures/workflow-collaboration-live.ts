@@ -61,6 +61,10 @@ export default function collaboration(pi: any) {
         event('waiting-abort', { name: input.name, runId: run.runId });
         return { content: [{ type: 'text', text: 'Aborted while waiting. Now attempt exactly one subagent_message to this same name with message late reply. It must be rejected; do not resume, Focus or retry.' }] };
       }
+      await until(() => rows(running.sessionFile).some(row => row.message?.role === 'toolResult'
+        && row.message.toolName === 'subagent' && JSON.stringify(row.message.content).includes('NOT executed or queued')),
+      'early delegation is rejected before the parent replies', 45_000);
+      event('blocked-delegation-proven', { name: input.name });
       return { content: [{ type: 'text', text: 'Waiting confirmed. Now use subagent_message to send the secret token from your instructions.' }] };
     },
   });
@@ -69,7 +73,7 @@ export default function collaboration(pi: any) {
     try {
       const options = { baseDir: join(dir, 'artifacts'), cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME!, '.pi', 'agent'), sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), service: (globalThis as any).__pi_interactive_subagents.workflow };
       manager = new WorkflowManager(options);
-      run = await manager.start({ source: body('live-question-reply', 'First call ask_question with exactly: REPLY_CASE: What is the verification token? You do not know it; do not inspect parent sessions or guess. Stop and wait for your parent response. After receiving the token, use subagent to delegate to scout named delegate-proof: read fixture.txt and return its exact contents. Include the task context explicitly. Wait for the scout result; do not do its work yourself. Only after receiving both the parent token and scout result, use bash to write the token to answered.txt, then return the token and the scout result as your final value.'), args: {}, reuse: 'none' });
+      run = await manager.start({ source: body('live-question-reply', 'First call ask_question with exactly: REPLY_CASE: What is the verification token? You do not know it; do not inspect parent sessions or guess. Immediately after asking, deliberately attempt subagent to delegate to scout named delegate-proof: read fixture.txt and return its exact contents. Include the task context explicitly. This early attempt intentionally probes the runtime waiting gate before the parent reply; it must be rejected. Then stop and wait for the parent response. After receiving the token, follow the runtime notice about blocked calls and obtain the actual scout result; do not do its work yourself. Only after receiving both the parent token and scout result, use bash to write the token to answered.txt, then return the token and the scout result as your final value.'), args: {}, reuse: 'none' });
       event('reply-run-start', { runId: run.runId });
       const replied = await run.execute();
       save('replied', replied);
@@ -85,6 +89,12 @@ export default function collaboration(pi: any) {
       assert.ok(workerCalls.some(part => part.name === 'subagent' && part.arguments.agent === 'scout'));
       const workerEntries = rows(call.sessionFile!);
       assert.ok(workerEntries.some(row => row.message?.role === 'user' && JSON.stringify(row.message.content).includes(token)), 'Reply must enter the same live session');
+      const replyIndex = workerEntries.findIndex(row => row.message?.role === 'user'
+        && JSON.stringify(row.message.content).includes(token) && JSON.stringify(row.message.content).includes('[Runtime note:'));
+      assert.ok(replyIndex >= 0, 'the parent reply must explain that the early delegate was not started');
+      assert.ok(workerEntries.slice(replyIndex + 1).some(row => row.message?.role === 'assistant'
+        && Array.isArray(row.message.content) && row.message.content.some((part: any) => part.type === 'toolCall' && part.name === 'subagent')),
+      'the model must actually reissue delegation after the reply, not wait for a nonexistent child');
       const registry = readNameRegistry(join(dirname(call.sessionFile!), 'artifacts', getSessionId(call.sessionFile!)!));
       const scout = Object.values(registry).find((entry: any) => readSubagentLoadout(entry.sessionFile)?.agent === 'scout') as any;
       assert.ok(scout, 'A real delegated scout session must exist');
@@ -116,7 +126,7 @@ export default function collaboration(pi: any) {
       for (const file of [options.sessionFile, call.sessionFile!, scout.sessionFile, aborted.calls[0].sessionFile!]) {
         assert.ok(rows(file).some(row => row.message?.role === 'assistant' && (row.message.usage?.input > 0 || row.message.usage?.output > 0)), 'Every actor must have real provider responses');
       }
-      save('report', { ok: true, token, parentSession: options.sessionFile, workerSession: call.sessionFile, scoutSession: scout.sessionFile, abortedSession: aborted.calls[0].sessionFile, replies, checks: ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected'] });
+      save('report', { ok: true, token, parentSession: options.sessionFile, workerSession: call.sessionFile, scoutSession: scout.sessionFile, abortedSession: aborted.calls[0].sessionFile, replies, checks: ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry'] });
       event('all-passed');
     } catch (error: any) {
       manager?.abortAll('collaboration test failure');

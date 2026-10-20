@@ -460,7 +460,13 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  // The leading space is deliberate: zsh's HIST_IGNORE_SPACE (set by
+  // oh-my-zsh and most zsh setups) keeps space-prefixed lines out of the
+  // user's history file. Without it every spawn wrote a dead
+  // `bash /path/to/subagent-scripts/<id>.sh` entry to ~/.zsh_history,
+  // which piles up in history search and autosuggestions. The shell ignores
+  // the space itself, so nothing else changes.
+  sendCommand(surface, ` bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 

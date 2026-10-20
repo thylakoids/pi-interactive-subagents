@@ -30,14 +30,31 @@ the package's peer Pi binary for the user's installed runtime.
 - The workflow live suite checks both old templates, overlapping pipeline
   stages, and disk-based Abort/Resume against retained transcripts and files.
   It injects a truncated journal tail before recovery, then reloads again and
-  checks cached calls and unchanged side-effect markers. A successful first
+  checks cached calls and unchanged side-effect markers. Recovery also refuses an
+  unreadable journal, reclaims a dead process lock, and rejects a second manager
+  while the resumed run owns it. A successful first
   recovery alone cannot prove that its new settlements remain replayable.
 - The collaboration live suite checks actual parent replies, child delegation,
-  waiting-state Abort, and rejection of a late reply. All actors use real models.
+  waiting-state Abort, and rejection of a late reply. It forces a delegation attempt
+  before the parent answers, verifies that the attempt was blocked, then requires
+  the runtime notice and a real reissued delegation after the reply. A toolCall
+  without a launched scout is not evidence of successful delegation. All actors
+  use real models. The question gate is reserved at tool_call, before execute,
+  because the provider may return ask_question and delegation in one parallel
+  tool batch. Unit tests cover that pre-execution window and release the wait
+  only for the matching failed question.
 - The protection live suite observes actual panes before worker startup, cancels
   with Skip/Abort, and checks a real successor and disk Resume. A real model must
   attempt a denied write through verify_command and then run passing tests;
-  transcript results and unchanged file bytes are checked independently.
+  transcript results and unchanged file bytes are checked independently. Each
+  denial and passing test is correlated to its actual toolCallId; a successful
+  ls/cat is not a passing test, and a sandbox setup failure is not a denied write.
+  Passing TAP must report one pass and zero failures; the substring "ok" in
+  "not ok" is never accepted as success.
+  It faults the journal write during Skip of a running real tool and checks
+  that cancellation still prevents the delayed side effect. Its evidence matcher
+  requires the full foreground wait sequence, accepts harmless trailing
+  inspections, and rejects marker-only or backgrounded commands.
   It also attempts an existing FIFO write against a live outside peer, which
   read-only mounts alone do not prevent on Linux.
   It also aborts after a real verification command has started and checks the
@@ -45,9 +62,18 @@ the package's peer Pi binary for the user's installed runtime.
 - The review live suite checks fresh starts, explicit reuse, disk resume after
   borrowing cached calls, label-only edits, free-form structured objects, real
   isolated writes, nested scripts/depth errors, default-no-retry and opt-in
-  stall recovery. It requires all feature probes, not optional subtest gates.
+  stall recovery. A real billed completion exhausts a tiny run budget; a timed
+  late Abort must not overwrite that failure or disagree with disk/notifications.
+  It requires all feature probes, not optional subtest gates.
+- Shell-history regressions use a private tmux server and disposable history
+  files. Bash (both platforms) and zsh (macOS) must still record an ordinary
+  control command while ignoring the generated launch line with ignorespace
+  enabled; the quoted-path script must actually run.
 - Sandbox lifecycle regressions kill an actual owning process while its command
   is running; direct AbortSignal tests alone cannot prove parent-death cleanup.
+- Cache side-effect evidence distinguishes the actual append command from
+  read-only inspections mentioning the same marker filename. File bytes and
+  matching tool results remain independent requirements.
 - A prompt echoed on screen is not evidence of a tool call. Missing session
   paths must fail tests rather than silently bypass transcript assertions.
 
@@ -75,6 +101,15 @@ run's lifetime spend, and treated display labels as part of execution identity.
 - Cache regressions reload the manager from disk, rename labels, preserve
   independent repeated samples, and exercise old journal keys. Fresh starts,
   explicit cross-run reuse, and same-run resume have separate spend assertions.
+- Recovery-lock regressions synchronize real competing processes at stale-owner
+  reads and require exactly one winner. They also inject a snapshot/script update
+  immediately before lock acquisition, refuse unreadable journals, and verify that
+  initialization failures release only their own lock. Abandoned takeover guards
+  fail closed rather than guessing that another recovery is dead. An old lock
+  with unreadable ownership is never stolen merely because its mtime is old;
+  a live creator may be paused before writing its PID. Terminal-state
+  tests exercise both Abort/failure orderings before VM settlement, through actual
+  budget admission failures, and compare live state, disk state and notifications.
 - Journal regressions cover missing final newlines and interrupted JSON records,
   then append results and reload twice. Separate subprocesses inject short and
   zero-byte writes and flush failures; successful append must complete every
