@@ -29,6 +29,9 @@ the package's peer Pi binary for the user's installed runtime.
   imports. They check selected known faults, not general correctness.
 - The workflow live suite checks both old templates, overlapping pipeline
   stages, and disk-based Abort/Resume against retained transcripts and files.
+  It injects a truncated journal tail before recovery, then reloads again and
+  checks cached calls and unchanged side-effect markers. A successful first
+  recovery alone cannot prove that its new settlements remain replayable.
 - The collaboration live suite checks actual parent replies, child delegation,
   waiting-state Abort, and rejection of a late reply. All actors use real models.
 - The protection live suite observes actual panes before worker startup, cancels
@@ -72,6 +75,11 @@ run's lifetime spend, and treated display labels as part of execution identity.
 - Cache regressions reload the manager from disk, rename labels, preserve
   independent repeated samples, and exercise old journal keys. Fresh starts,
   explicit cross-run reuse, and same-run resume have separate spend assertions.
+- Journal regressions cover missing final newlines and interrupted JSON records,
+  then append results and reload twice. Separate subprocesses inject short and
+  zero-byte writes and flush failures; successful append must complete every
+  byte and fsync before returning. These tests establish the append boundary,
+  not transactional rollback of an agent's external side effects.
 - Worktree regressions use real Git repositories and compare the parent dirty
   state before/after; mock cwd propagation alone cannot prove isolation or
   preservation of untracked work and commits.

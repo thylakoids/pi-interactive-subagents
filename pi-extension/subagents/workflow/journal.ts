@@ -13,7 +13,7 @@
  * still replays the same results. Entries are appended only after the value is
  * known, so a truncated last line is always the one to discard.
  */
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import type { WorkflowJournalEntry, WorkflowMeta, WorkflowRunSnapshot } from "./types.ts";
@@ -115,9 +115,20 @@ export function readJson<T>(path: string): T | null {
 
 /** Append one journal line and flush, so a crash never loses a settled call. */
 export function appendJournal(path: string, entry: WorkflowJournalEntry): void {
-  const fd = openSync(path, "a");
+  const fd = openSync(path, "a+");
   try {
-    writeSync(fd, JSON.stringify(entry) + "\n");
+    const size = fstatSync(fd).size;
+    const tail = Buffer.alloc(1);
+    // A killed append may leave a partial line. Never join the next result to it.
+    const separator = size > 0 && readSync(fd, tail, 0, 1, size - 1) === 1 && tail[0] !== 10 ? "\n" : "";
+    const bytes = Buffer.from(separator + JSON.stringify(entry) + "\n");
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(fd, bytes, offset, bytes.length - offset);
+      if (written === 0) throw new Error("Workflow journal write made no progress.");
+      offset += written;
+    }
+    fsyncSync(fd);
   } finally {
     closeSync(fd);
   }

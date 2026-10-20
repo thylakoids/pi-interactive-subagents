@@ -9,6 +9,15 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['torn journal tail absorbs the next settlement', 'pi-extension/subagents/workflow/journal.ts',
+    'Buffer.from(separator + JSON.stringify(entry) + "\\n")', 'Buffer.from(JSON.stringify(entry) + "\\n")',
+    'result settled after a torn append', 'test/workflow-journal-recovery.test.ts'],
+  ['journal success does not flush its settlement', 'pi-extension/subagents/workflow/journal.ts',
+    '    fsyncSync(fd);', '',
+    'durability boundary handles short-write', 'test/workflow-journal-recovery.test.ts'],
+  ['journal ignores short writes', 'pi-extension/subagents/workflow/journal.ts',
+    '      offset += written;', '      offset = bytes.length;',
+    'durability boundary handles short-write', 'test/workflow-journal-recovery.test.ts'],
   ['live marker inspections mistaken for recovery execution', 'test/integration/live-evidence.ts',
     "    && /\\bif test -f first\\.pid; then/.test(call.arguments.command) && call.arguments.command.includes('sleep 90');",
     "    && call.arguments.command.includes('first.pid');",

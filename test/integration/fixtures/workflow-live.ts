@@ -176,6 +176,7 @@ export default function liveFixture(pi: any) {
         record('abort-passed', { runId: recovery.runId, stoppedChild: oldPane });
 
         writeFileSync(join(dir, 'allow-resume'), 'release');
+        appendFileSync(join(aborted.runDir, 'journal.jsonl'), '{"type":"call","callKey":"interrupted-write');
         manager = diskManager; // Reload state rather than relying on in-memory cache.
         const resumed = await manager.resume(recovery.runId);
         const restored = await resumed.execute();
@@ -190,6 +191,13 @@ export default function liveFixture(pi: any) {
         assert.equal(readFileSync(join(dir, 'resumed-side-effect'), 'utf8').trim(), 'resumed');
         assert.match((restored.result as any).first, /COMPLETED_ONCE/);
         assert.match((restored.result as any).second, /RESUMED_OK/);
+        const replayed = await (await new WorkflowManager(options).resume(recovery.runId)).execute();
+        assert.equal(replayed.status, 'completed', replayed.error);
+        assert.ok(replayed.calls.every(call => call.cached), 'Settlements after a torn journal tail survive another disk reload');
+        assert.deepEqual(replayed.result, restored.result);
+        assert.equal(readFileSync(join(dir, 'completed-side-effect'), 'utf8').trim(), 'done');
+        assert.equal(readFileSync(join(dir, 'resumed-side-effect'), 'utf8').trim(), 'resumed');
+        assert.deepEqual(readFileSync(join(dir, 'resume-attempts'), 'utf8').trim().split('\n'), ['started', 'started']);
         record('resume-passed', { runId: recovery.runId });
         writeFileSync(join(dir, 'report.json'), JSON.stringify({ ok: true, model: process.env.PI_TEST_MODEL, checks: Object.keys(saved) }, null, 2));
       } catch (error: any) {
