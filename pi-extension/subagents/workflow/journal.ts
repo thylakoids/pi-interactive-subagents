@@ -13,9 +13,10 @@
  * still replays the same results. Entries are appended only after the value is
  * known, so a truncated last line is always the one to discard.
  */
-import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { runLockTransaction } from "./run-lock.ts";
 import type { WorkflowJournalEntry, WorkflowMeta, WorkflowRunSnapshot } from "./types.ts";
 
 export const RUNS_DIRNAME = "workflows";
@@ -176,87 +177,52 @@ export function loadJournal(path: string): JournalLoad {
   return { entries, records, skippedLines };
 }
 
-/**
- * Exclusive run lock. `openSync(..., "wx")` fails when another process holds
- * the run, which is what stops a second resume from re-running a live script.
- * A lock whose owner pid is gone is treated as stale and reclaimed.
- */
-type LockResult = { ok: true; path: string } | { ok: false; ownerPid: number; reason?: string };
+/** Logical ownership outlives the short, crash-released kernel transaction. */
 const ownedLocks = new Map<string, string>();
+const pendingReleases = new Map<string, string>();
 
-export function acquireLock(runDir: string): LockResult {
+export function acquireLock(runDir: string) {
   const path = join(runDir, "lock");
+  const pending = pendingReleases.get(path);
+  if (pending) {
+    if (!releaseToken(path, pending)) return { ok: false as const, ownerPid: process.pid, reason: "previous owned release still cannot be persisted" };
+    pendingReleases.delete(path);
+    if (ownedLocks.get(path) === pending) ownedLocks.delete(path);
+  }
   const token = randomBytes(16).toString("hex");
-  const payload = JSON.stringify({ pid: process.pid, at: Date.now(), token });
-  if (createLock(path, payload, token)) return { ok: true, path };
-
-  // Serialize stale-owner inspection AND replacement. Overwriting a stale file
-  // directly lets two rescuers both acquire it, even if each uses wx initially.
-  const guard = `${path}.reclaim`;
+  let result;
   try {
-    mkdirSync(guard);
-  } catch (error: any) {
-    if (error?.code !== "EEXIST") throw error;
-    return { ok: false, ownerPid: 0, reason: "another recovery owns lock.reclaim; an abandoned recovery guard requires manual inspection" };
-  }
-  try {
-    // The previous owner may have released while we were acquiring the guard.
-    if (createLock(path, payload, token)) return { ok: true, path };
-    const existing = readJson<{ pid?: number }>(path);
-    const ownerPid = Number.isSafeInteger(existing?.pid) && existing!.pid! > 0 ? existing!.pid! : 0;
-    if (ownerPid === 0) {
-      return { ok: false, ownerPid, reason: "lock owner is unreadable; manual inspection required" };
-    }
-    if (isProcessAlive(ownerPid)) {
-      return { ok: false, ownerPid };
-    }
-    unlinkSync(path);
-    // A fresh acquire can win after unlink; wx, never overwrite, decides ownership.
-    return createLock(path, payload, token) ? { ok: true, path } : { ok: false, ownerPid: 0 };
-  } finally {
-    rmdirSync(guard);
-  }
-}
-
-function createLock(path: string, payload: string, token: string): boolean {
-  let fd: number;
-  try {
-    fd = openSync(path, "wx");
-  } catch (error: any) {
-    if (error?.code === "EEXIST") return false;
-    throw error;
-  }
-  try {
-    writeFileSync(fd, payload, "utf8");
-    fsyncSync(fd);
-    ownedLocks.set(path, token);
-    return true;
+    result = runLockTransaction(runDir, "acquire", token);
   } catch (error) {
-    unlinkSync(path);
+    // A helper may die after publishing but before returning its acknowledgement.
+    // Remove only this attempt's token, never an unrelated or legacy owner.
+    if (!releaseToken(path, token)) pendingReleases.set(path, token);
     throw error;
-  } finally {
-    closeSync(fd);
   }
+  if (result.ok) ownedLocks.set(result.path, token);
+  return result;
 }
 
-export function releaseLock(path: string): void {
+function releaseToken(path: string, token: string): boolean {
+  // Token-checked release is idempotent, even if the acknowledgement is lost.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { if (runLockTransaction(dirname(path), "release", token).ok) return true; } catch { /* Retry a killed helper once. */ }
+  }
+  return false;
+}
+
+export function releaseLock(path: string): boolean {
   const token = ownedLocks.get(path);
-  if (!token) return;
+  if (!token) return true;
+  if (!releaseToken(path, token)) {
+    // A storage outage must not replace the workflow's result with a teardown
+    // exception. Retain the token and retry on the next same-process acquisition.
+    pendingReleases.set(path, token);
+    return false;
+  }
   ownedLocks.delete(path);
-  try {
-    if (readJson<{ token?: string }>(path)?.token === token) unlinkSync(path);
-  } catch {
-    // Already gone.
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error: any) {
-    return error?.code === "EPERM";
-  }
+  pendingReleases.delete(path);
+  return true;
 }
 
 export function snapshotPath(runDir: string): string {

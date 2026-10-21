@@ -15,13 +15,14 @@ function directory(t: TestContext) {
   return dir;
 }
 
-it('exactly one process reclaims a dead run owner under synchronized contention', { timeout: 15000 }, async t => {
+it('exactly one process reclaims a dead run owner under synchronized contention', { timeout: 20000 }, async t => {
   const dir = directory(t);
-  const lock = join(dir, 'lock');
-  const go = join(dir, 'go');
-  const dead = spawnSync(process.execPath, ['-e', '']);
-  assert.equal(dead.status, 0);
-  writeFileSync(lock, JSON.stringify({ pid: dead.pid }));
+  const dead = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const {acquireLock} = await import(${JSON.stringify(journalModule)});
+    if (!acquireLock(${JSON.stringify(dir)}).ok) throw new Error('seed owner refused');
+  `], {encoding:'utf8'});
+  assert.equal(dead.status, 0, dead.stderr);
+  assert.equal(JSON.parse(readFileSync(join(dir,'lock'),'utf8')).pid,dead.pid);
   const children: ReturnType<typeof spawn>[] = [];
   const closed: Promise<unknown>[] = [];
   t.after(async () => {
@@ -31,31 +32,15 @@ it('exactly one process reclaims a dead run owner under synchronized contention'
   const ready = new Set<number>();
   const results: any[] = [];
   await new Promise<void>((resolve, reject) => {
-    for (let index = 0; index < 4; index++) {
+    for (let index = 0; index < 6; index++) {
       const child = spawn(process.execPath, ['--input-type=module', '-e', `
-        import fs from 'node:fs';
-        import { syncBuiltinESMExports } from 'node:module';
-        const read = fs.readFileSync;
-        let paused = false;
-        fs.readFileSync = (path, ...args) => {
-          const value = read(path, ...args);
-          if (path === ${JSON.stringify(lock)} && !paused) {
-            paused = true;
-            process.send({ kind: 'ready' });
-            const timeout = Date.now() + 10000;
-            while (!fs.existsSync(${JSON.stringify(go)})) {
-              if (Date.now() > timeout) throw new Error('contention barrier timed out');
-              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-            }
-          }
-          return value;
-        };
-        syncBuiltinESMExports();
         const { acquireLock } = await import(${JSON.stringify(journalModule)});
-        const result = acquireLock(${JSON.stringify(dir)});
-        process.send({ kind: 'result', result });
-        setInterval(() => {}, 1000);
-      `], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+        process.on('message', () => {
+          const result = acquireLock(${JSON.stringify(dir)});
+          process.send({kind:'result', result});
+        });
+        process.send({kind:'ready'});
+      `], {stdio:['ignore','ignore','pipe','ipc']});
       children.push(child);
       closed.push(once(child, 'close'));
       let stderr = '';
@@ -63,16 +48,16 @@ it('exactly one process reclaims a dead run owner under synchronized contention'
       child.on('error', reject);
       child.on('exit', () => reject(new Error('contender exited before cleanup: ' + stderr)));
       child.on('message', (message: any) => {
-        ready.add(index);
-        if (ready.size === 4) writeFileSync(go, 'release captured owner reads');
-        if (message.kind === 'result') results.push({ ...message.result, pid: child.pid });
-        if (results.length === 4) resolve();
+        if (message.kind === 'ready') ready.add(index);
+        if (message.kind === 'ready' && ready.size === 6) for (const c of children) c.send('go');
+        if (message.kind === 'result') results.push({...message.result,pid:child.pid});
+        if (results.length === 6) resolve();
       });
     }
   });
   const winners = results.filter(result => result.ok);
   assert.equal(winners.length, 1, 'stale lock replacement must not overwrite another successful rescuer');
-  assert.equal(JSON.parse(readFileSync(lock, 'utf8')).pid, winners[0].pid);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'lock'), 'utf8')).pid, winners[0].pid);
 });
 
 it('release cannot delete a replacement owner token', t => {
@@ -114,6 +99,7 @@ it('resume reads snapshot and script only after acquiring ownership', t => {
   const program = join(dir, 'resume-race.mjs');
   writeFileSync(program, `
     import fs from 'node:fs';
+    import cp from 'node:child_process';
     import assert from 'node:assert/strict';
     import { join } from 'node:path';
     import { syncBuiltinESMExports } from 'node:module';
@@ -123,10 +109,10 @@ it('resume reads snapshot and script only after acquiring ownership', t => {
     try {
       const run = await f.manager.start({source:script("return {seen:'stale-script'};"),args:{version:'stale'}});
       await run.execute();
-      const open = fs.openSync;
+      const spawn = cp.spawnSync;
       let injected = false;
-      fs.openSync = (path, flags, ...rest) => {
-        if (path === join(run.runDir, 'lock') && flags === 'wx' && !injected) {
+      cp.spawnSync = (command, args, ...rest) => {
+        if (command === 'python3' && args[3] === 'acquire' && !injected) {
           injected = true;
           const path = join(run.runDir, 'snapshot.json');
           const snapshot = JSON.parse(fs.readFileSync(path, 'utf8'));
@@ -134,7 +120,7 @@ it('resume reads snapshot and script only after acquiring ownership', t => {
           fs.writeFileSync(path, JSON.stringify(snapshot));
           fs.writeFileSync(join(run.runDir, 'script.js'), script('return {seen:args.version};'));
         }
-        return open(path, flags, ...rest);
+        return spawn(command, args, ...rest);
       };
       syncBuiltinESMExports();
       const view = await (await f.reload().resume(run.runId)).execute();
@@ -168,34 +154,33 @@ it('an unreadable journal refuses resume and releases ownership for a repaired r
 for (const fault of ['script-write', 'lock-refused', 'lock-write']) {
   it('start refuses partial initialization and cleans its owned lock: ' + fault, t => {
     const dir = directory(t);
-    const program = join(dir, 'start-fault.mjs');
     const helper = new URL('./helpers/workflow.ts', import.meta.url).href;
+    const program = join(dir, 'start-fault.mjs');
     writeFileSync(program, `
       import fs from 'node:fs';
+      import cp from 'node:child_process';
       import assert from 'node:assert/strict';
       import { dirname, join } from 'node:path';
       import { syncBuiltinESMExports } from 'node:module';
       import { fixture, script } from ${JSON.stringify(helper)};
       const cleanups = [];
       const f = fixture({after(fn){cleanups.push(fn);}}, () => ({text:'unused'}), {baseDir:${JSON.stringify(dir)}});
-      const originalWrite = fs.writeFileSync, originalOpen = fs.openSync;
-      let runDir, lockFd;
+      const originalWrite = fs.writeFileSync, originalSpawn = cp.spawnSync;
+      let runDir;
       fs.writeFileSync = (path, ...rest) => {
-        if (${JSON.stringify(fault)} === 'lock-write' && typeof path === 'number') throw new Error('injected lock write failure');
         if (${JSON.stringify(fault)} === 'script-write' && typeof path === 'string' && path.endsWith('/script.js')) {
           runDir = dirname(path);
           throw new Error('injected script write failure');
         }
         return originalWrite(path, ...rest);
       };
-      fs.openSync = (path, flags, ...rest) => {
-        if (${JSON.stringify(fault)} === 'lock-refused' && typeof path === 'string' && path.endsWith('/lock') && flags === 'wx' && !runDir) {
-          runDir = dirname(path);
-          originalWrite(path, JSON.stringify({pid:process.pid,token:'foreign-live-owner'}));
+      cp.spawnSync = (command, args, ...rest) => {
+        if (command === 'python3' && args[3] === 'acquire') {
+          runDir = args[2];
+          if (${JSON.stringify(fault)} === 'lock-refused') originalWrite(join(runDir,'lock'), JSON.stringify({pid:process.pid,token:'foreign-live-owner'}));
+          if (${JSON.stringify(fault)} === 'lock-write') args = args.map((arg, index) => index === 1 ? arg.replace('os.fsync(stream.fileno())', "raise OSError('injected lock write failure')") : arg);
         }
-        const fd = originalOpen(path, flags, ...rest);
-        if (typeof path === 'string' && path.endsWith('/lock') && flags === 'wx') { runDir = dirname(path); lockFd = fd; }
-        return fd;
+        return originalSpawn(command, args, ...rest);
       };
       syncBuiltinESMExports();
       try {
@@ -204,7 +189,6 @@ for (const fault of ['script-write', 'lock-refused', 'lock-write']) {
         const lock = join(runDir, 'lock');
         if (${JSON.stringify(fault)} !== 'lock-refused') assert.equal(fs.existsSync(lock), false, 'failed start cannot strand its live-PID lock');
         else assert.equal(JSON.parse(fs.readFileSync(lock,'utf8')).token,'foreign-live-owner');
-        if (${JSON.stringify(fault)} === 'lock-write') assert.throws(() => fs.fstatSync(lockFd), /EBADF/);
         assert.equal(f.calls.length,0);
       } finally { for (const cleanup of cleanups.reverse()) cleanup(); }
     `);

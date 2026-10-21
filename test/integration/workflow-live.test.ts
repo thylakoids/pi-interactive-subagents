@@ -3,7 +3,7 @@ import { integrationRuntime } from './runtime.ts';
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
@@ -57,6 +57,14 @@ it('real models execute old templates, advance pipeline independently and recove
   assert.ok(existsSync(join(dir, 'report.json')), 'Timed out; inspect retained sessions and events in ' + dir);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
   assert.equal(report.ok, true, report.error);
+  const events = readFileSync(join(dir, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const crash = events.find(event => event.event === 'lock-crashes-injected');
+  assert.deepEqual(crash?.details, {ownerSignal:'SIGKILL',helperSignal:'SIGKILL'}, 'actual owner/helper crash injection is required');
+  const resumed = JSON.parse(readFileSync(join(dir, 'resumed.json'), 'utf8'));
+  assert.ok(existsSync(join(resumed.runDir, 'lock.guard')), 'the stable kernel guard survives recovery');
+  assert.equal(existsSync(join(resumed.runDir, 'lock')), false);
+  // A dangling symlink does not satisfy existsSync; readdir proves it was removed.
+  assert.equal(readdirSync(resumed.runDir).includes('lock.reclaim'), false);
   const evidence = verifyLiveEvidence(dir);
   t.diagnostic(evidence.uniqueRealChildSessions + ' real child sessions; ' + evidence.toolCalls + ' model tool calls; retained evidence verified independently');
   assert.deepEqual(report.checks, ['review', 'migration', 'pipeline-overlap', 'pipeline', 'aborted', 'aborted-disk', 'resumed']);

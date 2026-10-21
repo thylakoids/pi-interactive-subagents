@@ -268,7 +268,7 @@ Critique → Revise，直到验收或轮数/调用/token guard 触顶。`args`�
 workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 ```
 
-面板里展开 run 并选择 `Resume workflow` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁通过独占接管自动回收；无法识别持有者的空锁或损坏锁不会仅因时间久而被抢占，需人工检查（原持有者可能只是暂停或 I/O 卡住），竞争接管不会覆盖新持有者。若接管进程恰好在关键区被杀，残留的 `lock.reclaim` 会明确拒绝再次接管；需要先确认没有任何执行/恢复进程，再人工检查并移除该空目录，不能在运行中强行删锁。snapshot、脚本和 journal 在持锁后读取；journal 读取发生 I/O 错误会拒绝恢复，不能当作空历史继续执行。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
+面板里展开 run 并选择 `Resume workflow` 也可以。正在本会话运行中、或被另一个活进程持锁的 run 会被拒绝；死进程留下的锁通过内核文件锁保护的短事务自动回收。完整的持有者记录在 fsync 后原子发布，不再产生“已公开但尚未写 PID”的空锁窗口。接管进程崩溃后内核自动释放事务锁，下次获取会清理可识别的临时记录和兼容门闩，无需删锁。持有者记录带主进程的内核启动身份（Linux boot ID、PID namespace 与 start ticks；macOS boot session UUID 与 libproc 启动时间），PID 被复用时可以证明旧实例已死亡后回收。匹配的活跃/暂停进程不能抢占，身份无法读取时保守拒绝；新获取无法读取启动身份时明确拒绝，不生成 PID-only 锁；旧版无启动身份的记录需要一次人工确认，不能用本地 PID 不存在推断未知命名空间的持有者已死。跨主机、同一 boot 下跨 PID namespace 的记录不通过本地 PID 推断生死。无法识别持有者的旧版空锁/损坏锁，以及旧版无身份的 `lock.reclaim/` 目录仍需人工检查；不能按年龄强删。运行目录必须位于本机文件系统，不支持多主机共享目录的锁协调。snapshot、脚本和 journal 在持锁后读取；journal 读取发生 I/O 错误会拒绝恢复，不能当作空历史继续执行。resume 沿用 run 原始快照里的 `args` 和预算；也可以传 `args` 覆盖、传 `script` 换上改过的脚本（改动会被写回 run 目录，下次 resume 继续用它）。恢复要求还是同一个 pi 会话（run 存在该会话的 artifacts 目录里），重启后继续原会话即可——重启后 `/workflow <runId>` 也能打开磁盘上的 run。
 
 **跳过的调用不会被当作已完成重放。** 只有 `completed` 进缓存；`skipped`（面板里手动跳过）和 `failed` 都不会在 resume 或重跑时“冒充”完成——它们会真正重新执行。被跳过时脚本拿到 `null` 并继续，这是用户的决定，不是错误。
 
@@ -331,6 +331,7 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 - 单次 `parallel` / `pipeline` 最多 4096 项；单个 run 最多 1000 个 `agent()` 调用，再开会被拒绝（`Workflow exceeded 1000 agents in one run`）。按**实际启动次数**计，不是按去重后的键——否则一个反复发同一个调用的死循环永远撞不到这个上限。
 - 设了 `PI_WORKFLOW_TOKEN_BUDGET` 时，预算用尽会让 run 失败（而不是只报个数继续跑）。
 - 支持一层嵌套：child 不能再调用 `workflow()`；每个 run 最多 64 个 child 调用、同时 16 个 child VM，并共享父 run 的预算与 agent 并发限制。
+- 运行锁在 macOS/Linux 上需要 PATH 中的 Python 3（标准库 `fcntl.flock`）；缺失或锁后端失败会明确拒绝执行，不退回不安全的文件年龄判断。
 - 需要 tmux；pi 会话必须有持久化 session 文件，否则 start 直接以 `Cannot run a workflow: …` 拒绝。
 - `agent()` 只能使用当前会话允许的 agent 定义（与 `subagent` 工具同一套 allowlist），都不满足时会报错。
 - 超时是两层的，都不按整轮的墙钟算：脚本自身 30 分钟没有任何进展、且没有未结算的调用，才中止整轮；单个 `agent()` 调用累计运行 60 分钟仍未结束则以 `failed` 结算，脚本拿到 `null` 继续，其他调用和整轮都不受影响。等待 `ask_question` 回复（状态 `waiting`）默认不设上限：等待是 run 自己要来的状态，进程退出由 watcher 结算，运行时不会在无法证明失联时猜它死掉；只有显式设置 `PI_WORKFLOW_WAIT_TIMEOUT_MS`（毫秒，`0` 关闭）才给等待设上限，超出的等待时间开始计入上面的 60 分钟。`PI_WORKFLOW_CALL_TIMEOUT_MS` 改单调用上限，`0` 关闭。
@@ -349,8 +350,10 @@ subagent_message({ name: 'migrate-imports-migrate-src-a-ts', message: '为什么
 | `output.json` | 脚本 `return` 的值（`{ ok: true, value: … }`，仅成功时存在） |
 | `calls/<callKey>/schema.json` | 传给该子代理的 JSON Schema（仅结构化调用） |
 | `calls/<callKey>/result.json` | 子代理通过 `structured_output` 回传的结果（仅结构化调用）；缺失 = 它完成时没调用该工具 |
-| `lock` | 运行期间持有，包含持有者 PID 与随机 ownership token，防止两个进程同时执行同一个 run；死锁通过独占接管回收 |
-| `lock.reclaim/` | 仅接管期间存在的互斥目录；若接管进程被杀后残留，拒绝自动删除，需要确认没有执行者后人工处理 |
+| `lock` | 运行期间持有，包含持有者 PID、内核启动身份与随机 ownership token，防止两个进程同时执行同一个 run；死锁通过独占接管回收 |
+| `lock.guard` | 永久保留的内核文件锁 inode；只在获取/释放短事务中持锁，进程崩溃自动解锁；不要在使用中删除 |
+| `lock.reclaim` | 短事务中的带版本符号链接，阻止旧版本并发接管；崩溃残留可自动恢复。旧版无身份目录仍需检查 |
+| `.lock-owner-*` | 发布前的私有持有者记录；完成写入后通过硬链接原子发布，崩溃残留在下次事务中清理 |
 
 定位失败：
 

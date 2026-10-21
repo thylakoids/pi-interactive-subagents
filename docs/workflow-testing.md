@@ -101,15 +101,32 @@ run's lifetime spend, and treated display labels as part of execution identity.
 - Cache regressions reload the manager from disk, rename labels, preserve
   independent repeated samples, and exercise old journal keys. Fresh starts,
   explicit cross-run reuse, and same-run resume have separate spend assertions.
-- Recovery-lock regressions synchronize real competing processes at stale-owner
-  reads and require exactly one winner. They also inject a snapshot/script update
-  immediately before lock acquisition, refuse unreadable journals, and verify that
-  initialization failures release only their own lock. Abandoned takeover guards
-  fail closed rather than guessing that another recovery is dead. An old lock
-  with unreadable ownership is never stolen merely because its mtime is old;
-  a live creator may be paused before writing its PID. Terminal-state
-  tests exercise both Abort/failure orderings before VM settlement, through actual
-  budget admission failures, and compare live state, disk state and notifications.
+- Recovery-lock regressions release six real competing processes from an IPC
+  barrier and require exactly one winner. The kernel transaction is also paused
+  deterministically before flush, after flush, after publication and after release;
+  another process must be denied at each boundary. SIGKILL of the actual helper
+  must release the kernel mutex, recover its identifiable compatibility gate,
+  clean unpublished records and handle lost acknowledgements without manual
+  deletion. The guard inode must remain identical across recovery.
+- A real run owner is stopped with SIGSTOP: neither age nor paused execution
+  permits takeover. Only after SIGKILL and process exit may recovery proceed.
+  Tests require actual OS birth identities, simulate PID reuse using a dead
+  child's retained identity and a different live process, and reject foreign
+  PID namespaces even for locally absent PIDs. Identity inspection failure must
+  not permit takeover or publish a new PID-only record. Legacy records without
+  a birth identity cannot be declared dead using namespace-blind PID checks.
+  Unknown legacy records/guards, foreign-host records and an unavailable Python
+  backend fail closed. Source/snapshot updates before acquisition, journal I/O
+  failures, initialization errors and ownership-token release remain covered.
+- The billed template/pipeline suite kills a real lock owner, then kills a real
+  Python helper after fsync but before publication. Disk Resume must recover
+  without deleting either crash artifact, preserve completed results and launch
+  only the interrupted step. Independent checks require the crash event, stable
+  guard artifact, absent compatibility gate, retained transcripts and unchanged
+  completed side effects.
+- Terminal-state tests exercise both Abort/failure orderings before VM settlement,
+  through actual budget admission failures, and compare live state, disk state
+  and notifications.
 - Journal regressions cover missing final newlines and interrupted JSON records,
   then append results and reload twice. Separate subprocesses inject short and
   zero-byte writes and flush failures; successful append must complete every

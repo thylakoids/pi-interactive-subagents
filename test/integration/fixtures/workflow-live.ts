@@ -1,10 +1,11 @@
 /** Live-provider probes: production service, real child sessions, unmodified templates. */
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import subagentsExtension from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager } from '../../../pi-extension/subagents/workflow/manager.ts';
+import { RUN_LOCK_HELPER } from '../../../pi-extension/subagents/workflow/run-lock.ts';
 import { BUNDLED_WORKFLOWS_DIR } from '../../../pi-extension/subagents/workflow/script.ts';
 import { readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import type { WorkflowRunView } from '../../../pi-extension/subagents/workflow/types.ts';
@@ -181,12 +182,27 @@ export default function liveFixture(pi: any) {
         await assert.rejects(new WorkflowManager(options).resume(recovery.runId), /EISDIR|directory/);
         rmdirSync(journal);
         renameSync(journal + '.saved', journal);
-        const deadPid = Number(execFileSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' }).trim());
         const lock = join(aborted.runDir, 'lock');
         writeFileSync(lock, '{');
         utimesSync(lock, new Date(0), new Date(0));
         await assert.rejects(new WorkflowManager(options).resume(recovery.runId), /manual inspection/);
-        writeFileSync(join(aborted.runDir, 'lock'), JSON.stringify({ pid: deadPid }));
+        unlinkSync(lock); // Repair only the deliberately corrupted legacy record above.
+        const lockModule = new URL('../../../pi-extension/subagents/workflow/journal.ts', import.meta.url).href;
+        const crashedOwner = spawnSync(process.execPath, ['--input-type=module', '-e', `
+          const {acquireLock} = await import(${JSON.stringify(lockModule)});
+          if (!acquireLock(${JSON.stringify(aborted.runDir)}).ok) throw new Error('live crash probe could not own the run');
+          process.kill(process.pid, 'SIGKILL');
+        `], {encoding:'utf8', timeout:10000});
+        assert.equal(crashedOwner.signal, 'SIGKILL', crashedOwner.stderr);
+        assert.equal(JSON.parse(readFileSync(lock,'utf8')).pid,crashedOwner.pid);
+        const crashedHelper = spawnSync('python3', ['-c', RUN_LOCK_HELPER.replace(
+          'os.fsync(stream.fileno())', 'os.fsync(stream.fileno()); os.kill(os.getpid(), 9)'),
+          aborted.runDir, 'acquire', String(process.pid), 'crashed-live-probe'], {encoding:'utf8',timeout:10000});
+        assert.equal(crashedHelper.signal,'SIGKILL',crashedHelper.stderr);
+        assert.equal(existsSync(lock),false,'the crashed helper must leave an unpublished record, not an empty public lock');
+        record('lock-crashes-injected', {ownerSignal:crashedOwner.signal,helperSignal:crashedHelper.signal});
+        // No lock/gate deletion follows either crash: disk resume must recover it.
+
         writeFileSync(join(dir, 'allow-resume'), 'release');
         appendFileSync(join(aborted.runDir, 'journal.jsonl'), '{"type":"call","callKey":"interrupted-write');
         manager = diskManager; // Reload state rather than relying on in-memory cache.

@@ -1210,7 +1210,7 @@ export class WorkflowRun {
   private finish(): void {
     if (this.finished) return;
     this.finished = true;
-    if (this.lockPath) releaseLock(this.lockPath);
+    if (this.lockPath && !releaseLock(this.lockPath)) this.note("could not persist lock release; retained ownership for a later retry");
     const view = this.view();
     if (!this.settledNotified) {
       this.settledNotified = true;
@@ -1426,7 +1426,7 @@ export class WorkflowManager {
     if (!lock.ok) {
       throw new WorkflowScriptError(
         `Run ${runId} is locked by process ${lock.ownerPid || "unknown"}${lock.reason ? ` (${lock.reason})` : ""}. ` +
-          "Abort it first, or resume after it settles. A lock left by a dead process is reclaimed automatically.",
+          "Abort it first, or resume after it settles. A lock with verifiable identity left by a dead process is reclaimed automatically.",
       );
     }
 
