@@ -330,7 +330,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
     },
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     // Anything still in flight settles after this point, when every handle
     // this extension holds is stale: drop the ctx, refuse to notify, and stop
     // the agents so no pane is left running with nobody listening.
@@ -339,26 +339,20 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
     // The overlay's refresh timer dies with the session even if the TUI never
     // got to dispose the component.
     panel?.dispose();
+    const running = manager?.running() ?? [];
     manager?.abortAll("session ended");
+    await Promise.all(running.map(run => run.execute()));
+    manager = null;
+    panel = null;
   });
 
-  // A reload — or a second session in the same process — replaces the session
-  // the way a shutdown does, and the extension instance survives it; without
-  // this the next session would start with the ctx dropped and notifications
-  // disabled.
+  // The same extension instance can serve a subsequent session.
   pi.on("session_start", (_event, ctx) => {
     sessionLive = true;
     latestCtx = ctx;
   });
 }
 
-/**
- * Whether terminal-only UI (the overlay) is available.
- *
- * Read structurally rather than from the type: the plugin compiles against an
- * older SDK revision whose `ExtensionContext` predates `mode`, while the
- * installed runtime provides it.
- */
 /**
  * Optional per-run token budget, from `PI_WORKFLOW_TOKEN_BUDGET`.
  * Invalid or non-positive values are ignored rather than guessed at.
@@ -370,10 +364,8 @@ function readTokenBudget(): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function isTui(ctx: unknown): boolean {
-  const candidate = ctx as { mode?: unknown; hasUI?: unknown };
-  if (typeof candidate.mode === "string") return candidate.mode === "tui";
-  return candidate.hasUI === true;
+function isTui(ctx: ExtensionContext): boolean {
+  return ctx.mode === "tui";
 }
 
 function formatStartMessage(action: string, view: WorkflowRunView): string {

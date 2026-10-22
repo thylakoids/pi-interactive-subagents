@@ -168,11 +168,12 @@ if [ "$container_arch" != "$server_arch" ]; then
   die "the container runs $container_arch while the docker server is $server_arch: that is emulation, not acceptance evidence"
 fi
 
-# The only skips allowed in a terminal run: the four billed live suites, which
+# The only skips allowed in a terminal run: the five billed live suites, which
 # run separately with PI_WORKFLOW_LIVE=1. Anything else - the read-only sandbox
 # suite, lifecycle, surface, the UI tree - must really run.
 ALLOWED_TERMINAL_SKIPS="$LOG_DIR/allowed-terminal-skips.txt"
 cat > "$ALLOWED_TERMINAL_SKIPS" <<'EOF'
+real workflow survives reload, records child crash, and drains parent shutdown
 real parent answers workflow questions, worker delegates, and waiting workflow can Abort
 real models execute old templates, advance pipeline independently and recover after Abort
 cancels a launch before its child starts and runs a read-only step under the sandbox
@@ -252,7 +253,7 @@ run_suite() {
     terminal)
       skips_in "$suite_log" > "$suite_dir/terminal-skips.txt"
       if ! diff -u "$ALLOWED_TERMINAL_SKIPS" "$suite_dir/terminal-skips.txt" > "$suite_dir/terminal-skips.diff"; then
-        fail_suite "terminal: unexpected skips (only the four live suites may skip):"
+        fail_suite "terminal: unexpected skips (only the five live suites may skip):"
         sed -n '3,40p' "$suite_dir/terminal-skips.diff" | sed 's/^/  /'
       fi
       ;;
@@ -271,7 +272,7 @@ wanted() { [ "$SUITE" = all ] || [ "$SUITE" = "$1" ]; }
 if wanted unit;      then run_suite unit      "npm test"; fi
 if wanted mutations; then run_suite mutations "node test/mutations/workflow.mjs"; fi
 if wanted terminal;  then run_suite terminal  "npm run test:package-install && npm run test:integration"; fi
-if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts"; fi
+if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-*live.test.ts"; fi
 
 {
   echo "suite       exit  log"

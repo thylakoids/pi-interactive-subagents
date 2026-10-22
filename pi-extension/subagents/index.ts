@@ -81,31 +81,11 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
-const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
-const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
-const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
-
-{
-  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
-  if (prevInterval) {
-    clearInterval(prevInterval);
-    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-  }
-  const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY];
-  if (prevStatusInterval) {
-    clearInterval(prevStatusInterval);
-    (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-  }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
-}
+// Official Pi awaits session_shutdown before reloading extensions.
+let moduleAbort = new AbortController();
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  return moduleAbort.signal;
 }
 
 const SubagentParams = Type.Object({
@@ -735,6 +715,7 @@ interface SubagentResult {
 }
 
 function publishSubagentResult(pi: ExtensionAPI, result: SubagentResult, agent?: string): void {
+  if (!latestCtx) return;
   updateWidget();
   pi.sendMessage({
     customType: "subagent_result",
@@ -752,6 +733,7 @@ function publishSubagentResult(pi: ExtensionAPI, result: SubagentResult, agent?:
 }
 
 function publishSubagentError(pi: ExtensionAPI, name: string, error: any, task?: string): void {
+  if (!latestCtx) return;
   updateWidget();
   pi.sendMessage({
     customType: "subagent_result", display: true,
@@ -966,7 +948,6 @@ function updateWidget() {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
     return;
   }
@@ -1319,7 +1300,6 @@ function startStatusRefresh(pi: ExtensionAPI) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
       }
       return;
     }
@@ -1361,7 +1341,6 @@ function startStatusRefresh(pi: ExtensionAPI) {
     }
   }, 1000);
 
-  (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
 // Resuming a finished session is always autonomous: the relaunched agent runs
@@ -1418,7 +1397,6 @@ function startWidgetRefresh() {
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
-  (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
 /**
@@ -2006,11 +1984,13 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
-  } finally {
-    try { closeSurfaceTree(surface); } catch {}
-    runningSubagents.delete(running.id);
-    cleanupVerifyScratch(running.verifyScratchDir);
-  }
+  } finally { cleanupRunningSubagent(running); }
+}
+
+function cleanupRunningSubagent(running: RunningSubagent): void {
+  if (!runningSubagents.delete(running.id)) return;
+  try { closeSurfaceTree(running.surface); } catch {}
+  cleanupVerifyScratch(running.verifyScratchDir);
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -2021,37 +2001,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("model_select", (event) => captureSessionDefaults(pi, event.model));
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    latestPi = pi;
     latestCtx = ctx;
     captureSessionDefaults(pi, ctx.model);
-    // pi runs multiple sessions in one process. A prior session's shutdown
-    // aborts the shared module poll-abort controller; install a fresh one so
-    // subagents spawned in this session aren't watched against a dead signal.
-    // See https://github.com/HazAT/pi-interactive-subagents/issues/5
-    const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (!prevAbort || prevAbort.signal.aborted) {
-      (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
-    }
+    if (moduleAbort.signal.aborted) moduleAbort = new AbortController();
   });
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    latestPi = null;
     latestCtx = null;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
     if (statusInterval) {
       clearInterval(statusInterval);
       statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -2761,6 +2728,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       );
     });
   }
+
+  // Workflow shutdown runs first so its calls are durably aborted before the
+  // shared registry disappears. Then close any remaining manual children.
+  pi.on("session_shutdown", () => {
+    moduleAbort.abort();
+    for (const agent of runningSubagents.values()) {
+      agent.abortController?.abort();
+      cleanupRunningSubagent(agent);
+    }
+  });
 
   // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {

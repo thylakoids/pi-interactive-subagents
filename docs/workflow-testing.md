@@ -7,7 +7,7 @@ npm test
 node test/mutations/workflow.mjs
 npm run test:package-install
 PI_TEST_MODEL=provider/model npm run test:integration
-PI_WORKFLOW_LIVE=1 PI_WORKFLOW_REVIEW_LIVE=1 PI_TEST_MODEL=provider/model node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts
+PI_WORKFLOW_LIVE=1 PI_WORKFLOW_REVIEW_LIVE=1 PI_TEST_MODEL=provider/model node --test --test-concurrency=1 test/integration/workflow-*live.test.ts
 ```
 
 The supported runtime baseline is official Pi 1.4.0 from npm on Node.js 22.19+.
@@ -19,12 +19,12 @@ consumer, removes node_modules and repeats installation with `npm ci --offline`.
 It loads the installed extension in official Pi, checks VM isolation, aborts an
 actual CPU loop while observing event-loop heartbeats, and starts another run.
 No developer node_modules or live provider response is used for that smoke test;
-the four billed suites below test actual model behavior separately. The Linux
+the five billed suites below test actual model behavior separately. The Linux
 terminal suite runs this package-install check before its terminal tests.
 
 Run the integration commands inside tmux; otherwise the legacy lifecycle and
 surface suites skip. They require configured provider credentials and
-make billed model calls. The four workflow live suites are otherwise skipped.
+make billed model calls. The five workflow live suites are otherwise skipped.
 Test agent definitions inherit the selected parent model; they must not pin a
 different provider behind `PI_TEST_MODEL`.
 `PI_TEST_PI` can select an absolute Pi executable. Test launchers remove npm's
@@ -32,6 +32,18 @@ temporary binary directories from PATH so `npm run` cannot silently substitute
 the package's peer Pi binary for the user's installed runtime.
 
 ## Evidence requirements
+
+The session lifecycle live probe drives the production workflow tool through
+actual `/reload`, `/quit`, SIGTERM and an unreported child-pane death. It checks
+abort journals, shutdown markers, lock release and pane removal before the parent
+exits, then resumes after reload and verifies completed side effects were not
+repeated. Unit lifecycle tests also reuse one extension instance across sessions
+to prevent a new session from inheriting an old manager. Official Pi awaits
+shutdown hooks; no cross-reload global timer/controller recovery is needed.
+The probe keeps ordinary children running alongside the workflow, so shutdown
+must also drain their panes without publishing results through stale APIs.
+Tool test harnesses must emit session_start and await session_shutdown when
+restarting an extension; calling tools without that lifecycle is not a Pi session.
 
 - Template tests execute the shipped script through the VM, scheduler and
   journal. Their agent responses are controlled: they test branching, not model
@@ -185,7 +197,7 @@ credible on a real Linux kernel with unprivileged user namespaces. The image in
 
 ```sh
 PI_TEST_MODEL=provider/model test/linux/run              # build if needed, run everything
-PI_TEST_MODEL=provider/model test/linux/run --suite live  # the four billed suites only
+PI_TEST_MODEL=provider/model test/linux/run --suite live  # the five billed suites only
 test/linux/run --suite unit                               # no model needed
 test/linux/run --rebuild --suite-timeout 7200
 ```

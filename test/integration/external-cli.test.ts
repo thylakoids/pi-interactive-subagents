@@ -26,17 +26,25 @@ describe("native CLI tools in tmux", { skip: !hasTmux, timeout: 60000 }, () => {
   const original = Object.fromEntries(keys.map(k => [k, process.env[k]]));
   const tools = new Map<string, any>();
   const messages: any[] = [];
+  const hooks = new Map<string, Function[]>();
   let ctx: any;
-  const api: any = { on() {}, registerTool(t: any) { tools.set(t.name, t); },
+  const api: any = { on(event: string, handler: Function) { hooks.set(event, [...(hooks.get(event) ?? []), handler]); }, registerTool(t: any) { tools.set(t.name, t); },
     registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
     getAllTools() { return []; }, sendMessage(message: any, options: any) { messages.push({ message, options }); } };
-  before(() => {
+  const emit = async (event: string) => { for (const handler of hooks.get(event) ?? []) await handler({ reason: 'reload' }, ctx); };
+  const initialize = async () => {
+    await emit('session_shutdown');
+    hooks.clear();
+    extension(api);
+    await emit('session_start');
+  };
+  before(async () => {
     dir = mkdtempSync(join(tmpdir(), "pi-native-tools-"));
     mkdirSync(join(dir, "agents"));
     mkdirSync(join(dir, "sessions"));
     const parentFile = join(dir, "sessions", "parent.jsonl");
     writeFileSync(parentFile, JSON.stringify({ type: "session", id: "parent" }) + "\n");
-    ctx = { cwd: dir, sessionManager: { getSessionFile: () => parentFile,
+    ctx = { cwd: dir, mode: 'print', hasUI: false, ui: { notify() {} }, sessionManager: { getSessionFile: () => parentFile,
       getSessionId: () => "parent", getSessionDir: () => join(dir, "sessions") } };
     const pane = execFileSync("tmux", ["new-session", "-d", "-s", muxSession,
       "-x", "160", "-y", "40", "-P", "-F", "#{pane_id}"], { encoding: "utf8" }).trim();
@@ -112,10 +120,10 @@ setInterval(() => {}, 1000);
       writeFileSync(join(dir, "agents", `test-${kind}.md`), `---\ncli: ${kind}\nauto-exit: true\n---\nNative ${kind} profile.\n`);
       writeFileSync(join(dir, "agents", `interactive-${kind}.md`), `---\ncli: ${kind}\nauto-exit: false\n---\nNative interactive profile.\n`);
     }
-    extension(api);
+    await initialize();
   });
-  after(() => {
-    for (const running of __test__.runningSubagents.values()) running.abortController?.abort();
+  after(async () => {
+    await emit('session_shutdown');
     try { execFileSync("tmux", ["kill-session", "-t", muxSession], { stdio: "ignore" }); } catch {}
     for (const key of keys) { if (original[key] === undefined) delete process.env[key]; else process.env[key] = original[key]; }
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -141,7 +149,7 @@ setInterval(() => {}, 1000);
       const nativeId = readExternalSession(file)!.nativeId;
       assert.ok(nativeId);
       // Reinitialize extension registrations to simulate the parent returning.
-      extension(api);
+      await initialize();
       messages.length = 0;
       const resumed = await tools.get("subagent_message").execute("resume", { name, message: "follow-up" }, new AbortController().signal, undefined, ctx);
       assert.equal(resumed.details.status, "started", JSON.stringify(resumed));

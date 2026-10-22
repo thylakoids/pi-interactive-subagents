@@ -7,11 +7,20 @@ import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
-const tests = ['test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
+const tests = ['test/workflow-session-lifecycle.test.ts', 'test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['late question wakes an exited parent', 'pi-extension/subagents/index.ts',
+    'latestPi = null;\n    latestCtx = null;', 'latestCtx = null;',
+    'parent-shutdown removes delegated descendants', 'test/integration/workflow-descendants.test.ts'],
+  ['shutdown returns before its workflow execution settles', 'pi-extension/subagents/workflow/index.ts',
+    'await Promise.all(running.map(run => run.execute()));', 'void Promise.all(running.map(run => run.execute()));',
+    'awaits terminal persistence', 'test/workflow-session-lifecycle.test.ts'],
+  ['next session reuses the previous workflow manager', 'pi-extension/subagents/workflow/index.ts',
+    'manager = null;\n    panel = null;', '',
+    'awaits terminal persistence', 'test/workflow-session-lifecycle.test.ts'],
   ['exited owner leaves delegated panes behind', 'pi-extension/subagents/index.ts',
-    'try { closeSurfaceTree(surface); } catch {}\n    runningSubagents.delete(running.id);',
-    'try { closeSurface(surface); } catch {}\n    runningSubagents.delete(running.id);',
+    'try { closeSurfaceTree(running.surface); } catch {}',
+    'try { closeSurface(running.surface); } catch {}',
     'owner-exit removes delegated descendants', 'test/integration/workflow-descendants.test.ts'],
   ['post-launch failure leaks verification scratch', 'pi-extension/subagents/wiring.ts',
     'cleanupVerifyScratch(ownedRunning.verifyScratchDir);', '',
