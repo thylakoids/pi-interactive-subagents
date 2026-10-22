@@ -9,6 +9,22 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-session-lifecycle.test.ts', 'test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['pane close leaves detached tool descendants alive', 'pi-extension/subagents/tmux.ts',
+    'process.kill(pid, "SIGKILL");', 'void pid;',
+    'closing an owned pane kills detached timeout descendants', 'test/integration/surface-owner.test.ts'],
+  ['parent dies before guardian acknowledgment', 'pi-extension/subagents/surface-guardian.ts',
+    "process.stdout.on('error', () => {});", '',
+    'SIGKILL reaps only.*starting', 'test/integration/surface-owner.test.ts'],
+  ['SIGKILL leaves owned panes and scratch alive', 'pi-extension/subagents/surface-guardian.ts',
+    'reapSurfaceOwner(process.argv[2]);', '',
+    'SIGKILL reaps only.*guardian ready', 'test/integration/surface-owner.test.ts'],
+  ['resume starts before dead owner resources are reaped', 'pi-extension/subagents/workflow/manager.ts',
+    'if (lock.reclaimedResourceOwner) this.options.service.ownership?.reap(lock.reclaimedResourceOwner);', '',
+    'resume reaps a verified dead owner', 'test/workflow-execution.test.ts'],
+  ['zombie owner strands the workflow lock', 'pi-extension/subagents/workflow/run-lock.ts',
+    process.platform === 'linux' ? "if stream.read().rsplit(')', 1)[1].split()[0] == 'Z':" : "if state.startswith('Z'):",
+    'if False:',
+    'unreaped zombie owner', 'test/workflow-lock-zombie.test.ts'],
   ['late question wakes an exited parent', 'pi-extension/subagents/index.ts',
     'latestPi = null;\n    latestCtx = null;', 'latestCtx = null;',
     'parent-shutdown removes delegated descendants', 'test/integration/workflow-descendants.test.ts'],

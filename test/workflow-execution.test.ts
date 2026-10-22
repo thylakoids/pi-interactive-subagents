@@ -1,7 +1,39 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { WorkflowManager } from '../pi-extension/subagents/workflow/manager.ts';
 import { deferred, fixture, script } from './helpers/workflow.ts';
+
+it('resume reaps a verified dead owner before allowing replacement work', async t => {
+  let reaped = false;
+  const f = fixture(t, () => {
+    assert.equal(reaped, true, 'old processes must stop before replacement side effects');
+    return { text: 'replacement' };
+  });
+  const run = await f.manager.start({ source: script('return "initial";'), args: {} });
+  await run.execute();
+  const module = new URL('../pi-extension/subagents/workflow/journal.ts', import.meta.url).href;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', `
+    import {acquireLock} from ${JSON.stringify(module)};
+    process.send(acquireLock(${JSON.stringify(run.runDir)}, 'old-owner'));
+    setInterval(()=>{},1000);
+  `], { stdio: ['ignore','ignore','pipe','ipc'] });
+  const closed = once(child, 'close');
+  t.after(async () => { child.kill('SIGKILL'); await closed; });
+  const [lock] = await once(child, 'message') as any[];
+  assert.equal(lock.ok, true);
+  f.service.ownership = { current: () => 'new-owner', reap(owner) {
+    assert.equal(owner, 'old-owner');
+    reaped = true;
+  } };
+  await assert.rejects(f.reload().resume(run.runId), /locked by process/);
+  assert.equal(reaped, false, 'a live owner must never be reaped');
+  child.kill('SIGKILL'); await closed;
+  const resumed = await f.reload().resume(run.runId, { source: script('return await agent("replacement");') });
+  assert.equal(reaped, true, 'resume must not depend on a concurrently scheduled guardian');
+  assert.equal((await resumed.execute()).result, 'replacement');
+});
 
 it('overlapping and repeated execute calls share one VM and one settlement', async t => {
   const gate = deferred<void>();

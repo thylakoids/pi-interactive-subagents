@@ -181,7 +181,7 @@ export function loadJournal(path: string): JournalLoad {
 const ownedLocks = new Map<string, string>();
 const pendingReleases = new Map<string, string>();
 
-export function acquireLock(runDir: string) {
+export function acquireLock(runDir: string, resourceOwner?: string) {
   const path = join(runDir, "lock");
   const pending = pendingReleases.get(path);
   if (pending) {
@@ -192,7 +192,7 @@ export function acquireLock(runDir: string) {
   const token = randomBytes(16).toString("hex");
   let result;
   try {
-    result = runLockTransaction(runDir, "acquire", token);
+    result = runLockTransaction(runDir, "acquire", token, resourceOwner);
   } catch (error) {
     // A helper may die after publishing but before returning its acknowledgement.
     // Remove only this attempt's token, never an unrelated or legacy owner.

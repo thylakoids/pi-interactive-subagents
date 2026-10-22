@@ -88,13 +88,47 @@ it('real workflow survives reload, records child crash, and drains parent shutdo
   assert.equal(existsSync(join(record('signal').runDir, 'lock')), false);
   assert.equal(paneIds().length, 1);
   assert.equal(existsSync(join(dir, 'signal-done')), false);
+
+  // SIGKILL cannot persist an abort. Resume must reclaim the dead lock and
+  // replay completed journal entries, rather than rerunning their side effects.
+  for (const [tag, generation] of [['killed', 4], ['terminal', 6]] as const) {
+    rmSync(join(dir, 'parent-exit'), { force: true });
+    tmux('respawn-pane', '-k', '-t', pane, command);
+    await until(() => json(join(dir, 'ready.json')).generation === generation, tag + ' parent ready');
+    await begin(tag);
+    await beginManual(tag);
+    const oldToolPid = Number(readFileSync(join(dir, tag + '-pid'), 'utf8').trim());
+    if (tag === 'killed') process.kill(json(join(dir, 'ready.json')).pid, 'SIGKILL');
+    else tmux('respawn-pane', '-k', '-t', pane, 'sleep 120');
+    await until(() => paneIds().length === 1, tag + ' guardian removes child panes');
+    await until(() => {
+      try {
+        return /^Z/.test(execFileSync('ps', ['-o', 'stat=', '-p', String(oldToolPid)], { encoding: 'utf8' }).trim());
+      } catch (error) {
+        if ((error as any).status !== 1) throw error;
+        return true;
+      }
+    }, tag + ' actual bash process exits, not merely its pane');
+    assert.equal(existsSync(join(dir, tag + '-done')), false);
+    assert.equal(existsSync(join(dir, tag + '-manual-release')), false);
+    rmSync(join(dir, 'parent-exit'), { force: true });
+    tmux('respawn-pane', '-k', '-t', pane, command);
+    await until(() => json(join(dir, 'ready.json')).generation === generation + 1, tag + ' replacement ready');
+    writeFileSync(join(dir, tag + '-release'), 'release');
+    send('/lifecycle-resume ' + tag);
+    await until(() => snapshot(tag).status === 'completed', tag + ' resumes without deleting a lock');
+    assert.equal(readFileSync(join(dir, tag + '-saved'), 'utf8'), 'once\n');
+    assert.equal(readFileSync(join(dir, tag + '-blocked'), 'utf8'), 'started\nstarted\n');
+    send('/quit');
+    await until(() => existsSync(join(dir, 'parent-exit')), tag + ' replacement exits');
+  }
   assert.doesNotMatch(readFileSync(join(dir, 'parent-stderr.log'), 'utf8'), /stale after session replacement or reload|UnhandledPromiseRejection/);
-  for (const tag of ['reload', 'crash', 'quit', 'signal']) {
+  for (const tag of ['reload', 'crash', 'quit', 'signal', 'killed', 'terminal']) {
     for (const entry of journal(tag).filter(row => row.status === 'completed')) {
       const rows = readFileSync(entry.sessionFile, 'utf8').trim().split('\n').map(JSON.parse);
       assert.ok(rows.some(row => row.message?.role === 'assistant' && row.message.usage?.output > 0));
       assert.ok(rows.some(row => Array.isArray(row.message?.content) && row.message.content.some((part: any) => part.type === 'toolCall')));
     }
   }
-  writeFileSync(join(dir, 'passed.json'), JSON.stringify({ checks: ['reload-abort', 'reload-resume', 'child-crash', 'parent-quit', 'parent-sigterm'] }));
+  writeFileSync(join(dir, 'passed.json'), JSON.stringify({ checks: ['reload-abort', 'reload-resume', 'child-crash', 'parent-quit', 'parent-sigterm', 'parent-sigkill-resume', 'terminal-close-resume'] }));
 });

@@ -26,6 +26,7 @@ it(exit + ' removes delegated descendants but preserves siblings and its parent'
   process.env.TMUX_PANE = root; process.env.PI_SUBAGENT_TREE = root;
   const child = createSurface('child');
   const sibling = createSurface('sibling');
+  tmux('set-option', '-p', '-t', sibling, '@pi_subagent_owner', 'unrelated-test-owner');
   process.env.TMUX_PANE = child;
   const delegated = createSurface('delegated');
   assert.equal(tmux('display-message', '-p', '-t', delegated, '#{@pi_subagent_parent}'), child);

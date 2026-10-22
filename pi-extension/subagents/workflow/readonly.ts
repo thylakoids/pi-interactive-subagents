@@ -28,8 +28,8 @@ import { LINUX_LANDLOCK_EXEC } from "./linux-landlock.ts";
 
 const verifyScratchRoots = new Set<string>();
 
-export function createVerifyScratch(): string {
-  const path = mkdtempSync(join(tmpdir(), "pi-verify-"));
+export function createVerifyScratch(parent = tmpdir()): string {
+  const path = mkdtempSync(join(parent, "pi-verify-"));
   verifyScratchRoots.add(path);
   return path;
 }

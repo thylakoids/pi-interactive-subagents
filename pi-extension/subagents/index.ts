@@ -32,6 +32,7 @@ import {
   focusSurface,
   surfaceExists,
 } from "./tmux.ts";
+import { waitForSurfaceOwner, disposeSurfaceOwner, surfaceOwnerDirectory } from "./surface-owner.ts";
 
 import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
@@ -1091,7 +1092,7 @@ function applySandboxToParts(
     }
   }
   if (loadout.readOnly) {
-    const scratch = createVerifyScratch();
+    const scratch = createVerifyScratch(surfaceOwnerDirectory());
     parts.unshift("env", `${READONLY_ENV.scratch}=${shellEscape(scratch)}`);
     return scratch;
   }
@@ -1438,6 +1439,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     if (external) {
       if (!external.nativeId) throw new Error("The original native CLI session ID is unavailable.");
       surface = createSurface(name);
+      await waitForSurfaceOwner();
       const running = launchExternalSubagent({
         id: randomUUID().slice(0, 8), name, task: "", prompt: "", sessionFile: sessionPath,
         artifactDir, surface, startTime: Date.now(), session: { ...external, autoExit: false },
@@ -1454,6 +1456,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     if (!loadout) throw new Error("The original sandbox snapshot is unavailable.");
     rmSync(`${sessionPath}.exit`, { force: true });
     surface = createSurface(name);
+    await waitForSurfaceOwner();
     const id = randomUUID().slice(0, 8);
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
@@ -1594,6 +1597,7 @@ async function launchSubagent(
   const surface = options?.surface ?? createSurface(params.name);
   let verifyScratchDir: string | undefined;
   try {
+    await waitForSurfaceOwner();
     if (!surfacePreCreated) {
       // Abortable: a cancelled launch closes its pane instead of waiting out
       // the shell delay and then starting a child nobody waits for.
@@ -2459,6 +2463,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const surface = createSurface(name);
           let running: RunningSubagent;
           try {
+            await waitForSurfaceOwner();
             running = launchExternalSubagent({ id, name, task: message, prompt: message,
               sessionFile: sessionPath, artifactDir: parentArtifactDir, surface, startTime,
               session: { ...external, autoExit }, resume: true, interactive });
@@ -2502,6 +2507,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const surface = createSurface(name);
         let verifyScratchDir: string | undefined;
         try {
+          await waitForSurfaceOwner();
           await waitForShellReady(getShellReadyDelayMs(), signal);
 
           // Build pi resume command
@@ -2737,6 +2743,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
       cleanupRunningSubagent(agent);
     }
+    disposeSurfaceOwner();
   });
 
   // ── subagent_result message renderer ──

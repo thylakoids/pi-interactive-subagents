@@ -5,7 +5,8 @@ import { spawnSync } from "node:child_process";
 export const RUN_LOCK_HELPER = String.raw`
 import fcntl, json, os, socket, subprocess, sys, tempfile, time
 
-directory, operation, pid, token = sys.argv[1:]
+directory, operation, pid, token = sys.argv[1:5]
+resource_owner = sys.argv[5] if len(sys.argv) > 5 else ''
 pid = int(pid)
 path = os.path.join(directory, 'lock')
 guard = os.path.join(directory, 'lock.guard')
@@ -63,10 +64,24 @@ def read_owner():
 def alive(owner_pid):
     try:
         os.kill(owner_pid, 0)
+        # A zombie cannot execute or own work, even though kill(pid, 0) succeeds.
+        if sys.platform == 'linux':
+            try:
+                with open('/proc/%d/stat' % owner_pid) as stream:
+                    if stream.read().rsplit(')', 1)[1].split()[0] == 'Z':
+                        return False
+            except FileNotFoundError:
+                return False
+        elif sys.platform == 'darwin':
+            state = subprocess.check_output(['ps', '-o', 'stat=', '-p', str(owner_pid)], text=True, timeout=2).strip()
+            if state.startswith('Z'):
+                return False
         return True
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    except (OSError, subprocess.SubprocessError):
         return True
 
 def transaction():
@@ -76,6 +91,7 @@ def transaction():
         if name.startswith('.lock-owner-'):
             os.unlink(os.path.join(directory, name))
     owner = read_owner()
+    reclaimed_resource_owner = None
     if operation == 'release':
         if owner and owner.get('token') == token and owner.get('pid') == pid:
             os.unlink(path)
@@ -109,11 +125,12 @@ def transaction():
                     return dict(ok=False, ownerPid=owner_pid)
             # Same host but a different boot, or a proven different incarnation
             # of this PID. The process which published this record cannot live.
+        reclaimed_resource_owner = owner.get('resourceOwner')
         os.unlink(path)
     fd, temporary = tempfile.mkstemp(prefix='.lock-owner-', dir=directory)
     try:
         with os.fdopen(fd, 'w') as stream:
-            json.dump(dict(version=2, pid=pid, token=token, host=host, identity=requester_identity, at=int(time.time()*1000)), stream)
+            json.dump(dict(version=2, pid=pid, token=token, host=host, identity=requester_identity, resourceOwner=resource_owner, at=int(time.time()*1000)), stream)
             stream.flush()
             os.fsync(stream.fileno())
         # Publish a complete record without overwriting even an old-version
@@ -122,7 +139,7 @@ def transaction():
             os.link(temporary, path)
         except FileExistsError:
             return dict(ok=False, ownerPid=0, reason='another owner published the lock')
-        return dict(ok=True, path=path)
+        return dict(ok=True, path=path, reclaimedResourceOwner=reclaimed_resource_owner)
     finally:
         os.unlink(temporary)
 
@@ -154,10 +171,10 @@ with open(guard, 'a+b') as mutex:
         emit(guarded_transaction())
 `;
 
-export type RunLockResult = { ok: true; path: string } | { ok: false; ownerPid: number; reason?: string };
+export type RunLockResult = { ok: true; path: string; reclaimedResourceOwner?: string | null } | { ok: false; ownerPid: number; reason?: string };
 
-export function runLockTransaction(directory: string, operation: "acquire" | "release", token: string): RunLockResult {
-  const child = spawnSync("python3", ["-c", RUN_LOCK_HELPER, directory, operation, String(process.pid), token], {
+export function runLockTransaction(directory: string, operation: "acquire" | "release", token: string, resourceOwner = ""): RunLockResult {
+  const child = spawnSync("python3", ["-c", RUN_LOCK_HELPER, directory, operation, String(process.pid), token, resourceOwner], {
     encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
   });
   if (child.error || child.status !== 0) {

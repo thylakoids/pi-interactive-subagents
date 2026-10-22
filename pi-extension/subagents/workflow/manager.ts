@@ -1392,7 +1392,7 @@ export class WorkflowManager {
     // A brand-new run id owns its directory, so this always succeeds; the lock
     // still matters because it is what blocks a second process from resuming
     // the run while this one is live.
-    const lock = acquireLock(run.runDir);
+    const lock = acquireLock(run.runDir, this.options.service.ownership?.current());
     if (!lock.ok) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);
     run.setLockPath(lock.path);
     try {
@@ -1423,7 +1423,7 @@ export class WorkflowManager {
     const scriptFile = scriptPath(runDir);
     const edited = overrides?.source?.trim() ? overrides.source : undefined;
 
-    const lock = acquireLock(runDir);
+    const lock = acquireLock(runDir, this.options.service.ownership?.current());
     if (!lock.ok) {
       throw new WorkflowScriptError(
         `Run ${runId} is locked by process ${lock.ownerPid || "unknown"}${lock.reason ? ` (${lock.reason})` : ""}. ` +
@@ -1439,6 +1439,7 @@ export class WorkflowManager {
     let skippedLines = 0;
     let run: WorkflowRun;
     try {
+      if (lock.reclaimedResourceOwner) this.options.service.ownership?.reap(lock.reclaimedResourceOwner);
       // Read the entire recovery input only after ownership: another process
       // can finish/edit between a pre-lock read and this successful acquire.
       const snapshot = loadSnapshot(runDir);

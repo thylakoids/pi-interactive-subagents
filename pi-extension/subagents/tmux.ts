@@ -15,7 +15,9 @@ import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, basename } from "node:path";
+import { fileURLToPath } from "node:url";
+import { surfaceOwnerId } from "./surface-owner.ts";
 
 import {
   MAIN_PANE_WIDTH,
@@ -363,6 +365,7 @@ function createSurfaceFor(anchor: string): string {
   // Layout-neutral, so it renders no frame; see the mark's role in layout.ts.
   runTmux(["set-option", "-p", "-t", pane, "@pi_subagent", tree], true);
   runTmux(["set-option", "-p", "-t", pane, "@pi_subagent_parent", anchor], true);
+  runTmux(["set-option", "-p", "-t", pane, "@pi_subagent_owner", surfaceOwnerId()]);
   surfaceWindows.set(pane, { window, tree });
   return pane;
 }
@@ -398,7 +401,21 @@ export function createSurfaceSplit(
     throw new Error(`Unexpected tmux split-window output: ${pane}`);
   }
 
+  runTmux(["set-option", "-p", "-t", pane, "@pi_subagent_owner", surfaceOwnerId()]);
+
   return pane;
+}
+
+/** Only resources bearing this exact process incarnation's token may be reaped. */
+export function reapSurfaceOwner(directory: string): void {
+  const owner = basename(directory);
+  const rows = runTmux(["list-panes", "-a", "-F", "#{pane_id}|#{@pi_subagent_owner}"], true);
+  for (const row of rows.trim().split("\n")) {
+    const [pane, token] = row.split("|");
+    if (token !== owner) continue;
+    closeSurfaceTree(pane);
+  }
+  rmSync(directory, { recursive: true, force: true });
 }
 
 /**
@@ -507,6 +524,34 @@ export function closeSurfaceTree(root: string): void {
   for (let i = 0; i < order.length; i++) {
     for (const [pane, parent] of rows) {
       if (parent === order[i] && pane && !owned.has(pane)) { owned.add(pane); order.push(pane); }
+    }
+  }
+  // Detached bash tools (and timeout's separate process group) do not receive
+  // the pane's SIGHUP. Stop their actual descendants before losing the ancestry.
+  const roots = runTmux(["list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}|#{pane_dead}"], true)
+    .trim().split("\n").map(line => line.split("|"))
+    .filter(([pane, , dead]) => owned.has(pane) && dead !== "1")
+    .map(([, pid]) => Number(pid)).filter(pid => pid > 0);
+  const processes = execFileSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8" })
+    .trim().split("\n").map(line => {
+      const [, pid, parent, command] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)!;
+      return { pid: Number(pid), parent: Number(parent), command };
+    });
+  const descendants = [...roots];
+  const found = new Set(roots);
+  for (let i = 0; i < descendants.length; i++) {
+    for (const child of processes) {
+      if (child.parent === descendants[i] && !found.has(child.pid)) {
+        found.add(child.pid); descendants.push(child.pid);
+      }
+    }
+  }
+  const guardian = fileURLToPath(new URL("./surface-guardian.ts", import.meta.url));
+  for (const pid of descendants.slice(roots.length).reverse()) {
+    // Guardians must survive to consume EOF and remove their own scratch.
+    if (processes.find(child => child.pid === pid)!.command.includes(guardian)) continue;
+    try { process.kill(pid, "SIGKILL"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   }
   for (const pane of order.reverse()) closeSurface(pane);

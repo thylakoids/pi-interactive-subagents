@@ -40,7 +40,7 @@ for (const boundary of ['before-flush', 'after-flush', 'after-publish', 'after-r
           args = [...args];
           if (${JSON.stringify(boundary)} === 'before-flush') args[1] = args[1].replace('os.fsync(stream.fileno())', ${JSON.stringify(pause + '\n            os.fsync(stream.fileno())')});
           if (${JSON.stringify(boundary)} === 'after-flush') args[1] = args[1].replace('os.fsync(stream.fileno())', ${JSON.stringify('os.fsync(stream.fileno())\n            ' + pause)});
-          if (${JSON.stringify(boundary)} === 'after-publish') args[1] = args[1].replace('return dict(ok=True, path=path)', ${JSON.stringify(pause.replaceAll('\n            ', '\n        ') + '\n        return dict(ok=True, path=path)')});
+          if (${JSON.stringify(boundary)} === 'after-publish') args[1] = args[1].replace('return dict(ok=True, path=path, reclaimedResourceOwner=reclaimed_resource_owner)', ${JSON.stringify(pause.replaceAll('\n            ', '\n        ') + '\n        return dict(ok=True, path=path)')});
           if (release) args[1] = args[1].replace('os.unlink(path)', ${JSON.stringify('os.unlink(path)\n            ' + pause)});
         }
         return original(cmd, args, ...rest);

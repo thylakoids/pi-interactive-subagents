@@ -14,7 +14,8 @@ import { fileURLToPath } from "node:url";
 import { getSessionId } from "./session.ts";
 import { classifyStatus, formatStatusDetail } from "./status.ts";
 import { cleanupVerifyScratch } from "./workflow/readonly.ts";
-import { isMuxAvailable, muxSetupHint, closeSurfaceTree } from "./tmux.ts";
+import { isMuxAvailable, muxSetupHint, closeSurfaceTree, reapSurfaceOwner } from "./tmux.ts";
+import { surfaceOwnerDirectory } from "./surface-owner.ts";
 import type { RunningSubagent, SubagentResult } from "./index.ts";
 import type {
   WorkflowSubagentCompletion,
@@ -101,6 +102,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
   };
 
   return {
+    ownership: { current: surfaceOwnerDirectory, reap: reapSurfaceOwner },
     isAvailable() {
       if (!isMuxAvailable()) return { ok: false, reason: muxSetupHint() };
       if (!surface.sessionSnapshot().sessionFile) {

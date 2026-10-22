@@ -297,6 +297,7 @@ export interface WorkflowSubagentCompletion {
 }
 
 export interface WorkflowSubagentService {
+  ownership?: { current(): string; reap(owner: string): void };
   isAvailable(): { ok: true } | { ok: false; reason: string };
   spawn(request: WorkflowSubagentRequest): Promise<WorkflowSubagentHandle>;
   steer(name: string, message: string): Promise<{ ok: true } | { error: string }>;

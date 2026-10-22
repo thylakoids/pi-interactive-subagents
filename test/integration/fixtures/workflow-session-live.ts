@@ -35,7 +35,7 @@ export default function fixture(pi: any) {
     const source = `export const meta = {name:'lifecycle-${tag}',description:'Real session lifecycle'}
       const a = await agent(${JSON.stringify(prompt(`echo once >> ${tag}-saved`))}, {label:'saved'});
       if (!a) throw new Error('saved child failed');
-      const b = await agent(${JSON.stringify(prompt(`echo started >> ${tag}-blocked; while ! test -f ${tag}-release; do sleep 0.2; done; echo done > ${tag}-done`))}, {label:'blocked'});
+      const b = await agent(${JSON.stringify(prompt(`timeout 240 sh -c 'echo $$ > ${tag}-pid; echo started >> ${tag}-blocked; while ! test -f ${tag}-release; do sleep 0.2; done; echo done > ${tag}-done'`))}, {label:'blocked'});
       if (!b) throw new Error('child interrupted');
       return {a,b};`;
     const details = await invoke({ action: 'start', script: source }, ctx);
