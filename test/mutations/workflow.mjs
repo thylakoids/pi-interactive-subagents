@@ -9,6 +9,9 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-session-lifecycle.test.ts', 'test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['ordinary tool mentioning guardian survives cleanup', 'pi-extension/subagents/tmux.ts',
+    '.command.startsWith(`${process.execPath} ${guardian} `)', '.command.includes(guardian)',
+    'closing an owned pane kills detached timeout descendants', 'test/integration/surface-owner.test.ts'],
   ['pane close leaves detached tool descendants alive', 'pi-extension/subagents/tmux.ts',
     'process.kill(pid, "SIGKILL");', 'void pid;',
     'closing an owned pane kills detached timeout descendants', 'test/integration/surface-owner.test.ts'],

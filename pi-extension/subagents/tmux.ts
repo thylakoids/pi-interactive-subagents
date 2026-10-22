@@ -549,7 +549,7 @@ export function closeSurfaceTree(root: string): void {
   const guardian = fileURLToPath(new URL("./surface-guardian.ts", import.meta.url));
   for (const pid of descendants.slice(roots.length).reverse()) {
     // Guardians must survive to consume EOF and remove their own scratch.
-    if (processes.find(child => child.pid === pid)!.command.includes(guardian)) continue;
+    if (processes.find(child => child.pid === pid)!.command.startsWith(`${process.execPath} ${guardian} `)) continue;
     try { process.kill(pid, "SIGKILL"); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }

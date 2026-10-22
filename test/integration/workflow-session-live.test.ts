@@ -33,6 +33,12 @@ it('real workflow survives reload, records child crash, and drains parent shutdo
   const snapshot = (tag: string) => json(join(record(tag).runDir, 'snapshot.json'));
   const journal = (tag: string) => readFileSync(join(record(tag).runDir, 'journal.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
   const paneIds = () => tmux('list-panes', '-s', '-t', session, '-F', '#{pane_id}').split('\n');
+  const processState = (pid: number) => {
+    assert.ok(Number.isInteger(pid) && pid > 0, 'probe must identify an actual process');
+    try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim(); }
+    catch (error) { if ((error as any).status !== 1) throw error; return ''; }
+  };
+  const exited = (pid: number) => { const state = processState(pid); return !state || state.startsWith('Z'); };
   const begin = async (tag: string) => {
     send('/lifecycle-start ' + tag);
     await until(() => existsSync(join(dir, tag + '.json')) && existsSync(join(dir, tag + '-blocked')), tag + ' blocks in real bash');
@@ -98,24 +104,53 @@ it('real workflow survives reload, records child crash, and drains parent shutdo
     await begin(tag);
     await beginManual(tag);
     const oldToolPid = Number(readFileSync(join(dir, tag + '-pid'), 'utf8').trim());
+    let guardianPid: number | undefined;
+    let guardianPaused = false;
+    if (tag === 'killed') {
+      const owner = json(join(record(tag).runDir, 'lock')).resourceOwner;
+      assert.equal(typeof owner, 'string');
+      const guardians = execFileSync('ps', ['-axo', 'pid=,args='], { encoding: 'utf8' }).split('\n')
+        .filter(row => row.includes('/surface-guardian.ts ') && row.endsWith(' ' + owner));
+      assert.equal(guardians.length, 1, 'pause the exact old owner guardian, never an unrelated helper');
+      guardianPid = Number(guardians[0].trim().split(/\s+/)[0]);
+      const stoppedGuardian = guardianPid;
+      t.after(() => { if (!guardianPaused) return; try { process.kill(stoppedGuardian, 'SIGCONT'); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      } });
+      process.kill(guardianPid, 'SIGSTOP');
+      guardianPaused = true;
+      await until(() => processState(guardianPid!).startsWith('T'), 'old guardian is actually paused');
+    }
     if (tag === 'killed') process.kill(json(join(dir, 'ready.json')).pid, 'SIGKILL');
     else tmux('respawn-pane', '-k', '-t', pane, 'sleep 120');
-    await until(() => paneIds().length === 1, tag + ' guardian removes child panes');
-    await until(() => {
-      try {
-        return /^Z/.test(execFileSync('ps', ['-o', 'stat=', '-p', String(oldToolPid)], { encoding: 'utf8' }).trim());
-      } catch (error) {
-        if ((error as any).status !== 1) throw error;
-        return true;
-      }
-    }, tag + ' actual bash process exits, not merely its pane');
+    if (guardianPid) {
+      await until(() => existsSync(join(dir, 'parent-exit')), 'old parent is dead before lock recovery');
+      assert.equal(exited(oldToolPid), false, 'old tool is still pending cleanup: the race must be real');
+    } else {
+      await until(() => paneIds().length === 1, tag + ' guardian removes child panes');
+      await until(() => exited(oldToolPid), tag + ' actual bash process exits, not merely its pane');
+    }
     assert.equal(existsSync(join(dir, tag + '-done')), false);
     assert.equal(existsSync(join(dir, tag + '-manual-release')), false);
     rmSync(join(dir, 'parent-exit'), { force: true });
     tmux('respawn-pane', '-k', '-t', pane, command);
     await until(() => json(join(dir, 'ready.json')).generation === generation + 1, tag + ' replacement ready');
-    writeFileSync(join(dir, tag + '-release'), 'release');
+    if (!guardianPid) writeFileSync(join(dir, tag + '-release'), 'release');
     send('/lifecycle-resume ' + tag);
+    if (guardianPid) {
+      await until(() => readFileSync(join(dir, tag + '-blocked'), 'utf8') === 'started\nstarted\n', 'replacement executes while old guardian remains paused');
+      assert.equal(exited(oldToolPid), true, 'resume must synchronously stop the old tool before launching replacement');
+      const newToolPid = Number(readFileSync(join(dir, tag + '-pid'), 'utf8').trim());
+      assert.notEqual(newToolPid, oldToolPid);
+      assert.equal(exited(newToolPid), false);
+      process.kill(guardianPid, 'SIGCONT');
+      guardianPaused = false;
+      await until(() => exited(guardianPid!), 'late old guardian completes its cleanup');
+      assert.equal(exited(newToolPid), false, 'late cleanup must not kill replacement work');
+      assert.equal(snapshot(tag).status, 'running');
+      assert.equal(readFileSync(join(dir, tag + '-saved'), 'utf8'), 'once\n');
+      writeFileSync(join(dir, tag + '-release'), 'release');
+    }
     await until(() => snapshot(tag).status === 'completed', tag + ' resumes without deleting a lock');
     assert.equal(readFileSync(join(dir, tag + '-saved'), 'utf8'), 'once\n');
     assert.equal(readFileSync(join(dir, tag + '-blocked'), 'utf8'), 'started\nstarted\n');
@@ -130,5 +165,5 @@ it('real workflow survives reload, records child crash, and drains parent shutdo
       assert.ok(rows.some(row => Array.isArray(row.message?.content) && row.message.content.some((part: any) => part.type === 'toolCall')));
     }
   }
-  writeFileSync(join(dir, 'passed.json'), JSON.stringify({ checks: ['reload-abort', 'reload-resume', 'child-crash', 'parent-quit', 'parent-sigterm', 'parent-sigkill-resume', 'terminal-close-resume'] }));
+  writeFileSync(join(dir, 'passed.json'), JSON.stringify({ checks: ['reload-abort', 'reload-resume', 'child-crash', 'parent-quit', 'parent-sigterm', 'parent-sigkill-resume', 'terminal-close-resume', 'late-guardian-preserves-replacement'] }));
 });

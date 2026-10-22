@@ -6,6 +6,7 @@ import { once } from 'node:events';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
 
 it('closing an owned pane kills detached timeout descendants before they can write again', { timeout: 15000 }, async t => {
@@ -15,7 +16,9 @@ it('closing an owned pane kills detached timeout descendants before they can wri
   const session = 'pi-detached-tool-' + process.pid;
   const root = tmux('new-session', '-d', '-s', session, '-P', '-F', '#{pane_id}');
   t.after(() => { try { tmux('kill-session', '-t', session); } catch {} });
-  const command = `echo $$ > ${shellEscape(join(dir, 'pid'))}; while ! test -f ${shellEscape(join(dir, 'release'))}; do sleep 0.05; done; echo escaped > ${shellEscape(join(dir, 'escaped'))}`;
+  // Mentioning the helper in ordinary tool arguments must not exempt the tool.
+  const guardian = fileURLToPath(new URL('../../pi-extension/subagents/surface-guardian.ts', import.meta.url));
+  const command = `echo $$ > ${shellEscape(join(dir, 'pid'))}; while ! test -f ${shellEscape(join(dir, 'release'))}; do sleep 0.05; done; echo escaped > ${shellEscape(join(dir, 'escaped'))} # ${guardian}`;
   const source = `import {spawn} from 'node:child_process'; spawn('timeout',['240','sh','-c',${JSON.stringify(command)}],{detached:true,stdio:'ignore'}); setInterval(()=>{},1000);`;
   tmux('respawn-pane', '-k', '-t', root, `${shellEscape(process.execPath)} --input-type=module -e ${shellEscape(source)}`);
   const deadline = Date.now() + 5000;
