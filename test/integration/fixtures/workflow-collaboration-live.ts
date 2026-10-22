@@ -1,6 +1,6 @@
 /** Root, worker and delegated scout all use real models and production messaging. */
 import assert from 'node:assert/strict';
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';

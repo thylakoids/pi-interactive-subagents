@@ -22,7 +22,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Value } from "@sinclair/typebox/value";
+import { Value } from "typebox/value";
 
 import structuredOutputExtension, {
   workflowResultSchema,
@@ -190,6 +190,7 @@ describe("parent-side and direct-call validation", () => {
 
       const wrongType = await tool.execute("call-2", { verdict: 42 });
       assert.equal(wrongType.isError, true);
+      assert.match(String(wrongType.content[0].text), /schema at \/verdict:.*must be string/);
       assert.equal(existsSync(resultFile), false);
 
       const extraRootKey = await tool.execute("call-3", { verdict: "v", extra: true });

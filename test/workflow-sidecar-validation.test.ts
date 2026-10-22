@@ -16,7 +16,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { Value } from "@sinclair/typebox/value";
+import { Value } from "typebox/value";
 
 import { workflowResultSchema, type JsonSchema } from "../pi-extension/subagents/workflow/structured-output.ts";
 import { fixture, script } from "./helpers/workflow.ts";

@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/earendil-works/pi), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 **tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
@@ -339,8 +339,22 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono)
+- Official [Pi](https://github.com/earendil-works/pi) npm/Node distribution; tested with **1.4.0**.
+- Node.js **22.19 or newer** on PATH, including in child tmux panes.
 - [tmux](https://github.com/tmux/tmux)
+- Python 3 for workflow run locks (see [workflow requirements](docs/workflow.md)).
+
+```bash
+npm install -g @earendil-works/pi-coding-agent@1.4.0
+pi install git:github.com/thylakoids/pi-interactive-subagents
+```
+
+The workflow runtime uses one backend: the installed `pi-codemode` QuickJS
+worker. The standalone Bun-compiled Pi executable is not a supported runtime;
+there is no Inline fallback or alternate sandbox configuration. Install the
+plugin's declared npm dependencies as well as Pi: Pi's embedded dependencies
+are not a replacement for the plugin's runtime dependencies. Offline installs
+need those npm packages available in the local cache or an internal registry.
 
 ```bash
 tmux new -A -s pi 'pi'

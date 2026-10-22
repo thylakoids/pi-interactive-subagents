@@ -210,7 +210,17 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
   }
 }
 
-if (process.argv[1] && existsSync(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+function isMainModule() {
+  try {
+    return !!process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    // Importing the hook must not depend on the caller's executable path being
+    // a readable filesystem entry (for example in a compiled Pi executable).
+    return false;
+  }
+}
+
+if (isMainModule()) {
   const [kind, sessionFile, resultFile, modeOrExitCode, payload] = process.argv.slice(2);
   try {
     const event = kind === 'exit' ? {} : JSON.parse(kind === 'codex' ? payload : readFileSync(0, 'utf8'));

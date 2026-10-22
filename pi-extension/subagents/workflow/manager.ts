@@ -16,7 +16,7 @@
  *    them on resume.
  */
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { Value } from "@sinclair/typebox/value";
+import { Value } from "typebox/value";
 import { join } from "node:path";
 import type { CodemodeHostCall, CodemodeOutcome } from "@earendil-works/pi-codemode";
 import {

@@ -1,5 +1,5 @@
 /** Centered workflow tree. Navigation follows Pi lists and Vim tree conventions. */
-import { isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import { isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentResultMeta, WorkflowRunView } from "./types.ts";
 import { summarizeCalls } from "./state.ts";
 

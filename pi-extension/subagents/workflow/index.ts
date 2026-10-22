@@ -11,9 +11,9 @@
  *   ui.ts       widget + observability panel
  *   wiring.ts   the interactive-subagent service this runtime drives
  */
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { WorkflowManager } from "./manager.ts";
 import { WorkflowPanel, formatElapsed, formatTokens } from "./ui.ts";

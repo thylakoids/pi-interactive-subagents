@@ -270,7 +270,7 @@ wanted() { [ "$SUITE" = all ] || [ "$SUITE" = "$1" ]; }
 
 if wanted unit;      then run_suite unit      "npm test"; fi
 if wanted mutations; then run_suite mutations "node test/mutations/workflow.mjs"; fi
-if wanted terminal;  then run_suite terminal  "npm run test:integration"; fi
+if wanted terminal;  then run_suite terminal  "npm run test:package-install && npm run test:integration"; fi
 if wanted live;      then run_suite live      "node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts"; fi
 
 {

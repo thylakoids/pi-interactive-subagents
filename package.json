@@ -15,12 +15,13 @@
   "scripts": {
     "test": "node --test test/*.test.ts test/test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
-    "test:cli-integration": "node --test test/integration/external-cli.test.ts"
+    "test:cli-integration": "node --test test/integration/external-cli.test.ts",
+    "test:package-install": "node --test test/packaging/install.test.ts"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
@@ -31,11 +32,14 @@
     ]
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
-    "@mariozechner/pi-tui": "^0.65.0",
-    "@sinclair/typebox": "^0.34.49"
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "typebox": "1.3.27"
   },
   "dependencies": {
-    "@earendil-works/pi-codemode": "^1.3.0"
+    "@earendil-works/pi-codemode": "1.4.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

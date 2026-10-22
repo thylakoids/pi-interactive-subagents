@@ -5,9 +5,22 @@ Run these against one frozen checkout, after all writers have handed off:
 ```sh
 npm test
 node test/mutations/workflow.mjs
+npm run test:package-install
 PI_TEST_MODEL=provider/model npm run test:integration
 PI_WORKFLOW_LIVE=1 PI_WORKFLOW_REVIEW_LIVE=1 PI_TEST_MODEL=provider/model node --test --test-concurrency=1 test/integration/workflow-live.test.ts test/integration/workflow-collaboration-live.test.ts test/integration/workflow-protection-live.test.ts test/integration/workflow-review-live.test.ts
 ```
+
+The supported runtime baseline is official Pi 1.4.0 from npm on Node.js 22.19+.
+Use that executable for both the parent and its child panes. A standalone
+Bun-compiled Pi is not an equivalent substitute and has no automatic fallback.
+`test:package-install` is a networked deployment test, separate from the offline
+unit suite: it packs the project, installs production dependencies in a clean
+consumer, removes node_modules and repeats installation with `npm ci --offline`.
+It loads the installed extension in official Pi, checks VM isolation, aborts an
+actual CPU loop while observing event-loop heartbeats, and starts another run.
+No developer node_modules or live provider response is used for that smoke test;
+the four billed suites below test actual model behavior separately. The Linux
+terminal suite runs this package-install check before its terminal tests.
 
 Run the integration commands inside tmux; otherwise the legacy lifecycle and
 surface suites skip. They require configured provider credentials and

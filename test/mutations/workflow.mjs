@@ -9,6 +9,14 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['hook import depends on resolving the caller executable', 'pi-extension/subagents/cli-hook.mjs',
+    'if (isMainModule()) {',
+    'if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {',
+    'caller.*executable cannot be resolved', 'test/external-cli.test.ts'],
+  ['structured-output errors lose their TypeBox instance path', 'pi-extension/subagents/workflow/structured-output.ts',
+    'const where = first?.instancePath || "/";', 'const where = "/";',
+    'rejects a direct execute that does not satisfy', 'test/workflow-review-schema.test.ts'],
+
   ['failing TAP not ok mistaken for a passing test', 'test/integration/live-evidence.ts',
     'return /^# pass 1\\r?$/m.test(text) && /^# fail 0\\r?$/m.test(text);', "return text.includes('ok 1 -');",
     'sandbox TAP evidence never treats not ok', 'test/workflow-live-evidence.test.ts'],

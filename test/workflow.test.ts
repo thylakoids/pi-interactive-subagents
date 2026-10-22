@@ -27,8 +27,8 @@ import {
   workflowSize,
 } from "../pi-extension/subagents/workflow/authoring.ts";
 import { registerWorkflowExtension } from "../pi-extension/subagents/workflow/index.ts";
-import { visibleWidth } from "@mariozechner/pi-tui";
-import { loadSkillsFromDir } from "@mariozechner/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import {
   WorkflowPanel,
   createPanelRenderState,

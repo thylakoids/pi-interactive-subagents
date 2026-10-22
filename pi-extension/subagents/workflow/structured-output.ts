@@ -12,9 +12,9 @@
  * Loaded via `-e <this file>` with `PI_SUBAGENT_SCHEMA_FILE` and
  * `PI_SUBAGENT_RESULT_FILE` set by the parent; it is inert without them.
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { readFileSync, writeFileSync } from "node:fs";
 
 export type JsonSchema = {
@@ -124,8 +124,8 @@ export default function structuredOutputExtension(pi: ExtensionAPI): void {
       // Validate here too so no unvalidated value can ever be recorded.
       try {
         if (!Value.Check(parameters, params)) {
-          const first = Value.Errors(parameters, params).First();
-          const where = first?.path || "/";
+          const first = Value.Errors(parameters, params)[0];
+          const where = first?.instancePath || "/";
           return {
             content: [{
               type: "text" as const,

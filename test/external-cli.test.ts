@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, mkdirSync, rmdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, isExternalCliKind, type ExternalCliSession } from "../pi-extension/subagents/external-cli.ts";
 import { handleCliEvent, readCliExitResult, withCliRunLockAsync } from "../pi-extension/subagents/cli-hook.mjs";
 
@@ -46,6 +46,29 @@ describe("native CLI hooks", () => {
       { input: `import { readCliExitResult } from ${JSON.stringify(hook)}; console.log(typeof readCliExitResult);`, encoding: "utf8" });
     assert.equal(output.trim(), "function");
   });
+  for (const code of ["EACCES", "ENOENT"]) {
+    it("can be imported when the caller's executable cannot be resolved: " + code, () => {
+      const hook = new URL("../pi-extension/subagents/cli-hook.mjs", import.meta.url).href;
+      const child = spawnSync(process.execPath, ["--input-type=module", "-"], {
+        input: `
+          import fs from 'node:fs';
+          import { syncBuiltinESMExports } from 'node:module';
+          process.argv[1] = '/virtual/pi-hook-import-probe';
+          const original = fs.realpathSync;
+          fs.realpathSync = (path, ...args) => {
+            if (path === process.argv[1]) throw Object.assign(new Error('unresolvable caller'), {code:${JSON.stringify(code)}});
+            return original(path, ...args);
+          };
+          syncBuiltinESMExports();
+          const {readCliExitResult} = await import(${JSON.stringify(hook)});
+          console.log(typeof readCliExitResult);
+        `,
+        encoding: "utf8",
+      });
+      assert.equal(child.status, 0, child.stderr);
+      assert.equal(child.stdout.trim(), "function");
+    });
+  }
   it("keeps a completed Claude response when the transcript has an unfinished tail", () => fixture("claude", f => {
     const transcript = join(f.dir, "transcript.jsonl");
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["task"]));
