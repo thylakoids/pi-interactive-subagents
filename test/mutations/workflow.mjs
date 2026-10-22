@@ -7,8 +7,21 @@ import { spawnSync } from 'node:child_process';
 
 const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
-const tests = ['test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
+const tests = ['test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['overlapping executions launch another VM', 'pi-extension/subagents/workflow/manager.ts',
+    'return this.execution ??= this.executeOnce();', 'return this.executeOnce();',
+    'overlapping and repeated execute calls', 'test/workflow-execution.test.ts'],
+  ['edited metadata ignored on resume', 'pi-extension/subagents/workflow/manager.ts',
+    'meta: parsed.meta,\n        scriptSource: parsed.body,', 'meta: snapshot.meta,\n        scriptSource: parsed.body,',
+    'edit-and-resume applies new metadata', 'test/workflow-execution.test.ts'],
+  ['resume adds a new ceiling to an unbounded run', 'pi-extension/subagents/workflow/manager.ts',
+    'budgetTotal: snapshot.budgetTotal ?? null,', 'budgetTotal: snapshot.budgetTotal ?? this.options.budgetTotal,',
+    'resume preserves an unbounded budget', 'test/workflow-execution.test.ts'],
+  ['explicit unbounded budget falls back to the manager ceiling', 'pi-extension/subagents/workflow/manager.ts',
+    'params.budgetTotal !== undefined ? params.budgetTotal : managerOptions.budgetTotal',
+    'params.budgetTotal || managerOptions.budgetTotal',
+    'removes the manager default budget', 'test/workflow-execution.test.ts'],
   ['hook import depends on resolving the caller executable', 'pi-extension/subagents/cli-hook.mjs',
     'if (isMainModule()) {',
     'if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {',
@@ -265,6 +278,11 @@ try {
     if (pattern) {
       const control = execute(pattern, testFile);
       assert.equal(control.status, 0, 'Targeted baseline failed: ' + name + '\n' + control.stdout + control.stderr);
+      const selected = control.stdout.split('\n').some(line => {
+        const match = /^\s*ok \d+ - (.+)$/.exec(line);
+        return match && !line.includes('# SKIP') && new RegExp(pattern).test(match[1]);
+      });
+      assert.ok(selected, 'Mutation selected no passing test: ' + name + ' (' + pattern + ')');
     }
     const target = join(dir, path);
     const source = readFileSync(target, 'utf8');

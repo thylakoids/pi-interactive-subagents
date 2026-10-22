@@ -81,7 +81,10 @@ export default function liveFixture(pi: any) {
             dimensions: [{ name: 'boundary', focus: 'Check exactly the inclusive adult-age boundary against CONTRACT.md; report at most one independently reproducible correctness issue.' }] },
         });
         record('review-start', { runId: review.runId });
-        const reviewed = await review.execute();
+        const reviewExecution = review.execute();
+        assert.equal(review.execute(), reviewExecution, 'Concurrent callers must share one real-model execution');
+        const reviewed = await reviewExecution;
+        assert.equal(await review.execute(), reviewed, 'Repeated execution must not relaunch completed children');
         save('review', reviewed);
         verifySessions(reviewed);
         const findings = (reviewed.result as any).confirmed;

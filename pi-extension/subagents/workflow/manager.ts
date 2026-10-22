@@ -221,7 +221,7 @@ export class WorkflowRun {
   /** Every agent this run has actually launched, for the lifetime cap. */
   private launchedAgents = 0;
   private finished = false;
-  private settledNotified = false;
+  private execution?: Promise<WorkflowRunView>;
   private lastSnapshotAt = 0;
   /** Wall-clock start of this execution; the VM clock is replayed on resume. */
   private executionStartedWall: number;
@@ -240,7 +240,7 @@ export class WorkflowRun {
       cache: Map<string, CachedCall>;
       lockPath?: string;
       resumedFrom?: string;
-      budgetTotal?: number;
+      budgetTotal?: number | null;
       cachedUsageIsSpent?: boolean;
       priorSpent?: number;
       priorAttempts?: number;
@@ -281,7 +281,7 @@ export class WorkflowRun {
 
     // Seed the live view from the journal so a resumed run immediately shows
     // the calls it will not re-run.
-    const budgetTotal = params.budgetTotal ?? managerOptions.budgetTotal ?? undefined;
+    const budgetTotal = params.budgetTotal !== undefined ? params.budgetTotal : managerOptions.budgetTotal;
     if (budgetTotal && budgetTotal > 0) this.snapshot.budgetTotal = budgetTotal;
 
     for (const entry of params.cache.values()) {
@@ -1086,7 +1086,12 @@ export class WorkflowRun {
 
   // ── lifecycle ───────────────────────────────────────────────────────────
 
-  async execute(): Promise<WorkflowRunView> {
+  execute(): Promise<WorkflowRunView> {
+    // One run owns one VM, including when callers overlap or retry execute().
+    return this.execution ??= this.executeOnce();
+  }
+
+  private async executeOnce(): Promise<WorkflowRunView> {
     this.persistSnapshot();
     const code = wrapScript(this.scriptSource);
     const startedWall = this.now();
@@ -1211,11 +1216,7 @@ export class WorkflowRun {
     if (this.finished) return;
     this.finished = true;
     if (this.lockPath && !releaseLock(this.lockPath)) this.note("could not persist lock release; retained ownership for a later retry");
-    const view = this.view();
-    if (!this.settledNotified) {
-      this.settledNotified = true;
-      this.manager.onSettled?.(view);
-    }
+    this.manager.onSettled?.(this.view());
   }
 
   isFinished(): boolean {
@@ -1386,7 +1387,7 @@ export class WorkflowManager {
       cache: predecessor?.cache ?? new Map(),
       lockPath: undefined,
       ...(predecessor ? { resumedFrom: predecessor.runId } : {}),
-      ...(params.budgetTotal ? { budgetTotal: params.budgetTotal } : {}),
+      budgetTotal: params.budgetTotal,
     });
     // A brand-new run id owns its directory, so this always succeeds; the lock
     // still matters because it is what blocks a second process from resuming
@@ -1458,7 +1459,7 @@ export class WorkflowManager {
       const args = overrides && "args" in overrides ? overrides.args : snapshot.args;
       run = new WorkflowRun(this.options, {
         runId,
-        meta: snapshot.meta,
+        meta: parsed.meta,
         scriptSource: parsed.body,
         source,
         args,
@@ -1469,7 +1470,7 @@ export class WorkflowManager {
         resumedFrom: snapshot.resumedFrom,
         // A run's budget is part of what it is: resuming must not silently
         // upgrade an unbounded run to one that stops, nor drop a ceiling.
-        budgetTotal: snapshot.budgetTotal ?? this.options.budgetTotal,
+        budgetTotal: snapshot.budgetTotal ?? null,
         // The cache came from this run's own journal, so its tokens are already
         // spent from this budget.
         cachedUsageIsSpent: true,

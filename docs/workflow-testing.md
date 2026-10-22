@@ -39,7 +39,14 @@ the package's peer Pi binary for the user's installed runtime.
 - Race tests use launch gates and observed states before issuing Skip or Abort.
   A sleep alone does not prove the intended race happened.
 - Mutation tests must fail a behavioral assertion, not crash on syntax or
-  imports. They check selected known faults, not general correctness.
+  imports. Each targeted control must actually select a passing, non-skipped
+  test; a successful process exit with no matching tests is not a baseline.
+  They check selected known faults, not general correctness.
+- Execution tests overlap calls to the same run, abort and reload from disk,
+  and assert that only one VM can produce side effects. Edit-and-resume must
+  apply the stored script's current metadata, while preserving the original
+  run's budget even when the new manager has different defaults. The live
+  template probe also repeats execution against real provider-backed children.
 - The workflow live suite checks both old templates, overlapping pipeline
   stages, and disk-based Abort/Resume against retained transcripts and files.
   It injects a truncated journal tail before recovery, then reloads again and
