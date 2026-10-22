@@ -9,6 +9,13 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['exited owner leaves delegated panes behind', 'pi-extension/subagents/index.ts',
+    'try { closeSurfaceTree(surface); } catch {}\n    runningSubagents.delete(running.id);',
+    'try { closeSurface(surface); } catch {}\n    runningSubagents.delete(running.id);',
+    'owner-exit removes delegated descendants', 'test/integration/workflow-descendants.test.ts'],
+  ['post-launch failure leaks verification scratch', 'pi-extension/subagents/wiring.ts',
+    'cleanupVerifyScratch(ownedRunning.verifyScratchDir);', '',
+    'setup fails after launch', 'test/workflow-review-wiring.test.ts'],
   ['overlapping executions launch another VM', 'pi-extension/subagents/workflow/manager.ts',
     'return this.execution ??= this.executeOnce();', 'return this.executeOnce();',
     'overlapping and repeated execute calls', 'test/workflow-execution.test.ts'],

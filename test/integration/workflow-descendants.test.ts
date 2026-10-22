@@ -3,9 +3,12 @@ import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createSurface, closeSurfaceTree, surfaceExists } from '../../pi-extension/subagents/tmux.ts';
+import { __test__ } from '../../pi-extension/subagents/index.ts';
+import { createStatusState } from '../../pi-extension/subagents/status.ts';
 let available = true;
 try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); } catch { available = false; }
-it('cancelling a delegated branch removes descendants but preserves siblings and its parent', { skip: !available }, t => {
+for (const exit of ['cancel', 'owner-exit']) {
+it(exit + ' removes delegated descendants but preserves siblings and its parent', { skip: !available }, async t => {
   const keys = ['TMUX', 'TMUX_PANE', 'PI_SUBAGENT_TREE'];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   const session = 'pi-branch-cancel-' + process.pid;
@@ -22,9 +25,21 @@ it('cancelling a delegated branch removes descendants but preserves siblings and
   process.env.TMUX_PANE = child;
   const delegated = createSurface('delegated');
   assert.equal(tmux('display-message', '-p', '-t', delegated, '#{@pi_subagent_parent}'), child);
-  closeSurfaceTree(child);
+  if (exit === 'cancel') closeSurfaceTree(child);
+  else {
+    const running = { id: 'exited-owner', name: 'child', task: '', surface: child,
+      startTime: Date.now(), sessionFile: '/nonexistent-exit-test-session.jsonl',
+      statusState: createStatusState({ source: 'pi', startTimeMs: Date.now() }) };
+    __test__.runningSubagents.set(running.id, running);
+    t.after(() => __test__.runningSubagents.delete(running.id));
+    tmux('kill-pane', '-t', child);
+    const result = await __test__.watchSubagent(running, new AbortController().signal);
+    assert.equal(result.exitCode, 1, 'unreported process exit is a failure');
+    assert.equal(__test__.runningSubagents.has(running.id), false);
+  }
   assert.equal(surfaceExists(child), false);
   assert.equal(surfaceExists(delegated), false);
   assert.equal(surfaceExists(root), true);
   assert.equal(surfaceExists(sibling), true);
 });
+}

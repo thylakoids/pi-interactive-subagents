@@ -38,6 +38,15 @@ the package's peer Pi binary for the user's installed runtime.
   compliance or tool availability.
 - Race tests use launch gates and observed states before issuing Skip or Abort.
   A sleep alone does not prove the intended race happened.
+- Post-launch setup failures must close the owned child and delete its private
+  verification scratch. The UI and live protection probes seed an unconsumed
+  exit report before Focus, then check the reopened pane survives and its new
+  scratch is removed on exit. A previous execution's exit report must never
+  terminate a new execution of the same session.
+- A real tmux owner-exit test kills a branch's pane without an exit report.
+  Its watcher must report failure and close delegated descendants, while
+  leaving sibling and parent panes untouched; explicit Abort is not the only
+  path that owns this cleanup.
 - Mutation tests must fail a behavioral assertion, not crash on syntax or
   imports. Each targeted control must actually select a passing, non-skipped
   test; a successful process exit with no matching tests is not a baseline.

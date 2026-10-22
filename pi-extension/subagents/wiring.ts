@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { getSessionId } from "./session.ts";
 import { classifyStatus, formatStatusDetail } from "./status.ts";
+import { cleanupVerifyScratch } from "./workflow/readonly.ts";
 import { isMuxAvailable, muxSetupHint, closeSurfaceTree } from "./tmux.ts";
 import type { RunningSubagent, SubagentResult } from "./index.ts";
 import type {
@@ -89,7 +90,6 @@ export interface SubagentPluginSurface {
  * hand-started one in the pane, the registry and the status widget.
  */
 export function createWorkflowSubagentService(surface: SubagentPluginSurface): WorkflowSubagentService {
-  const watches = new Map<string, AbortController>();
   const reserved = surface.reservedNames ?? new Set<string>();
   const close = surface.closeSurface ?? closeSurfaceTree;
   const takenNames = () => {
@@ -177,14 +177,10 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
         surface.startWidgetRefresh();
 
         const controller = new AbortController();
-        watches.set(running.id, controller);
         running.abortController = controller;
         const completion = surface
           .watch(running, controller.signal)
-          .then((result) => toCompletion(result))
-          .finally(() => {
-            watches.delete(running.id);
-          });
+          .then((result) => toCompletion(result));
 
         return {
           id: running.id,
@@ -194,9 +190,9 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
         };
       } catch (error) {
         if (ownedRunning) {
-          watches.get(ownedRunning.id)?.abort();
-          watches.delete(ownedRunning.id);
+          ownedRunning.abortController?.abort();
           try { close(ownedRunning.surface); } catch { /* only the failed launch's owned surface */ }
+          cleanupVerifyScratch(ownedRunning.verifyScratchDir);
           if (surface.runningSubagents.get(ownedRunning.id) === ownedRunning) {
             surface.runningSubagents.delete(ownedRunning.id);
           }

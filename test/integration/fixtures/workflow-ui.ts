@@ -56,6 +56,8 @@ export default function fixture(pi: any) {
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() } }) + "\n");
     writeSubagentLoadout(child, { agent: "workflow-subagent", toolAllowlist: "read", model: null, thinking: null,
       identity: null, systemPromptMode: null, spawnable: null, autoExit: true, cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR! });
+    // A previous parent may have died before consuming this exit report.
+    writeFileSync(child + '.exit', JSON.stringify({ type: 'error', errorMessage: 'STALE_PREVIOUS_EXIT' }));
     run = await manager.start({ source: `export const meta = { name: 'ui-fixture', description: 'UI test', phases: ['Probe', 'Verify'] }
       await agent('completed', { label: 'probe-completed', phase: 'Probe' });
       await parallel(['running', 'queued'].map(task => () => agent(task, { label: 'verify-' + task, phase: 'Verify' })));

@@ -319,6 +319,19 @@ export default function protectionFixture(pi: any) {
         assert.ok(scratch, 'the real launcher must supply a private scratch root');
         assert.equal(existsSync(scratch!), false, 'the completed child must release its scratch root');
         save('readonly-scratch', { path: scratch, launchScript });
+        // An unconsumed report from a dead parent must not close a fresh Focus.
+        writeFileSync(readonlyCall.sessionFile! + '.exit', JSON.stringify({ type: 'error', errorMessage: 'STALE_PREVIOUS_EXIT' }));
+        assert.equal((await options.service.focus(readonlyCall.name!, readonlyCall.sessionFile)).ok, true);
+        assert.equal(existsSync(readonlyCall.sessionFile! + '.exit'), false);
+        const focused = [...__test__.runningSubagents.values()].find(child => child.sessionFile === readonlyCall.sessionFile)!;
+        assert.ok(focused, 'Focus must register the reopened real Pi');
+        assert.ok(focused.verifyScratchDir && existsSync(focused.verifyScratchDir));
+        await delay(2500); // Allow watcher ticks and actual Pi startup, not just focus() to return.
+        assert.equal(surfaceExists(focused.surface), true, 'stale exit must not kill the new pane');
+        options.service.stop(focused.name);
+        await until(() => !__test__.runningSubagents.has(focused.id), 'focused child watcher settles');
+        assert.equal(existsSync(focused.verifyScratchDir!), false, 'closing Focus releases its own scratch');
+        save('readonly-focus-cleanup', { sessionFile: focused.sessionFile, scratch: focused.verifyScratchDir });
 
         // The model's own report is only a claim; the loadout, the transcript
         // and the bytes on disk are the evidence.

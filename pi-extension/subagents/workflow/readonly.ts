@@ -23,7 +23,21 @@ import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { LINUX_LANDLOCK_EXEC } from "./linux-landlock.ts";
+
+const verifyScratchRoots = new Set<string>();
+
+export function createVerifyScratch(): string {
+  const path = mkdtempSync(join(tmpdir(), "pi-verify-"));
+  verifyScratchRoots.add(path);
+  return path;
+}
+
+export function cleanupVerifyScratch(path?: string): void {
+  if (!path || !verifyScratchRoots.has(path)) return;
+  try { rmSync(path, { recursive: true, force: true }); verifyScratchRoots.delete(path); } catch {}
+}
 
 /** The one tool a read-only step may use to execute something. */
 export const VERIFY_COMMAND_TOOL = "verify_command";

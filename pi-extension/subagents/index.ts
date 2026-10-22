@@ -11,12 +11,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   rmSync,
   unlinkSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { READONLY_TOOL_ALLOWLIST, READONLY_ENV } from "./workflow/readonly.ts";
+import { homedir } from "node:os";
+import { READONLY_TOOL_ALLOWLIST, READONLY_ENV, createVerifyScratch, cleanupVerifyScratch } from "./workflow/readonly.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -1061,12 +1060,6 @@ function buildSubagentToolAllowlist(
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
  * responsibility since they differ slightly between launch and resume.
  */
-const verifyScratchRoots = new Set<string>();
-function cleanupVerifyScratch(path?: string): void {
-  if (!path || !verifyScratchRoots.has(path)) return;
-  try { rmSync(path, { recursive: true, force: true }); verifyScratchRoots.delete(path); } catch {}
-}
-
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
@@ -1117,8 +1110,7 @@ function applySandboxToParts(
     }
   }
   if (loadout.readOnly) {
-    const scratch = mkdtempSync(join(tmpdir(), "pi-verify-"));
-    verifyScratchRoots.add(scratch);
+    const scratch = createVerifyScratch();
     parts.unshift("env", `${READONLY_ENV.scratch}=${shellEscape(scratch)}`);
     return scratch;
   }
@@ -1402,6 +1394,7 @@ export const __test__ = {
   uniqueRunningName,
   reserveRunningName,
   reservedNames,
+  watchSubagent,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
@@ -1481,6 +1474,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     }
     const loadout = readSubagentLoadout(sessionPath);
     if (!loadout) throw new Error("The original sandbox snapshot is unavailable.");
+    rmSync(`${sessionPath}.exit`, { force: true });
     surface = createSurface(name);
     const id = randomUUID().slice(0, 8);
     const activityFile = getSubagentActivityFile(artifactDir, id);
@@ -1961,8 +1955,6 @@ async function watchSubagent(
       }
       const exitCode = payload.exitCode ?? result.exitCode;
       const summary = payload.summary || result.errorMessage || `CLI exited with code ${exitCode} without a final response.`;
-      try { closeSurface(surface); } catch {}
-      runningSubagents.delete(running.id);
       return { name, task, summary, exitCode, elapsed, sessionFile,
         sessionId: getSessionId(sessionFile) ?? undefined };
     }
@@ -1983,9 +1975,6 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    try { closeSurface(surface); } catch {}
-    runningSubagents.delete(running.id);
-
     return {
       name,
       task,
@@ -1998,11 +1987,6 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
-    runningSubagents.delete(running.id);
-
     if (signal.aborted) {
       return {
         name,
@@ -2023,6 +2007,8 @@ async function watchSubagent(
       error: err?.message ?? String(err),
     };
   } finally {
+    try { closeSurfaceTree(surface); } catch {}
+    runningSubagents.delete(running.id);
     cleanupVerifyScratch(running.verifyScratchDir);
   }
 }
@@ -2611,6 +2597,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
           const command = finishCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
+          rmSync(`${sessionPath}.exit`, { force: true });
           const launchScriptFile = join(
             artifactDir,
             "subagent-scripts",

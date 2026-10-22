@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { createWorkflowSubagentService } from '../pi-extension/subagents/wiring.ts';
 import { __test__ } from '../pi-extension/subagents/index.ts';
 import { deferred } from './helpers/workflow.ts';
+import { existsSync } from 'node:fs';
+import { createVerifyScratch, cleanupVerifyScratch } from '../pi-extension/subagents/workflow/readonly.ts';
 
 function surfaceFixture() {
   const names: Record<string, { sessionFile: string }> = {};
@@ -68,11 +70,14 @@ it('a failed pending workflow launch releases its name without closing another s
 });
 
 for (const fault of ['registry', 'watcher']) {
-  it('closes its owned child if ' + fault + ' setup fails after launch', async () => {
+  it('closes its owned child if ' + fault + ' setup fails after launch', async t => {
     const { surface, closed } = surfaceFixture();
+    const scratch = createVerifyScratch();
+    t.after(() => cleanupVerifyScratch(scratch));
     const launch = surface.launch;
     surface.launch = async (params: any) => {
       const running = await launch(params);
+      running.verifyScratchDir = scratch;
       surface.runningSubagents.set(running.id, running);
       return running;
     };
@@ -83,6 +88,7 @@ for (const fault of ['registry', 'watcher']) {
     assert.equal(surface.reservedNames.has(name), false);
     assert.deepEqual(closed, ['owned-test-surface']);
     assert.equal(surface.runningSubagents.size, 0, 'failed setup must not leave an unwatched running entry');
+    assert.equal(existsSync(scratch), false, 'failed setup must release its private verification scratch');
   });
 }
 
