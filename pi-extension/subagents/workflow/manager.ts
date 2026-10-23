@@ -628,7 +628,7 @@ export class WorkflowRun {
     this.activeChildren++;
     try {
       const result = await runScript({
-        code: wrapScript(parsed.body), args, startedAt: this.snapshot.startedAt,
+        code: parsed.body, filename: saved, args, startedAt: this.snapshot.startedAt,
         seed: (this.snapshot.seed ^ Number.parseInt(base.slice(0, 8), 16)) >>> 0,
         signal: this.signal, limits: { runTimeoutMs: this.scriptTimeoutMs }, maxItemsPerBatch: MAX_ITEMS_PER_BATCH,
         onCall: (call, deliver) => { void this.dispatch(call, deliver, scope); },
@@ -1093,12 +1093,12 @@ export class WorkflowRun {
 
   private async executeOnce(): Promise<WorkflowRunView> {
     this.persistSnapshot();
-    const code = wrapScript(this.scriptSource);
     const startedWall = this.now();
     this.executionStartedWall = startedWall;
 
     const result = await runScript({
-      code,
+      code: this.scriptSource,
+      filename: scriptPath(this.runDir),
       args: this.snapshot.args,
       startedAt: this.snapshot.startedAt,
       seed: this.snapshot.seed,
@@ -1990,13 +1990,4 @@ function formatMinutes(ms: number): string {
   if (ms < 60_000) return `${Math.max(1, Math.round(ms / 1000))}s`;
   const minutes = Math.round(ms / 60_000);
   return minutes === 1 ? "1 min" : `${minutes} min`;
-}
-
-/**
- * The sandbox runs an async function body, so the script needs no wrapper for
- * `await` or `return`. This hook exists for the meta statement's rewrite
- * bookkeeping and for future source-level annotations.
- */
-function wrapScript(source: string): string {
-  return source;
 }

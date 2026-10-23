@@ -8,6 +8,7 @@ import extension, { __test__ } from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager, type WorkflowRun } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { getSessionId, readNameRegistry, readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import { surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
+import { delegationProbe } from './workflow-delegation-probe.ts';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, label: string, timeout = 180_000) {
@@ -126,7 +127,8 @@ export default function collaboration(pi: any) {
       for (const file of [options.sessionFile, call.sessionFile!, scout.sessionFile, aborted.calls[0].sessionFile!]) {
         assert.ok(rows(file).some(row => row.message?.role === 'assistant' && (row.message.usage?.input > 0 || row.message.usage?.output > 0)), 'Every actor must have real provider responses');
       }
-      save('report', { ok: true, token, parentSession: options.sessionFile, workerSession: call.sessionFile, scoutSession: scout.sessionFile, abortedSession: aborted.calls[0].sessionFile, replies, checks: ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry'] });
+      await delegationProbe(options, dir);
+      save('report', { ok: true, token, parentSession: options.sessionFile, workerSession: call.sessionFile, scoutSession: scout.sessionFile, abortedSession: aborted.calls[0].sessionFile, replies, checks: ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry', 'multilevel-abort-resume-isolation'] });
       event('all-passed');
     } catch (error: any) {
       manager?.abortAll('collaboration test failure');

@@ -5,6 +5,8 @@ description: Write or adapt JavaScript workflows for pi-interactive-subagents, c
 
 # Workflow authoring
 
+Before starting an authored or edited script, call `workflow({ action: 'validate', script: '...' })` (or `name`). This compiles in the actual QuickJS sandbox without executing code, creating a run or calling agents. It checks syntax only; `node --check` does not validate QuickJS compatibility. Then test behavior with an explicit bounded stub branch before enabling costly agents. A valid compile does not prove runtime success.
+
 Turn the user's opted-in task into a small program with explicit data dependencies. A workflow request authorizes orchestration within its scope; merely loading this skill, listing templates, or finding a task parallelizable does not. For one task or a few manually managed agents, use `subagent` instead.
 
 Before writing a script, read [the authoring reference](references/authoring.md). It explains the API contract, failure/recovery rules, input requirements and runnable examples. If skills or file reads are unavailable, `workflow({ action: 'guide' })` returns this skill, the reference and current runtime declarations.

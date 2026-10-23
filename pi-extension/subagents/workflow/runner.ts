@@ -224,6 +224,9 @@ function readConcurrencyOverride(): number | null {
 
 export interface StartScriptOptions {
   code: string;
+  filename?: string;
+  /** Parse the actual sandbox program without executing user code or bridges. */
+  compileOnly?: boolean;
   /** Inlined into the script's `args` binding. */
   args: unknown;
   startedAt: number;
@@ -258,7 +261,9 @@ export interface ScriptResult {
  * and their budget refreshes. Buffer only while the VM is starting.
  */
 export async function runScript(options: StartScriptOptions): Promise<ScriptResult> {
-  const code = prepareScriptSource(options.code, options.args, options.maxItemsPerBatch);
+  const prefix = options.compileOnly ? "return;\n" : "";
+  const code = prefix + prepareScriptSource(options.code, options.args, options.maxItemsPerBatch);
+  const sourceOffset = code.split("\n").length - options.code.split("\n").length;
   const limits: ScriptLimits = { ...DEFAULT_LIMITS, ...options.limits };
   const sandbox = new CodemodeSandbox({ memoryLimitBytes: limits.memoryLimitBytes });
 
@@ -361,7 +366,7 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
       issuedCalls,
       error: {
         kind: result.error.kind,
-        message: result.error.message || result.error.name || "workflow script failed",
+        message: formatScriptError(result.error, options, sourceOffset),
       },
     };
   } finally {
@@ -369,4 +374,32 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
     options.signal.removeEventListener("abort", abort);
     await sandbox.close().catch(() => {});
   }
+}
+
+function formatScriptError(error: { name?: string; message?: string; stack?: string }, options: StartScriptOptions, offset: number): string {
+  const message = error.message || error.name || "workflow script failed";
+  const position = /\bat codemode\.js:(\d+)(?::(\d+))?/.exec(error.stack ?? "");
+  if (!position) return message;
+  const reportedLine = Number(position[1]) - offset;
+  const lines = options.code.split("\n");
+  if (reportedLine < 1 || reportedLine > lines.length + 1) return message;
+  // QuickJS may point at the SDK's closing wrapper for an unfinished source.
+  const line = Math.min(reportedLine, lines.length);
+  const column = reportedLine > lines.length ? lines.at(-1)!.length + 1 : position[2] ? Number(position[2]) : undefined;
+  const context = lines.slice(Math.max(0, line - 2), line + 1)
+    .map((text, i) => {
+      const number = Math.max(1, line - 1) + i;
+      const start = number === line && column ? Math.max(0, column - 101) : 0;
+      const excerpt = (start ? "..." : "") + text.slice(start, start + 240) + (text.length > start + 240 ? "..." : "");
+      return `${number === line ? ">" : " "} ${number} | ${excerpt}`;
+    });
+  return `${error.name ?? "Error"}: ${message}\n${options.filename ?? "workflow.js"}:${line}${column ? ":" + column : ""}\n${context.join("\n")}`;
+}
+
+/** Same QuickJS compiler and prelude as execution; no agent or host calls. */
+export function validateScript(code: string, filename = "workflow.js", signal = new AbortController().signal): Promise<ScriptResult> {
+  return runScript({ code, filename, compileOnly: true, args: {}, startedAt: 0, seed: 1,
+    signal,
+    onCall() { throw new Error("Compilation must not execute host calls"); },
+  });
 }

@@ -9,6 +9,18 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-session-lifecycle.test.ts', 'test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['unfinished source reports generated wrapper line', 'pi-extension/subagents/workflow/runner.ts',
+    'const line = Math.min(reportedLine, lines.length);', 'const line = reportedLine;',
+    'QuickJS validation parses unreachable', 'test/workflow-syntax.test.ts'],
+  ['syntax failures lose source diagnostics', 'pi-extension/subagents/workflow/runner.ts',
+    'message: formatScriptError(result.error, options, sourceOffset),', 'message: result.error.message,',
+    'syntax diagnostics preserve original', 'test/workflow-syntax.test.ts'],
+  ['meta extraction shifts source positions', 'pi-extension/subagents/workflow/script.ts',
+    'source.slice(0, exportStart) + "      " + source.slice(exportStart + 6)', '(source.slice(0, exportStart) + "      " + source.slice(exportStart + 6)).trimStart()',
+    'syntax diagnostics preserve original', 'test/workflow-syntax.test.ts'],
+  ['validation executes user code and host calls', 'pi-extension/subagents/workflow/runner.ts',
+    'const prefix = options.compileOnly ? "return;\\n" : "";', 'const prefix = "";',
+    'QuickJS validation parses unreachable', 'test/workflow-syntax.test.ts'],
   ['ordinary tool mentioning guardian survives cleanup', 'pi-extension/subagents/tmux.ts',
     '.command.startsWith(`${process.execPath} ${guardian} `)', '.command.includes(guardian)',
     'closing an owned pane kills detached timeout descendants', 'test/integration/surface-owner.test.ts'],
@@ -327,7 +339,7 @@ try {
       const result = execute(pattern, testFile);
       assert.equal(result.status, 1, 'Mutant survived or crashed: ' + name + '\n' + result.stdout + result.stderr);
       assert.match(result.stdout, /ERR_ASSERTION/, 'Must fail an assertion, not a syntax/import error: ' + name);
-      assert.doesNotMatch(result.stdout + result.stderr, /SyntaxError|ERR_MODULE_NOT_FOUND/);
+      assert.doesNotMatch(result.stdout + result.stderr, /(?:^|\n)(?:# )?SyntaxError:|ERR_MODULE_NOT_FOUND/);
       console.log('Detected: ' + name);
     } finally { writeFileSync(target, source); }
   }

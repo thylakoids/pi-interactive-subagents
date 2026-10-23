@@ -155,9 +155,9 @@ export function parseScript(source: string, origin: string): ParsedScript {
     );
   }
 
-  const before = source.slice(0, match.index + match[1].length);
-  const after = source.slice(literalEnd + 1);
-  const body = `${before}const meta = ${literal};${after}`;
+  // Keep original line/column positions for QuickJS diagnostics.
+  const exportStart = match.index + match[0].indexOf("export");
+  const body = source.slice(0, exportStart) + "      " + source.slice(exportStart + 6);
 
   return { body, meta, origin };
 }

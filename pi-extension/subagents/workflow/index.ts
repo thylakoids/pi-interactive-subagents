@@ -19,6 +19,7 @@ import { WorkflowManager } from "./manager.ts";
 import { WorkflowPanel, formatElapsed, formatTokens } from "./ui.ts";
 import { WorkflowScriptError, listSavedWorkflows, parseScript, readScriptFile, resolveSavedScriptPath } from "./script.ts";
 import { buildWorkflowDescription, readAuthoringGuide, workflowSize } from "./authoring.ts";
+import { validateScript } from "./runner.ts";
 import { STRUCTURED_OUTPUT_EXTENSION } from "../wiring.ts";
 import type { WorkflowRunView, WorkflowSubagentService } from "./types.ts";
 
@@ -37,21 +38,22 @@ const WorkflowParams = Type.Object({
       Type.Literal("status"),
       Type.Literal("list"),
       Type.Literal("guide"),
+      Type.Literal("validate"),
     ], {
       description:
-        "start a run (default), resume from its journal, report status, list available workflows, or read authoring guidance/templates without executing anything",
+        "start a run (default), resume, report status, list/guide, or validate QuickJS syntax without executing code or agents",
     }),
   ),
   script: Type.Optional(
     Type.String({
       description:
-        "Inline workflow source for action=start. Plain JavaScript; must begin with a pure literal `export const meta = {...}`.",
+        "Inline source for start/resume/validate. Plain JavaScript; must begin with a pure literal `export const meta = {...}`.",
     }),
   ),
   name: Type.Optional(
     Type.String({
       description:
-        "Saved workflow name or path: selects the script for action=start; selects a full template for action=guide.",
+        "Saved workflow name or path for start/validate, or a full template for guide.",
     }),
   ),
   args: Type.Optional(
@@ -176,7 +178,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       });
     } else {
       run = await activeManager.start({
-        source: resolveSource(params, ctx),
+        source: resolveSource(params, ctx).source,
         args: params.args ?? {},
         ...(params.reuse ? { reuse: params.reuse } : {}),
       });
@@ -187,8 +189,8 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
     return run.view();
   };
 
-  const resolveSource = (params: { script?: string; name?: string }, ctx: ExtensionContext): string => {
-    if (params.script?.trim()) return params.script;
+  const resolveSource = (params: { script?: string; name?: string }, ctx: ExtensionContext): { source: string; filename: string } => {
+    if (params.script?.trim()) return { source: params.script, filename: "inline-workflow.js" };
     if (!params.name?.trim()) {
       throw new WorkflowScriptError(
         "Provide `script` (inline source) or `name` (a saved workflow in .pi/workflows/<name>.js).",
@@ -201,7 +203,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
         `No saved workflow "${params.name}" in ${join(ctx.cwd, ".pi", "workflows")} or ${join(agentDir, "workflows")}.`,
       );
     }
-    return readScriptFile(path);
+    return { source: readScriptFile(path), filename: path };
   };
 
   pi.registerTool({
@@ -216,6 +218,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       "Give each agent() a short `label`; it is the panel's row title and part of the resume key.",
       "Use `schema` when you will branch on the result; free text cannot be parsed reliably.",
       "Keep per-agent prompts self-contained: subagents do not see this conversation.",
+      "Before starting an authored/edited script, use action=validate: the real QuickJS compiler checks syntax without executing code or calling agents. Node --check is not sandbox validation.",
     ],
     parameters: WorkflowParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -226,6 +229,15 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
         }
         if (action === "guide") {
           return readonlyResult("guide", formatWorkflowGuide(params.name, ctx, size));
+        }
+        if (action === "validate") {
+          const { source, filename } = resolveSource(params, ctx);
+          const checked = await validateScript(parseScript(source, filename).body, filename, _signal);
+          return {
+            content: [{ type: "text" as const, text: checked.ok ? `QuickJS syntax OK: ${filename}. No code or agents executed; runtime behavior is not validated.` : checked.error!.message }],
+            details: { action, valid: checked.ok, filename, ...(checked.ok ? {} : { error: checked.error!.message }) },
+            ...(checked.ok ? {} : { isError: true }),
+          };
         }
         const view = await startRun({ ...params, action }, ctx);
         return {
@@ -260,7 +272,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       if (details?.error) {
         return new Text(`${INDENT}${theme.fg("dim", "⎿")}  ${theme.fg("error", String(details.error))}`, 0, 0);
       }
-      if (details?.action === "list" || details?.action === "guide") {
+      if (details?.action === "list" || details?.action === "guide" || details?.action === "validate") {
         const text = result.content
           .filter((item): item is { type: "text"; text: string } => item.type === "text")
           .map((item) => item.text)
@@ -377,6 +389,7 @@ function formatStartMessage(action: string, view: WorkflowRunView): string {
       `journal: ${view.runDir}/journal.jsonl`,
     ];
     const unresolved = unresolvedLabels(view);
+    if (view.error) lines.push(`error: ${view.error}`);
     if (unresolved.length > 0) {
       lines.push(`no value from ${unresolved.length} call(s):`);
       for (const label of unresolved) lines.push(`  · ${label}`);
@@ -496,6 +509,7 @@ export interface WorkflowSettledDetails {
   runId: string;
   name: string;
   status: string;
+  error?: string;
   elapsedMs: number;
   agentCount: number;
   completedCount: number;
@@ -529,7 +543,7 @@ function renderWorkflowCall(args: { action?: string; script?: string; name?: str
   if (args.action === "resume") return `${head}${theme.fg("dim", `(${args.runId ?? "resume"})`)}`;
   if (args.action === "status") return `${head}${theme.fg("dim", "(status)")}`;
   if (args.action === "list") return `${head}${theme.fg("dim", "(list)")}`;
-  if (args.action === "guide") return `${head}${theme.fg("dim", `(guide${args.name ? `: ${args.name}` : ""})`)}`;
+  if (args.action === "guide" || args.action === "validate") return `${head}${theme.fg("dim", `(${args.action}${args.name ? `: ${args.name}` : ""})`)}`;
   return `${head}${theme.fg("dim", `(${args.name?.trim() || inlineName(args.script) || "inline"})`)}`;
 }
 
@@ -550,6 +564,10 @@ function renderSettledMessage(details: WorkflowSettledDetails | undefined, expan
   if (details.usage?.totalTokens) counts.push(`${formatTokens(details.usage.totalTokens)} tokens`);
   if (details.usage?.cost) counts.push(`$${details.usage.cost.toFixed(2)}`);
   const lines = [head, `${INDENT}${theme.fg("dim", `⎿  ${counts.join(" · ")}`)}`];
+  if (details.error) {
+    const error = expanded ? details.error.split("\n") : [firstLine(details.error, 140)];
+    lines.push(...error.map(line => `${INDENT}   ${theme.fg("error", line)}`));
+  }
   if (!expanded) {
     lines.push(`${INDENT}   ${theme.fg("muted", "(ctrl+o to expand result)")}`);
     return lines.join("\n");
@@ -633,6 +651,7 @@ function publishRunSettled(pi: ExtensionAPI, view: WorkflowRunView): void {
         runId: view.runId,
         name: view.meta.name,
         status: view.status,
+        ...(view.error ? { error: view.error } : {}),
         // Frozen here: the transcript is read hours later, and a live clock
         // would make the run look longer every time it is rendered.
         elapsedMs: Math.max(0, (view.finishedAt ?? Date.now()) - view.startedAtWall),

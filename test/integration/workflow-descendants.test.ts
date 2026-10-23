@@ -2,10 +2,10 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createSurface, closeSurfaceTree, surfaceExists } from '../../pi-extension/subagents/tmux.ts';
+import { createSurface, closeSurfaceTree, surfaceExists, sendCommand, shellEscape } from '../../pi-extension/subagents/tmux.ts';
 import extension, { __test__ } from '../../pi-extension/subagents/index.ts';
 import { createVerifyScratch, cleanupVerifyScratch } from '../../pi-extension/subagents/workflow/readonly.ts';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStatusState } from '../../pi-extension/subagents/status.ts';
@@ -30,6 +30,21 @@ it(exit + ' removes delegated descendants but preserves siblings and its parent'
   process.env.TMUX_PANE = child;
   const delegated = createSurface('delegated');
   assert.equal(tmux('display-message', '-p', '-t', delegated, '#{@pi_subagent_parent}'), child);
+  process.env.TMUX_PANE = delegated;
+  const leaf = createSurface('third-level');
+  const markers = mkdtempSync(join(tmpdir(), 'pi-branch-tools-'));
+  t.after(() => rmSync(markers, { recursive: true, force: true }));
+  for (const [pane, label] of [[leaf, 'leaf'], [sibling, 'sibling']]) {
+    const command = `echo $$ > ${shellEscape(join(markers, label + '-pid'))}; while ! test -f ${shellEscape(join(markers, 'release'))}; do sleep 0.05; done; echo done > ${shellEscape(join(markers, label + '-done'))}`;
+    sendCommand(pane, 'bash -c ' + shellEscape(command));
+  }
+  const deadline = Date.now() + 5000;
+  while (!existsSync(join(markers, 'leaf-pid')) || !existsSync(join(markers, 'sibling-pid'))) {
+    assert.ok(Date.now() < deadline, 'both actual tools must start before cancellation');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const leafPid = Number(readFileSync(join(markers, 'leaf-pid'), 'utf8'));
+  const siblingPid = Number(readFileSync(join(markers, 'sibling-pid'), 'utf8'));
   if (exit === 'cancel') closeSurfaceTree(child);
   else {
     const scratch = createVerifyScratch();
@@ -63,7 +78,23 @@ it(exit + ' removes delegated descendants but preserves siblings and its parent'
   }
   assert.equal(surfaceExists(child), false);
   assert.equal(surfaceExists(delegated), false);
+  assert.equal(surfaceExists(leaf), false);
   assert.equal(surfaceExists(root), true);
   assert.equal(surfaceExists(sibling), true);
+  assert.doesNotThrow(() => process.kill(siblingPid, 0), 'another branch tool must survive');
+  writeFileSync(join(markers, 'release'), 'release');
+  const finished = Date.now() + 5000;
+  while (!existsSync(join(markers, 'sibling-done'))) {
+    assert.ok(Date.now() < finished, 'unrelated branch must still make progress');
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(existsSync(join(markers, 'leaf-done')), false, 'closed third-level tool cannot execute after cancellation');
+  assert.equal(readFileSync(join(markers, 'sibling-done'), 'utf8').trim(), 'done');
+  try { assert.match(tmuxProcessState(leafPid), /^Z/); } catch (error) { if ((error as any).status !== 1) throw error; }
 });
+}
+
+function tmuxProcessState(pid: number) {
+  assert.ok(Number.isInteger(pid) && pid > 0);
+  return execFileSync('ps', ['-o','stat=','-p',String(pid)], { encoding: 'utf8' }).trim();
 }

@@ -34,11 +34,15 @@ workflow({ action: 'status', runId: 'wf-1a2b3c4d5e6f' })                        
 workflow({ action: 'list' })                                                       // 列出项目、全局和内置 workflow
 workflow({ action: 'guide' })                                                      // 读取编写指南和当前运行时 API
 workflow({ action: 'guide', name: 'deep-research' })                               // 读取完整模板，不执行
+workflow({ action: 'validate', name: 'migrate-imports' })                           // 实际 QuickJS 纯编译检查
+workflow({ action: 'validate', script: '...脚本源码...' })                          // 内联脚本纯编译检查
 ```
 
 `args` 必须是 JSON 可序列化的值，脚本里以 `args` 直接读到。
 
 `list` 和 `guide` 是只读动作：不需要 tmux、持久化会话或可用的子代理配置，不会启动模型调用。`list` 展示每个 workflow 的 description、`whenToUse`、phases 和路径；`guide <name>` 返回完整脚本，适合在 skill 或文件读取不可用时参考。
+
+新写或编辑脚本后，先用 `validate`：它使用与执行完全相同的 QuickJS 编译器和前置代码，但不执行脚本、不创建 run、不调用 agent，也不需要 tmux 或模型配置。`node --check` 不能代替这个检查。编译错误显示文件、原始行列号及附近代码；实际 run 的错误指向其目录内的 `script.js`。缺失闭合括号等落在沙箱包装代码的错误会指向用户脚本末尾。纯编译不验证运行行为；复杂编排应再用显式、有界的 stub 分支测试数据流，确认后才启用真实 agent，避免在昂贵调用后才发现控制流错误。
 
 工具立即返回 run id（形如 `wf-1a2b3c4d5e6f`）和 run 目录位置；run 在后台执行，落定（完成/失败/中止）时主会话收到一条消息：状态、完成数、token 用量、`runId`、`script:` 路径，以及脚本 `return` 值的 JSON（超长截断到 4000 字符，完整值在 run 目录的 `output.json`）。中途不需要轮询。
 

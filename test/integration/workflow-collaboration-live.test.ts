@@ -32,6 +32,9 @@ it('real parent answers workflow questions, worker delegates, and waiting workfl
     writeFileSync(join(agentsDir, name + '.md'), definition);
   }
   writeFileSync(join(dir, 'fixture.txt'), 'SCOUT_READ_OK\n');
+  for (const [name, child] of [['branch', 'relay'], ['relay', 'leaf'], ['leaf', '']] as const) {
+    writeFileSync(join(agentsDir, name + '.md'), `---\nname: ${name}\ndescription: Live delegation probe\ntools: bash\nthinking: off\nauto-exit: true\n${child ? 'subagent_agents: ' + child + '\n' : ''}---\nFollow the supplied task exactly. If asked to delegate, use subagent and wait for its actual result. Do not replace delegation with your own work.\n`);
+  }
   const pane = tmux('new-session', '-d', '-s', session, '-x', '140', '-y', '42', '-P', '-F', '#{pane_id}');
   const runtime = integrationRuntime();
   const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_WORKFLOW_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_WORKFLOW_MAX_CONCURRENT_AGENTS=4 PI_SUBAGENT_SHELL_READY_DELAY_MS=100 ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/workflow-collaboration-live.ts'))} --session ${shellEscape(join(dir, 'parent.jsonl'))} 2>${shellEscape(join(dir, 'startup-error.log'))}; status=$?; echo $status >${shellEscape(join(dir, 'parent-exit.txt'))}; sleep 120`;
@@ -47,5 +50,5 @@ it('real parent answers workflow questions, worker delegates, and waiting workfl
   assert.ok(existsSync(join(dir, 'report.json')), 'Timed out; inspect retained sessions and events in ' + dir);
   const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));
   assert.equal(report.ok, true, report.error);
-  assert.deepEqual(report.checks, ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry']);
+  assert.deepEqual(report.checks, ['real-parent-reply', 'same-session-continuation', 'real-scout-delegation', 'waiting-state', 'abort-while-waiting', 'disk-terminal-state', 'late-reply-rejected', 'blocked-delegation-retry', 'multilevel-abort-resume-isolation']);
 });
