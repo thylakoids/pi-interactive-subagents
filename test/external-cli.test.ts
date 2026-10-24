@@ -19,6 +19,37 @@ function fixture(kind: "claude" | "codex", run: (f: any) => void) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 describe("native CLI hooks", () => {
+  it("does not acknowledge an identical queued prompt twice through hook and transcript", () => fixture("claude", f => {
+    const transcript = join(f.dir, 'transcript.jsonl');
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['same', 'same']));
+    writeFileSync(transcript, [
+      { type: 'user', uuid: 'user-first', promptId: 'first', message: { content: 'same' } },
+      { type: 'assistant', uuid: 'answer-first', message: { content: [] } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'auto', { session_id: 'claude-id', transcript_path: transcript, ...event });
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'first', prompt: 'same' });
+    send({ hook_event_name: 'Stop', prompt_id: 'first', last_assistant_message: 'first answer' });
+    assert.equal(existsSync(f.resultFile), false, 'the second identical prompt has not run');
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['same']);
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'second', prompt: 'same' });
+    send({ hook_event_name: 'Stop', prompt_id: 'second', last_assistant_message: 'second answer' });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'second answer');
+  }));
+  it("acknowledges only the completed Claude prompt even when Stop precedes transcript flush", () => fixture("claude", f => {
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['first', 'later']));
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'auto', { session_id: 'claude-id', ...event });
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'first-id', prompt: 'first' });
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'later-id', prompt: 'later' });
+    send({ hook_event_name: 'Stop', prompt_id: 'first-id', last_assistant_message: 'first done' });
+    assert.equal(existsSync(f.resultFile), false, 'a later submitted prompt is still pending');
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['first']);
+    send({ hook_event_name: 'Stop', prompt_id: 'first-id', last_assistant_message: 'duplicate stop' });
+    assert.equal(existsSync(f.resultFile), false);
+    send({ hook_event_name: 'UserPromptSubmit', session_id: 'other-session', prompt_id: 'later-id', prompt: 'wrong' });
+    send({ hook_event_name: 'Stop', prompt_id: 'later-id', last_assistant_message: 'later done' });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'later done');
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['first', 'later']);
+  }));
   it("baselines complete history at SessionStart and accepts a completed record without a newline", () => fixture("claude", f => {
     const transcript = join(f.dir, "transcript.jsonl");
     const oldInput = { type: "user", uuid: "old", message: { content: "old task" } };

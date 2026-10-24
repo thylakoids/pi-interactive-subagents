@@ -48,6 +48,16 @@ workflow({ action: 'validate', script: '...脚本源码...' })                  
 
 ## 脚本契约
 
+### 后端能力边界
+
+`agent: 'claude-cli'` 和 `agent: 'codex-cli'` 使用原生交互 CLI，只返回最终文本；并发、pipeline、重试、Skip 和 Abort 仍由 workflow 管理。它们不提供 Pi 的 `ask_question` 等待/回复协议、`structured_output`、只读验证或受控委派。不要把 CLI 自带的子代理当作 Pi 管理的子代理。
+
+CLI 调用的 `schema`、`readOnly: true` 和带 token budget 的运行会在启动前拒绝；CLI 定义中的 Pi `tools`、`skills`、`subagent_agents` 及额外 Pi extensions 也会拒绝，不会静默忽略。原生 CLI 使用自己的工具配置，并绕过权限确认；这不是 Pi 工具白名单或只读沙箱。没有完整 token/费用和工具活动/提问等待遥测，预算计算不支持 CLI。
+
+未指定模型或推理强度时，CLI 使用自身配置，不继承 Pi 会话的模型/强度。显式 `model` 必须是原生 CLI 接受的标识；`effort` 必须是后端支持的值（不能把 Pi 的 `off` 原样传入）。模型对具体强度的支持由原生 CLI 验证，不会自动降低强度或换模型。
+
+两种恢复不同：workflow `resume` 重放已完成结果，未完成调用以新 CLI 会话重试；`subagent_message` 则用原生会话 ID 续接旧对话。已完成 agent 的 Focus 不提交新 prompt，而是打开原会话供用户交互。Codex 在首次完成通知提供 thread ID 前，不能保证原会话可恢复；此时明确报错，不使用 `--last` 猜测。Pi 的 `session-mode: fork` 不适用于原生 CLI。
+
 纯 JavaScript（不是 TypeScript），作为 async 函数体执行——`await` 和 `return` 都可用。**第一句必须是纯字面量的 `meta`**：
 
 ```js

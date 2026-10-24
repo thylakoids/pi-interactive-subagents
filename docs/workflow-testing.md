@@ -33,6 +33,58 @@ the package's peer Pi binary for the user's installed runtime.
 
 ## Evidence requirements
 
+### Native Claude/Codex CLI acceptance
+
+The stand-in TUIs in `external-cli.test.ts` test the adapter, not native model
+behavior. Run the separate billed suite with authenticated, onboarded native
+CLIs and tmux:
+
+```sh
+PI_NATIVE_CLI_LIVE=1 node --test --test-concurrency=1 test/integration/native-cli-live.test.ts
+```
+
+It checks startup, a live message, Abort, same-conversation native resume with
+remembered content, workflow journal replay without repeating a committed
+command, a new conversation for the retried step, and completed Focus without
+submitting another turn. Evidence must include actual completion text and native
+IDs, not just pane existence. `PI_NATIVE_CLAUDE_MODEL` / `PI_NATIVE_CODEX_MODEL`
+optionally select native model identifiers; neither backend inherits Pi model
+or effort defaults. Without the opt-in, these two billed suites skip explicitly.
+
+For Linux, build the normal image first, then a native-CLI image:
+
+```sh
+docker build -t pi-native-linux - <<'EOF'
+FROM pi-linux-e2e:local
+USER root
+RUN npm install -g --no-audit --no-fund @openai/codex@latest @anthropic-ai/claude-code@latest \
+ && chown -R node:node /home/node
+USER node
+EOF
+PI_LINUX_IMAGE=pi-native-linux PI_SECRET_DIR=/path/to/private-test-config test/linux/run --suite native
+```
+
+The read-only secret mount may contain `claude.json`, `claude/settings.json`,
+`codex/config.toml`, `codex/auth.json`, plus the usual Pi `auth.json`/`models.json`.
+Only these explicit files are copied to the disposable container home, not host
+plugins, hooks or session history. Supply minimal test configuration and completed
+onboarding. Container endpoints must be reachable from Linux (localhost means the
+container, not the host). The `native` suite is separately opted in, not part of
+`all`, and rejects skipped backend tests. Retained evidence can contain prompts
+and native session identifiers; keep it private.
+
+The Linux native runner explicitly permits test-only confirmation of the native
+workspace-trust screen for its owned temporary directory and records that setup.
+Production does not auto-confirm trust or onboarding. On the host, complete trust
+setup yourself or explicitly set `PI_NATIVE_CLI_TRUST_TEST_DIR=1`; the native CLI
+may save that directory's trust record in its configured home.
+
+Claude completion is matched by the submitted `prompt_id`: the native transcript
+is written asynchronously and may lag a Stop hook. Adapter regressions cover
+this race and ensure a later submitted prompt is not acknowledged prematurely.
+
+### General acceptance
+
 The session lifecycle live probe drives the production workflow tool through
 actual `/reload`, `/quit`, SIGTERM and an unreported child-pane death. It checks
 abort journals, shutdown markers, lock release and pane removal before the parent

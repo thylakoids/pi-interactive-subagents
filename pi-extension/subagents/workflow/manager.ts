@@ -425,6 +425,9 @@ export class WorkflowRun {
     if (!parsed.prompt.trim()) {
       throw new WorkflowScriptError("agent() requires a non-empty prompt.");
     }
+    if (this.manager.service.agentKind(agentType) === "cli" && this.snapshot.budgetTotal != null) {
+      throw new WorkflowScriptError("Token budgets require Pi agents; external CLI usage is not reported. Remove the budget or use a Pi agent.");
+    }
     if (parsed.opts.readOnly && this.manager.service.agentKind(agentType) === "cli") {
       throw new WorkflowScriptError("readOnly requires a Pi agent; external CLI permissions cannot be enforced.");
     }
@@ -1674,6 +1677,11 @@ const UNSUPPORTED_AGENT_OPTS: Record<string, string> = {
 
 function normalizeOpts(record: Record<string, unknown>): ParsedAgentArgs["opts"] {
   const opts: ParsedAgentArgs["opts"] = {};
+  for (const key of ["model", "effort"] as const) {
+    if (record[key] !== undefined && (typeof record[key] !== "string" || !record[key].trim())) {
+      throw new WorkflowScriptError(`agent() ${key} must be a non-empty string.`);
+    }
+  }
   if (record.readOnly !== undefined) {
     if (typeof record.readOnly !== "boolean") throw new WorkflowScriptError("agent() readOnly must be a boolean.");
     opts.readOnly = record.readOnly;
@@ -1707,7 +1715,10 @@ function normalizeOpts(record: Record<string, unknown>): ParsedAgentArgs["opts"]
   }
   if (typeof record.label === "string") opts.label = record.label;
   if (typeof record.phase === "string") opts.phase = record.phase;
-  if (record.schema && typeof record.schema === "object") {
+  if (record.schema !== undefined) {
+    if (!record.schema || typeof record.schema !== "object" || Array.isArray(record.schema)) {
+      throw new WorkflowScriptError("agent() schema must be an object.");
+    }
     opts.schema = record.schema as Record<string, unknown>;
     assertSatisfiableSchema(opts.schema);
   }

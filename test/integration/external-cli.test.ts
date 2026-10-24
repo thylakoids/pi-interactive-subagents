@@ -30,6 +30,7 @@ describe("native CLI tools in tmux", { skip: !hasTmux, timeout: 60000 }, () => {
   let ctx: any;
   const api: any = { on(event: string, handler: Function) { hooks.set(event, [...(hooks.get(event) ?? []), handler]); }, registerTool(t: any) { tools.set(t.name, t); },
     registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+    getThinkingLevel() { return 'off'; },
     getAllTools() { return []; }, sendMessage(message: any, options: any) { messages.push({ message, options }); } };
   const emit = async (event: string) => { for (const handler of hooks.get(event) ?? []) await handler({ reason: 'reload' }, ctx); };
   const initialize = async () => {
@@ -129,6 +130,35 @@ setInterval(() => {}, 1000);
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
   for (const kind of ["codex", "claude"]) {
+    it(`${kind}: unsupported settings fail before creating a native pane`, async () => {
+      const panes = () => execFileSync('tmux', ['list-panes', '-a', '-F', '#{pane_id}'], { encoding: 'utf8' }).trim();
+      const before = panes();
+      const service = (globalThis as any).__pi_interactive_subagents.workflow;
+      await assert.rejects(service.spawn({ agentType: `test-${kind}`, name: `bad-effort-${kind}`, task: 'HOLD', effort: 'off' }), /does not support effort/);
+      for (const field of ['tools: read', 'skills: review', 'subagent_agents: worker']) {
+        writeFileSync(join(dir, 'agents', `restricted-${kind}.md`), `---\ncli: ${kind}\n${field}\n---\nRestricted.\n`);
+        await assert.rejects(service.spawn({ agentType: `restricted-${kind}`, name: `bad-settings-${kind}`, task: 'HOLD' }), /does not support Pi/);
+      }
+      writeFileSync(join(dir, 'agents', `restricted-${kind}.md`), `---\ncli: ${kind}\nsession-mode: fork\n---\nFork.\n`);
+      await assert.rejects(service.spawn({ agentType: `restricted-${kind}`, name: `bad-fork-${kind}`, task: 'HOLD' }), /cannot use.*session-mode: fork/s);
+      assert.equal(panes(), before, 'unsupported parameters must not create a pane');
+      assert.equal([...__test__.runningSubagents.values()].some(r => r.name.startsWith('bad-')), false);
+    });
+    it(`${kind}: workflow launch uses the native contract and native effort defaults`, async () => {
+      const service = (globalThis as any).__pi_interactive_subagents.workflow;
+      const handle = await service.spawn({ agentType: `test-${kind}`, name: `workflow-${kind}`, task: 'HOLD' });
+      const child = [...__test__.runningSubagents.values()].find(r => r.name === handle.name)!;
+      const native = readExternalSession(handle.sessionFile)!;
+      assert.equal(native.thinking, null);
+      assert.match(native.identity!, /Native CLI workflow execution contract/);
+      assert.match(native.identity!, /tools are not available/);
+      assert.doesNotMatch(native.identity!, /call ask_question|may delegate/);
+      await until(() => /READY/.test(readScreen(child.surface)), 'native workflow editor ready');
+      assert.deepEqual(await service.steer(handle.name, 'complete workflow'), { ok: true });
+      const result = await handle.completion;
+      assert.equal(result.exitCode, 0);
+      assert.match(result.summary, /complete workflow/);
+    });
     it(`${kind}: spawn, mid-run multiline message, result, restart, and native resume`, async () => {
       messages.length = 0;
       const name = `native-${kind}`;
@@ -136,6 +166,7 @@ setInterval(() => {}, 1000);
       assert.equal(spawned.details.status, "started", JSON.stringify(spawned));
       const running = [...__test__.runningSubagents.values()].find(r => r.name === name)!;
       assert.ok(running, "running native session registered");
+      assert.equal(readExternalSession(running.sessionFile)!.thinking, null, 'Pi off effort must not leak into native CLI defaults');
       await until(() => /READY/.test(readScreen(running.surface)), "native editor ready");
       const message = 'line one\nline two $(touch NEVER_EXECUTE)';
       const steered = await tools.get("subagent_message").execute("steer", { name, message }, new AbortController().signal, undefined, ctx);

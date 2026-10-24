@@ -9,6 +9,16 @@ const root = resolve(import.meta.dirname, '../..');
 const dir = mkdtempSync(join(tmpdir(), 'workflow-mutations-'));
 const tests = ['test/workflow-session-lifecycle.test.ts', 'test/workflow-execution.test.ts', 'test/workflow-contract.test.ts', 'test/workflow-templates.test.ts', 'test/workflow-worker.test.ts', 'test/model-inheritance.test.ts', 'test/workflow-questions.test.ts'];
 const mutants = [
+  ['Claude hook and transcript count the same prompt twice', 'pi-extension/subagents/cli-hook.mjs',
+    'if (input.promptId && Object.hasOwn(submitted, input.promptId)) continue;', '',
+    'does not acknowledge an identical queued prompt twice', 'test/external-cli.test.ts'],
+  ['Claude Stop acknowledges a later prompt before its turn completes', 'pi-extension/subagents/cli-hook.mjs',
+    'acknowledgeInputs(resultFile, completedInputs, [submitted[event.prompt_id]]);',
+    'acknowledgeInputs(resultFile, completedInputs, Object.values(submitted));',
+    'acknowledges only the completed Claude prompt', 'test/external-cli.test.ts'],
+  ['unreported CLI tokens bypass the workflow budget', 'pi-extension/subagents/workflow/manager.ts',
+    'this.manager.service.agentKind(agentType) === "cli" && this.snapshot.budgetTotal != null',
+    'false', 'budgeted native calls fail before spawn', 'test/workflow-cli-boundaries.test.ts'],
   ['unfinished source reports generated wrapper line', 'pi-extension/subagents/workflow/runner.ts',
     'const line = Math.min(reportedLine, lines.length);', 'const line = reportedLine;',
     'QuickJS validation parses unreachable', 'test/workflow-syntax.test.ts'],

@@ -120,6 +120,16 @@ if [ -n "$copied" ]; then
 else
   log "credentials: /run/pi-secret has no auth.json or models.json; suites that call models will fail without provider auth"
 fi
+if [[ "${PI_NATIVE_CLI_LIVE:-0}" == 1 ]]; then
+  for binary in claude codex; do command -v "$binary" >/dev/null || die "native suite requires $binary in the image"; done
+  for file in claude.json claude/settings.json codex/config.toml codex/auth.json; do
+    if [[ -f "/run/pi-secret/$file" ]]; then
+      mkdir -p "$(dirname "$HOME/.$file")"
+      cp "/run/pi-secret/$file" "$HOME/.$file"
+      chmod 600 "$HOME/.$file"
+    fi
+  done
+fi
 export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 
 # -- evidence: everything the suites write away from HOME -------------------

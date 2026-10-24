@@ -38,10 +38,10 @@ import { randomUUID } from "node:crypto";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
-import { workflowExecution } from "./workflow/execution.ts";
+import { workflowExecution, CLI_WORKFLOW_EXECUTION_CONTRACT } from "./workflow/execution.ts";
 import { workflowSummary } from "./workflow/ui.ts";
 import type { WorkflowRunView } from "./workflow/types.ts";
-import { isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
+import { assertExternalOptions, isExternalCliKind, prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, type ExternalCliSession, type ExternalCliKind } from "./external-cli.ts";
 
 import {
   countSessionEntryLines,
@@ -1539,6 +1539,7 @@ async function launchSubagent(
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const cliKind = resolveCliKind(agentDefs, params.agent);
+  assertCliSessionModeSupported(cliKind, resolveEffectiveSessionMode(params, agentDefs), params.agent);
   // Explicit call and user definition overrides win; otherwise inherit the
   // current parent session, including model switches made after startup.
   // Native CLIs use their own defaults, not Pi provider/model identifiers.
@@ -1553,7 +1554,8 @@ async function launchSubagent(
   }
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? sessionDefaults.thinking;
+  const effectiveThinking = options?.thinking ?? agentDefs?.thinking ?? (cliKind ? undefined : sessionDefaults.thinking);
+  if (cliKind) assertExternalOptions(cliKind, { ...agentDefs, thinking: effectiveThinking, extraExtensions: options?.extraExtensions });
   const effectiveInteractive = resolveEffectiveInteractive(
     params,
     agentDefs,
@@ -1586,7 +1588,6 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   const launchBehavior = resolveLaunchBehavior(params, policy ? { ...agentDefs, sessionMode: policy.sessionMode } : agentDefs);
-  assertCliSessionModeSupported(cliKind, launchBehavior.sessionMode, params.agent);
 
   // A launch that is already cancelled must not open a pane at all.
   throwIfLaunchCancelled(options?.signal);
@@ -1635,7 +1636,9 @@ async function launchSubagent(
     // An agent with a non-empty subagent_agents list is granted the spawning
     // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
     const grantSpawning = policy ? !!policy.spawnable?.length : !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-    const identity = policy?.identity ?? agentDefs?.body ?? null;
+    const identity = cliKind && options?.workflow
+      ? [agentDefs?.body, CLI_WORKFLOW_EXECUTION_CONTRACT].filter(Boolean).join("\n\n")
+      : policy?.identity ?? agentDefs?.body ?? null;
     const systemPromptMode = policy?.systemPromptMode ?? agentDefs?.systemPromptMode;
     const identityInSystemPrompt = systemPromptMode && identity;
     const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";

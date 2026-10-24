@@ -11,6 +11,15 @@ You are executing one step of a script, not managing the overall task.
 - When structured_output is available, call it exactly once with the complete final result as your last action; do not restate it in prose.
 - Stop when this step is finished. The runtime handles orchestration and termination.`;
 
+export const CLI_WORKFLOW_EXECUTION_CONTRACT = `## Native CLI workflow execution contract
+These rules override conflicting role conventions above for this invocation.
+You are executing one step, not managing the workflow.
+- Use your native tools to complete only the assigned task. Do not delegate or start workflows: native children are not integrated with the parent's delegation protocol.
+- Pi's ask_question, structured_output and verify_command tools are not available. Do not call or emulate them, and do not wait for terminal input. If blocked, return the missing information or an explicit failure as your final answer.
+- Return the requested result directly as your final text, without greetings or a Changes/Verification/Notes report. Never invent success.
+- End your turn when done. The parent can send messages or reopen this native conversation, but workflow Resume retries an unfinished step in a new conversation.
+- Tool permissions and models come from the native CLI, not Pi. This is not a read-only sandbox; token budgets and Pi tool allowlists are not supported.`;
+
 /**
  * Appended for read-only steps. It states enforcement, not a request: the tool
  * allowlist contains no writer and no spawning tool, so the only way to run

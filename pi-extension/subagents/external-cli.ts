@@ -10,6 +10,21 @@ export type ExternalCliKind = (typeof EXTERNAL_CLI_KINDS)[number];
 export function isExternalCliKind(value: unknown): value is ExternalCliKind {
   return EXTERNAL_CLI_KINDS.some(kind => kind === value);
 }
+
+/** Pi-only settings must never look as though they constrain a native CLI. */
+export function assertExternalOptions(kind: ExternalCliKind, options: {
+  tools?: string; skills?: string; subagentAgents?: string[]; thinking?: string;
+  extraExtensions?: string[];
+}): void {
+  for (const key of ["tools", "skills", "subagentAgents", "extraExtensions"] as const) {
+    if (options[key]?.length) throw new Error(`${kind} does not support Pi ${key}; configure native CLI tools separately.`);
+  }
+  const levels = kind === "claude" ? ["low", "medium", "high", "xhigh", "max", "ultracode"]
+    : ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+  if (options.thinking && !levels.includes(options.thinking)) {
+    throw new Error(`${kind} does not support effort "${options.thinking}"; use ${levels.join(", ")}. Model-specific support is checked by the native CLI.`);
+  }
+}
 export interface ExternalCliSession {
   version: 1;
   kind: ExternalCliKind;
@@ -66,6 +81,7 @@ export function prepareExternalLaunch(params: {
   noPrompt?: boolean;
 }): string {
   const { session: s } = params;
+  assertExternalOptions(s.kind, { thinking: s.thinking ?? undefined });
   const parts = [shellEscape(resolveCliBinary(s.kind))];
   const hookArgs = [process.execPath, params.hookFile, s.kind, params.sessionFile, params.resultFile, s.autoExit ? "auto" : "interactive"];
   if (s.kind === "codex") {
@@ -93,6 +109,7 @@ export function prepareExternalLaunch(params: {
     const command = hookArgs.map(shellEscape).join(" ");
     writeFileSync(params.settingsFile, JSON.stringify({ skipDangerousModePermissionPrompt: true, hooks: {
       SessionStart: [{ hooks: [{ type: "command", command, timeout: 10 }] }],
+      UserPromptSubmit: [{ hooks: [{ type: "command", command, timeout: 10 }] }],
       Stop: [{ hooks: [{ type: "command", command, timeout: 10 }] }],
       StopFailure: [{ hooks: [{ type: "command", command, timeout: 10 }] }],
     } }), { mode: 0o600 });

@@ -103,7 +103,7 @@ function claudeTranscriptInputs(event) {
     const content = entry.message?.content;
     const text = typeof content === 'string' ? content : Array.isArray(content)
       ? content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '';
-    return text && entry.uuid ? [{ id: entry.uuid, text }] : [];
+    return text && entry.uuid ? [{ id: entry.uuid, text, promptId: entry.promptId }] : [];
   });
 }
 export function handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
@@ -140,6 +140,15 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     if (!existsSync(`${resultFile}.claude-seen.json`)) {
       atomicJson(`${resultFile}.claude-seen.json`, claudeTranscriptInputs(event).map(input => input.id));
     }
+    return;
+  }
+  if (kind === 'claude' && event.hook_event_name === 'UserPromptSubmit') {
+    if (event.session_id !== session.nativeId || !event.prompt_id || typeof event.prompt !== 'string') return;
+    let submitted = {};
+    try { submitted = JSON.parse(readFileSync(`${resultFile}.submitted.json`, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    submitted[event.prompt_id] = event.prompt;
+    atomicJson(`${resultFile}.submitted.json`, submitted);
     return;
   }
   if (kind === 'claude' && !['Stop', 'StopFailure'].includes(event.hook_event_name)) return;
@@ -179,12 +188,20 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     // resume need no format detection or persistent history snapshot.
     acknowledgeInputs(resultFile, completedInputs, event['input-messages']);
   } else if (kind === 'claude' && !failed) {
+    // Stop can precede the transcript flush. Bind the submitted prompt to its
+    // actual completed turn, never to a later prompt merely visible on disk.
+    const submitted = existsSync(`${resultFile}.submitted.json`)
+      ? JSON.parse(readFileSync(`${resultFile}.submitted.json`, 'utf8')) : {};
+    if (event.prompt_id) {
+      acknowledgeInputs(resultFile, completedInputs, [submitted[event.prompt_id]]);
+    }
     let seen = [];
     try { seen = JSON.parse(readFileSync(`${resultFile}.claude-seen.json`, 'utf8')); } catch {}
     const inputs = [];
     for (const input of claudeTranscriptInputs(event)) {
       if (seen.includes(input.id)) continue;
       seen.push(input.id);
+      if (input.promptId && Object.hasOwn(submitted, input.promptId)) continue;
       inputs.push(input.text);
     }
     acknowledgeInputs(resultFile, completedInputs, inputs);

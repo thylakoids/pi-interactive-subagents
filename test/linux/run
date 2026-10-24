@@ -28,7 +28,7 @@
 #
 # Usage:
 #   test/linux/run                       # build if needed, run every suite
-#   test/linux/run --suite unit          # unit | mutations | terminal | live | all
+#   test/linux/run --suite unit          # unit | mutations | terminal | live | native | all
 #   test/linux/run --rebuild --model provider/model
 #   PI_SECRET_DIR=/path/to/agent-config test/linux/run --suite live
 set -Eeuo pipefail
@@ -71,8 +71,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$SUITE" in
-  all|unit|mutations|terminal|live) ;;
-  *) die "unknown suite: $SUITE (expected all|unit|mutations|terminal|live)" ;;
+  all|unit|mutations|terminal|live|native) ;;
+  *) die "unknown suite: $SUITE (expected all|unit|mutations|terminal|live|native)" ;;
 esac
 
 command -v docker >/dev/null 2>&1 || die "the docker CLI is not installed"
@@ -168,11 +168,13 @@ if [ "$container_arch" != "$server_arch" ]; then
   die "the container runs $container_arch while the docker server is $server_arch: that is emulation, not acceptance evidence"
 fi
 
-# The only skips allowed in a terminal run: the five billed live suites, which
-# run separately with PI_WORKFLOW_LIVE=1. Anything else - the read-only sandbox
+# The only skips allowed in a terminal run: the five Pi and two native billed
+# suites, which run separately with explicit opt-ins. Anything else - the read-only sandbox
 # suite, lifecycle, surface, the UI tree - must really run.
 ALLOWED_TERMINAL_SKIPS="$LOG_DIR/allowed-terminal-skips.txt"
 cat > "$ALLOWED_TERMINAL_SKIPS" <<'EOF'
+REAL claude native TUI lifecycle
+REAL codex native TUI lifecycle
 real workflow survives reload, records child crash, and drains parent shutdown
 real parent answers workflow questions, worker delegates, and waiting workflow can Abort
 real models execute old templates, advance pipeline independently and recover after Abort
@@ -211,6 +213,7 @@ run_suite() {
   args+=( -e "PI_LINUX_EXPECT_ARCH=$server_arch" )
   if [ -n "$MODEL" ]; then args+=( -e "PI_TEST_MODEL=$MODEL" ); fi
   if [ "$name" = live ]; then args+=( -e PI_WORKFLOW_LIVE=1 -e PI_WORKFLOW_REVIEW_LIVE=1 ); fi
+  if [ "$name" = native ]; then args+=( -e PI_NATIVE_CLI_LIVE=1 -e PI_NATIVE_CLI_TRUST_TEST_DIR=1 ); fi
   args+=( -v "$REPO_ROOT:/src:ro" -v "$suite_dir:/evidence" )
   args+=( -v "$suite_dir/sessions:/home/node/.pi/agent/sessions" )
   if [ -n "$SECRET_DIR" ]; then args+=( -v "$SECRET_DIR:/run/pi-secret:ro" ); fi
@@ -228,7 +231,7 @@ run_suite() {
   fi
 
   case "$name" in
-    unit|terminal|live)
+    unit|terminal|live|native)
       if ! grep -q '^# tests ' "$suite_log" 2>/dev/null; then
         fail_suite "$name: no TAP summary in $suite_log"
         return 0
@@ -253,14 +256,14 @@ run_suite() {
     terminal)
       skips_in "$suite_log" > "$suite_dir/terminal-skips.txt"
       if ! diff -u "$ALLOWED_TERMINAL_SKIPS" "$suite_dir/terminal-skips.txt" > "$suite_dir/terminal-skips.diff"; then
-        fail_suite "terminal: unexpected skips (only the five live suites may skip):"
+        fail_suite "terminal: unexpected skips (only the seven live suites may skip):"
         sed -n '3,40p' "$suite_dir/terminal-skips.diff" | sed 's/^/  /'
       fi
       ;;
-    live)
+    live|native)
       skipped=$(skips_in "$suite_log")
       if [ -n "$skipped" ]; then
-        fail_suite "live: the billed suites skipped instead of running:"
+        fail_suite "$name: the billed suites skipped instead of running:"
         printf '%s\n' "$skipped" | sed 's/^/  - /'
       fi
       ;;
@@ -268,6 +271,7 @@ run_suite() {
 }
 
 wanted() { [ "$SUITE" = all ] || [ "$SUITE" = "$1" ]; }
+[ "$SUITE" != native ] || run_suite native 'node --test --test-concurrency=1 test/integration/native-cli-live.test.ts'
 
 if wanted unit;      then run_suite unit      "npm test"; fi
 if wanted mutations; then run_suite mutations "node test/mutations/workflow.mjs"; fi
@@ -276,7 +280,7 @@ if wanted live;      then run_suite live      "node --test --test-concurrency=1 
 
 {
   echo "suite       exit  log"
-  for name in unit mutations terminal live; do
+  for name in unit mutations terminal live native; do
     if [ -f "$LOG_DIR/$name/exit" ]; then
       printf '%-11s %-5s %s\n' "$name" "$(cat "$LOG_DIR/$name/exit")" "$LOG_DIR/$name/logs/suite.log"
     fi
