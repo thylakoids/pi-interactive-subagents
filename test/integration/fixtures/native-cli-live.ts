@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import extension, { __test__ } from '../../../pi-extension/subagents/index.ts';
 import { readExternalSession } from '../../../pi-extension/subagents/external-cli.ts';
 import { readScreen, surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
@@ -12,6 +11,7 @@ import { WorkflowManager } from '../../../pi-extension/subagents/workflow/manage
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export default function nativeLive(pi: any) {
   const dir = process.env.PI_NATIVE_LIVE_DIR!;
+  assert.ok(process.env.CODEX_HOME && realpathSync(process.env.CODEX_HOME) === realpathSync(join(dir, 'codex-home')), 'native tests require their own CODEX_HOME');
   const tools = new Map<string, any>();
   const register = pi.registerTool;
   pi.registerTool = (tool: any) => { tools.set(tool.name, tool); register.call(pi, tool); };
@@ -113,7 +113,7 @@ export default function nativeLive(pi: any) {
           // real rollout for the still-running turn without changing config.
           for (const offset of [0, 86_400_000, -86_400_000]) {
             const day = new Date(Date.now() - offset).toISOString().slice(0, 10).split('-');
-            const folder = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'sessions', ...day);
+            const folder = join(process.env.CODEX_HOME!, 'sessions', ...day);
             if (!existsSync(folder)) continue;
             for (const file of readdirSync(folder).filter(file => file.endsWith('.jsonl'))) {
               const text = readFileSync(join(folder, file), 'utf8');

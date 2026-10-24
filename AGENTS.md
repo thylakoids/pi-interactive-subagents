@@ -4,6 +4,8 @@
 
 Before updating or synchronizing a checkout, inspect HEAD, the working tree, and local versus remote history. Preserve local commits and uncommitted work. Pi's Git package updates may reset and clean the checkout; use Git to synchronize development work rather than assuming the remote branch supersedes local changes.
 
+After validating changes, commit and push them unless the user explicitly requests otherwise. Do not leave verified development work only in the package checkout, where an automatic package update could overwrite it. Report any validation or push failure instead of claiming the work is safely synchronized.
+
 ## Agent definitions
 
 Agent definitions live in `agents/`. A multi-agent job — a review, a migration, a research

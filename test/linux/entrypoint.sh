@@ -122,7 +122,7 @@ else
 fi
 if [[ "${PI_NATIVE_CLI_LIVE:-0}" == 1 ]]; then
   for binary in claude codex; do command -v "$binary" >/dev/null || die "native suite requires $binary in the image"; done
-  for file in claude.json claude/settings.json codex/config.toml codex/auth.json; do
+  for file in claude.json claude/settings.json codex/auth.json; do
     if [[ -f "/run/pi-secret/$file" ]]; then
       mkdir -p "$(dirname "$HOME/.$file")"
       cp "/run/pi-secret/$file" "$HOME/.$file"

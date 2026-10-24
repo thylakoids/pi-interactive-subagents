@@ -51,6 +51,15 @@ IDs, not just pane existence. `PI_NATIVE_CLAUDE_MODEL` / `PI_NATIVE_CODEX_MODEL`
 optionally select native model identifiers; neither backend inherits Pi model
 or effort defaults. Without the opt-in, these two billed suites skip explicitly.
 
+Every native test uses its own temporary `CODEX_HOME`. For Codex, only `auth.json`
+is copied from the caller's `CODEX_HOME` (or `~/.codex`); `PI_NATIVE_CODEX_AUTH_FILE`
+can explicitly select that credential file. Normal configuration, session history,
+indexes, databases, plugins and caches are never copied. A minimal test-owned
+configuration forces file credential storage, so refreshes cannot modify the
+normal home or OS keychain. Missing auth fails rather than falling back. The
+temporary home, including copied/refreshed credentials and native history, is
+removed after the test even on failure. Reports and screenshots remain in TMPDIR.
+
 For Linux, build the normal image first, then a native-CLI image:
 
 ```sh
@@ -65,7 +74,7 @@ PI_LINUX_IMAGE=pi-native-linux PI_SECRET_DIR=/path/to/private-test-config test/l
 ```
 
 The read-only secret mount may contain `claude.json`, `claude/settings.json`,
-`codex/config.toml`, `codex/auth.json`, plus the usual Pi `auth.json`/`models.json`.
+`codex/auth.json`, plus the usual Pi `auth.json`/`models.json`.
 Only these explicit files are copied to the disposable container home, not host
 plugins, hooks or session history. Supply minimal test configuration and completed
 onboarding. Container endpoints must be reachable from Linux (localhost means the
