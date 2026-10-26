@@ -34,9 +34,10 @@ export function withCliRunLock(resultFile, action) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
   }
 }
-export async function withCliRunLockAsync(resultFile, action) {
+export async function withCliRunLockAsync(resultFile, action, signal) {
   const deadline = Date.now() + 5000;
   for (;;) {
+    signal?.throwIfAborted();
     const release = tryCliRunLock(resultFile);
     if (release) {
       try { return await action(); } finally { release(); }

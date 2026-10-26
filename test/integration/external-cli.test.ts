@@ -2,7 +2,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import extension, { __test__ } from "../../pi-extension/subagents/index.ts";
@@ -194,6 +194,88 @@ setInterval(() => {}, 1000);
       assert.deepEqual(entries.filter(e => e.type === "message").map(e => e.message.role), ["user", "user", "assistant", "user", "assistant"]);
     });
   }
+  for (const kind of ['codex', 'claude']) {
+    it(`${kind}: cancelled messages waiting for the run lock never reach the CLI`, async () => {
+      const name = `cancel-queued-message-${kind}`;
+      await tools.get('subagent').execute('seed', { name, agent: `test-${kind}`, task: 'HOLD' }, new AbortController().signal, undefined, ctx);
+      const child = [...__test__.runningSubagents.values()].find(r => r.name === name)!;
+      await until(() => /READY/.test(readScreen(child.surface)), 'native editor ready for cancellation');
+      const inputFile = `${child.sentinelFile}.inputs.json`;
+      const before = readFileSync(inputFile, 'utf8');
+      const lock = `${child.sentinelFile}.lock`;
+      mkdirSync(lock);
+      const cancel = new AbortController();
+      const sending = tools.get('subagent_message').execute('cancel-message', { name, message: 'CANCELLED_MUST_NOT_ARRIVE' }, cancel.signal, undefined, ctx);
+      cancel.abort();
+      rmdirSync(lock);
+      try {
+        const result = await sending;
+        assert.match(result.details.error ?? '', /abort|cancel/i);
+        assert.equal(readFileSync(inputFile, 'utf8'), before);
+        assert.doesNotMatch(readFileSync(child.sessionFile, 'utf8'), /CANCELLED_MUST_NOT_ARRIVE/);
+      } finally {
+        child.abortController!.abort();
+        await until(() => !__test__.runningSubagents.has(child.id), 'message cancellation cleanup');
+      }
+    });
+    it(`${kind}: concurrent native resumes cannot launch two writers for one session`, async () => {
+      messages.length = 0;
+      const tool = tools.get('subagent_message');
+      const name = `resume-race-${kind}`;
+      await tools.get('subagent').execute('seed', { name, agent: `test-${kind}`, task: 'seed' }, new AbortController().signal, undefined, ctx);
+      await until(() => messages.some(m => m.message.details?.name === name), 'seed completes');
+      const before = panes();
+      const outcomes = await Promise.allSettled([0, 1].map(n => tool.execute(`resume-${n}`,
+        { name, message: 'HOLD' }, new AbortController().signal, undefined, ctx)));
+      const started = outcomes.filter(outcome => outcome.status === 'fulfilled' && outcome.value.details.status === 'started');
+      const rejected = outcomes.filter(outcome => outcome.status === 'fulfilled' && /already opening/.test(outcome.value.details.error ?? ''));
+      try {
+        assert.equal(started.length, 1, 'only one resume may own this native session');
+        assert.equal(rejected.length, 1, 'the competing message is rejected explicitly for retry');
+        assert.equal(panes().length, before.length + 1);
+        assert.equal([...__test__.runningSubagents.values()].filter(r => r.name === name).length, 1);
+      } finally {
+        for (const child of [...__test__.runningSubagents.values()].filter(r => r.name === name)) child.abortController?.abort();
+        await until(() => ![...__test__.runningSubagents.values()].some(r => r.name === name), 'resume race cleanup');
+      }
+    });
+    it(`${kind}: cancellation between native resume reservation and launch creates no writer`, async () => {
+      messages.length = 0;
+      const name = `resume-cancel-${kind}`;
+      await tools.get('subagent').execute('seed', { name, agent: `test-${kind}`, task: 'seed' }, new AbortController().signal, undefined, ctx);
+      await until(() => messages.some(m => m.message.details?.name === name), 'seed completes');
+      const before = panes();
+      const cancel = new AbortController();
+      const pending = tools.get('subagent_message').execute('resume', { name, message: 'HOLD' }, cancel.signal, undefined, ctx);
+      // execute() has reserved its surface and yielded at owner readiness.
+      cancel.abort();
+      try { await assert.rejects(pending, /cancel/i); }
+      finally {
+        for (const child of [...__test__.runningSubagents.values()].filter(r => r.name === name)) child.abortController?.abort();
+        await until(() => ![...__test__.runningSubagents.values()].some(r => r.name === name), 'cancelled resume cleanup');
+      }
+      assert.deepEqual(panes(), before);
+      const retried = await tools.get('subagent_message').execute('retry', { name, message: 'retry after cancellation' }, new AbortController().signal, undefined, ctx);
+      assert.equal(retried.details.status, 'started', 'a cancelled opening must release its reservation');
+      await until(() => messages.some(m => m.message.details?.name === name && m.message.content.includes('retry after cancellation')), 'retry completes');
+    });
+  }
+  it('codex: Abort before the first notify refuses native Resume without starting a new conversation', async () => {
+    messages.length = 0;
+    const name = 'codex-before-first-notify';
+    await tools.get('subagent').execute('spawn', { name, agent: 'test-codex', task: 'HOLD' }, new AbortController().signal, undefined, ctx);
+    const child = [...__test__.runningSubagents.values()].find(r => r.name === name)!;
+    await until(() => /READY/.test(readScreen(child.surface)), 'unbound native CLI is running');
+    assert.equal(readExternalSession(child.sessionFile)!.nativeId, null);
+    child.abortController!.abort();
+    await until(() => !__test__.runningSubagents.has(child.id), 'initial native Abort completes');
+    const before = panes();
+    const content = readFileSync(child.sessionFile, 'utf8');
+    const result = await tools.get('subagent_message').execute('resume', { name, message: 'continue' }, new AbortController().signal, undefined, ctx);
+    assert.match(result.details.error, /no native CLI session ID/);
+    assert.deepEqual(panes(), before, 'no silent fresh-session fallback');
+    assert.equal(readFileSync(child.sessionFile, 'utf8'), content);
+  });
   for (const kind of ["codex", "claude"]) it(`${kind}: waits for queued follow-ups across separate native turns`, async () => {
     messages.length = 0;
     const name = `queued-${kind}`;

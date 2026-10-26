@@ -1,7 +1,7 @@
 /** Real Pi host, production tools/service, and actual native TUIs only. */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import extension, { __test__ } from '../../../pi-extension/subagents/index.ts';
 import { readExternalSession } from '../../../pi-extension/subagents/external-cli.ts';
@@ -124,6 +124,83 @@ export default function nativeLive(pi: any) {
         assert.equal(surfaceExists(child.surface), false, 'completed native pane is cleaned up');
         event('mid-turn', { id: initial.prompt_id, sessionFile: child.sessionFile, submissions: submissions.length });
         save(scenario, { ok: true, checks: ['foreground-shell', 'live-message', 'shared-prompt-id', 'automatic-return', 'pane-cleanup'] });
+      } else if (scenario === 'codex-boundaries') {
+        assert.equal(process.env.PI_NATIVE_LIVE_KIND, 'codex');
+        const name = 'codex-boundaries';
+        const results = () => ctx.sessionManager.getEntries().filter((entry: any) =>
+          entry.type === 'custom_message' && entry.customType === 'subagent_result' && entry.details?.name === name);
+        const started = await invoke('subagent', { name, agent: 'native-auto',
+          task: prompt('echo $$ > codex-burst-pid; echo ready > codex-burst-ready; while ! test -f codex-burst-release; do sleep 0.2; done', 'CODEX_BURST_INITIAL') });
+        const child = running(name)!;
+        await until(() => existsSync(join(dir, 'codex-burst-ready')), 'Codex foreground tool blocks before burst');
+        const lock = `${child.sentinelFile}.lock`;
+        mkdirSync(lock);
+        const cancelMessage = new AbortController();
+        const sending = tools.get('subagent_message').execute('cancel-message', { name,
+          message: 'CANCELLED_MESSAGE_MUST_NOT_BE_DELIVERED' }, cancelMessage.signal, undefined, ctx);
+        cancelMessage.abort();
+        rmdirSync(lock);
+        const cancelledMessage = await sending;
+        assert.match(cancelledMessage.details?.error ?? '', /abort|cancel/i);
+        assert.equal(JSON.parse(readFileSync(`${child.sentinelFile}.inputs.json`, 'utf8')).length, 1);
+        const update = prompt('echo repeat >> codex-repeated', 'CODEX_REPEAT_DONE') + '\nEach copy of this message is a separate task; execute the command once per copy, even when the text is identical.';
+        for (const message of [update, update, 'Finish ALL earlier queued tasks, including both copies of the repeated command. Then reply exactly CODEX_BURST_COMPLETE.']) {
+          assert.equal((await invoke('subagent_message', { name, message })).status, 'steered');
+        }
+        const inputs = JSON.parse(readFileSync(`${child.sentinelFile}.inputs.json`, 'utf8'));
+        assert.equal(inputs.length, 4);
+        assert.notEqual(inputs[1], inputs[2], 'identical text needs independent receipts');
+        assert.equal(results().length, 0, 'no result while the foreground command is blocked');
+        writeFileSync(join(dir, 'codex-burst-release'), 'release');
+        await until(() => results().length === 1, 'all queued Codex messages finish and reach the parent');
+        assert.equal(results()[0].details.exitCode, 0, JSON.stringify(results()[0]));
+        assert.match(JSON.stringify(results()[0].content), /CODEX_BURST_COMPLETE/);
+        assert.equal(readFileSync(join(dir, 'codex-repeated'), 'utf8'), 'repeat\nrepeat\n');
+        const latest = JSON.parse(readFileSync(`${child.sentinelFile}.latest`, 'utf8'));
+        assert.deepEqual(new Set(latest.completedInputs), new Set(inputs));
+        assert.equal(latest.completedInputs.length, 4);
+        assert.equal(surfaceExists(child.surface), false);
+        const nativeId = readExternalSession(child.sessionFile)!.nativeId;
+        assert.ok(nativeId);
+        event('queued-burst', { nativeId, receipts: inputs.length, sessionFile: child.sessionFile });
+
+        // A cancelled opening must not start a native writer or hold its slot.
+        const cancelled = new AbortController();
+        const opening = tools.get('subagent_message').execute('cancel-resume', { name, message: 'Never run this cancelled instruction.' }, cancelled.signal, undefined, ctx);
+        cancelled.abort();
+        await assert.rejects(opening, /cancel/i);
+        assert.equal(running(name), undefined);
+
+        // Competing resumes must reserve the same session before their await.
+        const task = prompt('echo $$ > codex-abort-pid; echo ready > codex-abort-ready; while ! test -f codex-abort-release; do sleep 0.2; done', 'CODEX_ABORT_RELEASED');
+        const resumes = await Promise.all([0, 1].map(n => tools.get('subagent_message').execute('race-resume-' + n,
+          { name, message: task }, new AbortController().signal, undefined, ctx)));
+        assert.equal(resumes.filter(result => result.details?.status === 'started').length, 1);
+        assert.equal(resumes.filter(result => /already opening/.test(result.details?.error ?? '')).length, 1);
+        const blocked = running(name)!;
+        assert.equal(blocked.sessionFile, started.sessionFile);
+        await until(() => existsSync(join(dir, 'codex-abort-ready')), 'resumed native shell tool is active');
+        const pid = Number(readFileSync(join(dir, 'codex-abort-pid'), 'utf8').trim());
+        assert.ok(processState(pid) && !processState(pid).startsWith('Z'));
+        // This is an ordinary child. Workflow stop deliberately adds an abort
+        // marker requiring workflow Resume or explicit Focus, so use the
+        // ordinary watcher's cancellation instead of that workflow-only API.
+        blocked.abortController!.abort();
+        await until(() => !running(name), 'aborted ordinary Codex child unregisters');
+        await until(() => !processState(pid) || processState(pid).startsWith('Z'), 'Abort kills the actual Codex shell tool');
+        await until(() => results().length === 2, 'Abort reaches the parent as one terminal result');
+        assert.notEqual(results()[1].details.exitCode, 0);
+        assert.equal(readExternalSession(child.sessionFile)!.nativeId, nativeId);
+        writeFileSync(join(dir, 'codex-abort-release'), 'release');
+        assert.equal((await invoke('subagent_message', { name,
+          message: 'Do not rerun earlier commands. Without tools, reply exactly CODEX_ABORT_RESUME_OK.' })).status, 'started');
+        await until(() => results().length === 3, 'same native thread resumes after Abort and reports to parent');
+        assert.equal(results()[2].details.exitCode, 0);
+        assert.match(JSON.stringify(results()[2].content), /CODEX_ABORT_RESUME_OK/);
+        assert.equal(readExternalSession(child.sessionFile)!.nativeId, nativeId);
+        assert.equal(readFileSync(join(dir, 'codex-repeated'), 'utf8'), 'repeat\nrepeat\n', 'native Resume must not replay completed writes');
+        event('codex-boundaries', { nativeId, abortedToolPid: pid, parentResults: results().length });
+        save(scenario, { ok: true, checks: ['queued-burst', 'repeated-message', 'message-cancellation', 'parent-delivery', 'resume-race', 'resume-cancellation', 'abort-active-tool', 'same-thread-resume'] });
       } else if (scenario === 'workflow') {
         const options = { baseDir: join(dir, 'artifacts'), cwd: dir, agentDir: join(dir, '.pi'), sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), service };
         manager = new WorkflowManager(options);

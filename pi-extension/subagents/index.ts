@@ -1230,6 +1230,7 @@ async function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
+  signal?: AbortSignal,
 ): Promise<{ ok: true } | { error: string }> {
   if (running.cli) {
     try {
@@ -1245,7 +1246,7 @@ async function steerSubagent(
         writeFileSync(inputsFile, JSON.stringify([...inputs, prompt]), { mode: 0o600 });
         appendUserMessage(running.sessionFile, message);
         return { ok: true as const };
-      });
+      }, signal);
     } catch (error: any) {
       return { error: `Failed to message "${running.name}": ${error?.message ?? String(error)}` };
     }
@@ -1261,7 +1262,7 @@ async function steerSubagent(
 }
 
 async function handleSubagentSteer(
-  params: { name?: string; message?: string },
+  params: { name?: string; message?: string; signal?: AbortSignal },
   send: (surface: string, command: string) => void = sendCommand,
 ) {
   const message = params.message;
@@ -1279,7 +1280,7 @@ async function handleSubagentSteer(
     return { content: [{ type: "text" as const, text: error }], details: { error } };
   }
   observeRunningSubagent(running, Date.now());
-  const steer = await steerSubagent(running, message, send);
+  const steer = await steerSubagent(running, message, send, params.signal);
   if ("error" in steer) {
     return { content: [{ type: "text" as const, text: steer.error }],
       details: { error: steer.error, id: running.id, name: running.name } };
@@ -2408,7 +2409,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message });
+          return handleSubagentSteer({ name: requestedName, message: params.message, signal });
         }
 
         // ── Resume a finished session by name ──
@@ -2452,7 +2453,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
-            return handleSubagentSteer({ name: r.name, message: params.message });
+            return handleSubagentSteer({ name: r.name, message: params.message, signal });
           }
         }
 
@@ -2463,16 +2464,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             return { content: [{ type: "text" as const, text: error }], details: { error } };
           }
           throwIfLaunchCancelled(signal);
-          const surface = createSurface(name);
+          const openingPath = resolve(sessionPath);
+          if (openingSessions.has(openingPath)) {
+            const error = `Session "${name}" is already opening; retry subagent_message after it starts.`;
+            return { content: [{ type: "text" as const, text: error }], details: { error } };
+          }
+          openingSessions.add(openingPath);
+          let surface: string | undefined;
           let running: RunningSubagent;
           try {
+            surface = createSurface(name);
             await waitForSurfaceOwner();
+            throwIfLaunchCancelled(signal);
             running = launchExternalSubagent({ id, name, task: message, prompt: message,
               sessionFile: sessionPath, artifactDir: parentArtifactDir, surface, startTime,
               session: { ...external, autoExit }, resume: true, interactive });
           } catch (error) {
-            try { closeSurface(surface); } catch {}
+            if (surface) { try { closeSurface(surface); } catch {} }
             throw error;
+          } finally {
+            openingSessions.delete(openingPath);
           }
           const watcherAbort = new AbortController();
           running.abortController = watcherAbort;

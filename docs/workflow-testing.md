@@ -54,6 +54,15 @@ command. `PI_NATIVE_CLAUDE_MODEL` / `PI_NATIVE_CODEX_MODEL`
 optionally select native model identifiers; neither backend inherits Pi model
 or effort defaults. Without the opt-in, these two billed suites skip explicitly.
 
+The Codex boundary probe submits a burst containing two identical tasks while
+a real shell tool is blocked, then checks four independent transport receipts,
+two actual side effects and exactly one result in the parent session. It also
+checks message cancellation while waiting for the run lock, competing Resumes,
+cancellation during opening, Abort of an active native shell process, and
+same-thread Resume without replaying finished writes.
+Adapter regressions verify that Abort before Codex's first thread-ID notification
+refuses native Resume explicitly rather than silently starting a new conversation.
+
 Every native test uses its own temporary `CODEX_HOME`. For Codex, only `auth.json`
 is copied from the caller's `CODEX_HOME` (or `~/.codex`); `PI_NATIVE_CODEX_AUTH_FILE`
 can explicitly select that credential file. Normal configuration, session history,

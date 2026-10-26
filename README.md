@@ -242,6 +242,17 @@ returned when the user exits. If the pane is forcibly closed, the last completed
 response is retained alongside the interruption and any pending-input notice. Follow-ups to finished sessions run autonomously.
 Multiple-line messages use tmux bracketed paste, preserving them as one prompt.
 CLI panes have no surrounding shell that could execute leftover input.
+A parent can open only one native Resume or Focus for a saved session at a time. A competing
+Resume is rejected explicitly for retry once the opening finishes; it cannot
+start another writer on the same conversation. Cancelling an opening closes its
+pane before launching the CLI. A message cancelled while waiting for the run
+lock is not pasted into the CLI or recorded as submitted.
+
+Codex reports its native thread ID in its first completed-turn notification.
+If it is aborted before that notification, native Resume and Focus cannot
+identify the original thread and refuse to open a replacement conversation.
+Start a fresh subagent or resume the workflow, whose unfinished step runs anew.
+After the ID is known, native Resume continues that same conversation after Abort.
 
 The parent-facing pi transcript records submitted tasks and final responses;
 `<session>.cli.json` stores the backend, exact native ID, cwd, model and identity.
