@@ -47,7 +47,10 @@ It checks startup, a live message, Abort, same-conversation native resume with
 remembered content, workflow journal replay without repeating a committed
 command, a new conversation for the retried step, and completed Focus without
 submitting another turn. Evidence must include actual completion text and native
-IDs, not just pane existence. `PI_NATIVE_CLAUDE_MODEL` / `PI_NATIVE_CODEX_MODEL`
+IDs, not just pane existence. The Claude probe also sends a message while a real
+foreground shell tool is blocked, verifies both input hooks share a `prompt_id`,
+then requires automatic result delivery and pane cleanup after releasing the
+command. `PI_NATIVE_CLAUDE_MODEL` / `PI_NATIVE_CODEX_MODEL`
 optionally select native model identifiers; neither backend inherits Pi model
 or effort defaults. Without the opt-in, these two billed suites skip explicitly.
 
@@ -88,9 +91,19 @@ Production does not auto-confirm trust or onboarding. On the host, complete trus
 setup yourself or explicitly set `PI_NATIVE_CLI_TRUST_TEST_DIR=1`; the native CLI
 may save that directory's trust record in its configured home.
 
-Claude completion is matched by the submitted `prompt_id`: the native transcript
-is written asynchronously and may lag a Stop hook. Adapter regressions cover
-this race and ensure a later submitted prompt is not acknowledged prematurely.
+Claude preserves the initial submission for each `prompt_id`: live input and
+background-task notifications may reuse the current ID. Additional input can
+be consumed in that turn or queued for the next; only processed transcript
+records acknowledge it. The transcript is written asynchronously and may lag
+Stop. Regressions cover both delivery paths, repeated input, duplicate Stops,
+and late failures. The executable Stop hook waits up to five seconds for the
+current turn's final transcript record, outside the run lock; a flush timeout
+reports a hook error rather than leaving the parent waiting indefinitely.
+Flush regressions synchronize on the first stale read instead of guessing a
+startup delay, and reject identical answers from earlier turns.
+Simple one-prompt lifecycle tests do not exercise the shared-ID
+path; the billed mid-turn probe must also check the answer and its actual
+delivery into the parent session, not merely a completed handle.
 
 ### General acceptance
 

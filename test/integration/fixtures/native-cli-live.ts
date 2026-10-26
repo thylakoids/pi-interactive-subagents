@@ -91,6 +91,39 @@ export default function nativeLive(pi: any) {
         assert.equal(readExternalSession(seed.sessionFile)!.nativeId, resumeId);
         event('native-resume', { id: resumeId });
         save(scenario, { ok: true, checks: ['startup', 'message', 'abort', 'native-resume'] });
+      } else if (scenario === 'mid-turn') {
+        assert.equal(process.env.PI_NATIVE_LIVE_KIND, 'claude');
+        const name = 'native-mid-turn';
+        const started = await invoke('subagent', { agent: 'native-auto', name,
+          task: 'Run this command with your shell tool in the foreground (do not use background mode):\n' +
+            'echo started > mid-turn-started; while ! test -f mid-turn-release; do sleep 0.2; done\n' +
+            'After it finishes, follow any additional instructions and give your final answer. Do not delegate.' });
+        assert.equal(started.status, 'started');
+        const child = running(name)!;
+        await until(() => existsSync(join(dir, 'mid-turn-started')), 'real Claude foreground shell is running');
+        const results = () => ctx.sessionManager.getEntries().filter((entry: any) =>
+          entry.type === 'custom_message' && entry.customType === 'subagent_result' && entry.details?.name === name);
+        const message = 'Your final answer must be exactly NATIVE_MID_TURN_OK. Do not call any further tools.';
+        assert.equal((await invoke('subagent_message', { name, message })).status, 'steered');
+        assert.equal(results().length, 0, 'steering a running turn must not finish it');
+        writeFileSync(join(dir, 'mid-turn-release'), 'release');
+        await until(() => results().length > 0, 'shared-ID Claude result is persisted in the parent session automatically');
+        assert.equal(results().length, 1, 'one result delivered to the actual Pi session');
+        const completed = results()[0];
+        assert.equal(completed.details.exitCode, 0, JSON.stringify(completed));
+        assert.match(JSON.stringify(completed.content), /NATIVE_MID_TURN_OK/);
+        const hooks = readFileSync(`${child.sentinelFile}.events.jsonl`, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+        const submissions = hooks.filter(hook => hook.hook_event_name === 'UserPromptSubmit');
+        const initial = submissions[0];
+        const update = submissions.find(hook => hook.prompt === message);
+        assert.ok(initial && update, 'both actual input hooks must be observed');
+        assert.equal(update.prompt_id, initial.prompt_id, 'exercise the native shared-ID path, not two independent turns');
+        const latest = JSON.parse(readFileSync(`${child.sentinelFile}.latest`, 'utf8'));
+        assert.equal(latest.completedInputs.length, 2);
+        assert.ok(latest.completedInputs.includes(message));
+        assert.equal(surfaceExists(child.surface), false, 'completed native pane is cleaned up');
+        event('mid-turn', { id: initial.prompt_id, sessionFile: child.sessionFile, submissions: submissions.length });
+        save(scenario, { ok: true, checks: ['foreground-shell', 'live-message', 'shared-prompt-id', 'automatic-return', 'pane-cleanup'] });
       } else if (scenario === 'workflow') {
         const options = { baseDir: join(dir, 'artifacts'), cwd: dir, agentDir: join(dir, '.pi'), sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), service };
         manager = new WorkflowManager(options);

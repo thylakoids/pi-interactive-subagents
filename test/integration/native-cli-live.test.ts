@@ -106,13 +106,15 @@ for (const kind of ['claude', 'codex']) it(`REAL ${kind} native TUI lifecycle`, 
     assert.ok(existsSync(join(dir, file)), `Timed out waiting for ${file}; evidence: ${dir}`);
   };
   await until('ready.json', 45_000);
-  for (const scenario of ['conversation', 'workflow']) await t.test(scenario, async () => {
+  for (const scenario of ['conversation', ...(kind === 'claude' ? ['mid-turn'] : []), 'workflow']) await t.test(scenario, async () => {
     mux('send-keys', '-t', pane, '/native-live ' + scenario, 'Enter');
     await until(scenario + '.json', 540_000);
     const report = JSON.parse(readFileSync(join(dir, scenario + '.json'), 'utf8'));
     assert.equal(report.ok, true, report.error + '; evidence: ' + dir);
     assert.deepEqual(report.checks, scenario === 'conversation'
       ? ['startup', 'message', 'abort', 'native-resume']
+      : scenario === 'mid-turn'
+      ? ['foreground-shell', 'live-message', 'shared-prompt-id', 'automatic-return', 'pane-cleanup']
       : ['workflow-abort', 'workflow-journal-resume', 'completed-focus']);
   });
 });

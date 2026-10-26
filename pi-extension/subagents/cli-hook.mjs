@@ -106,6 +106,25 @@ function claudeTranscriptInputs(event) {
     return text && entry.uuid ? [{ id: entry.uuid, text, promptId: entry.promptId }] : [];
   });
 }
+// Claude writes its transcript asynchronously. Wait outside the run lock so
+// the parent can still submit or cancel while the final record is flushed.
+async function waitForClaudeTranscript(event) {
+  if (event.hook_event_name !== 'Stop' || !event.transcript_path || !event.last_assistant_message) return;
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    if (existsSync(event.transcript_path)) {
+      const entries = readClaudeTranscript(event.transcript_path);
+      const last = entries.findLastIndex(entry => entry.type === 'assistant' && !entry.isSidechain);
+      const text = entries[last]?.message?.content?.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      // Equal answers from an earlier turn must not satisfy a new Stop.
+      const hasInput = !event.prompt_id || entries.slice(0, last).some(entry =>
+        entry.type === 'user' && !entry.isSidechain && entry.promptId === event.prompt_id);
+      if (hasInput && text === event.last_assistant_message) return;
+    }
+    if (Date.now() >= deadline) throw new Error('Claude transcript did not flush the completed turn within 5s.');
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
 export function handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
   return withCliRunLock(resultFile, () => handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event));
 }
@@ -147,7 +166,10 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     let submitted = {};
     try { submitted = JSON.parse(readFileSync(`${resultFile}.submitted.json`, 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    submitted[event.prompt_id] = event.prompt;
+    // Queued messages and background notifications reuse the current prompt_id,
+    // even when they will only run in the NEXT turn. Preserve its first input;
+    // the transcript below confirms which additional inputs were processed.
+    submitted[event.prompt_id] ??= event.prompt;
     atomicJson(`${resultFile}.submitted.json`, submitted);
     return;
   }
@@ -180,7 +202,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
   let previous = null;
   try { previous = JSON.parse(readFileSync(`${resultFile}.latest`, 'utf8')); } catch {}
   const completedTurns = previous?.completedTurns || [];
-  if (turnId && completedTurns.includes(turnId)) return;
+  if (!failed && turnId && completedTurns.includes(turnId)) return;
   const completedInputs = previous?.completedInputs || [];
   if (kind === 'codex' && Array.isArray(event['input-messages'])) {
     // Every submitted Codex prompt has a unique receipt. Match outstanding
@@ -207,7 +229,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     acknowledgeInputs(resultFile, completedInputs, inputs);
     atomicJson(`${resultFile}.claude-seen.json`, seen);
   }
-  if (turnId) completedTurns.push(turnId);
+  if (turnId && !completedTurns.includes(turnId)) completedTurns.push(turnId);
   const lines = readFileSync(sessionFile, 'utf8').trim().split('\n');
   const leaf = JSON.parse(lines.at(-1));
   appendFileSync(sessionFile, JSON.stringify({
@@ -241,6 +263,7 @@ if (isMainModule()) {
   const [kind, sessionFile, resultFile, modeOrExitCode, payload] = process.argv.slice(2);
   try {
     const event = kind === 'exit' ? {} : JSON.parse(kind === 'codex' ? payload : readFileSync(0, 'utf8'));
+    if (kind === 'claude') await waitForClaudeTranscript(event);
     handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event);
   } catch (error) {
     // Hook errors must be observable but must never block the CLI's own loop.

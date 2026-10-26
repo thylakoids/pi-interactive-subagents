@@ -275,11 +275,15 @@ and resume prompt sent to Codex carries a unique receipt in an HTML comment;
 pi's session records retain the original task text. Completion matches outstanding
 receipts directly, so repeated messages work with both cumulative and turn-local
 notifications, without guessing the format or storing native history snapshots.
-Old receipts cannot acknowledge new requests. Claude completion checks only the
-transcript path supplied by its hook: user messages and human `queued_command`
-attachments before the final
-assistant entry count as processed; queue enqueue records do not. SessionStart
-records a baseline so previous conversation inputs cannot satisfy new requests.
+Old receipts cannot acknowledge new requests. Claude preserves the first
+`UserPromptSubmit` for each `prompt_id`: queued messages and background
+notifications can reuse the active ID, even when they run in a later turn.
+Stop acknowledges the original input; additional inputs count only once their
+user messages or human `queued_command` attachments precede an assistant in the
+hook's transcript. Queue enqueue records do not count. SessionStart records a
+baseline so previous conversation inputs cannot satisfy new requests.
+The Stop hook waits up to five seconds for the final transcript record to flush;
+a timeout is returned as a hook error rather than leaving the run stuck.
 
 ### Verification
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, mkdirSync, rmdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync, spawn } from "node:child_process";
 import { prepareExternalLaunch, prepareExternalPrompt, readExternalSession, writeExternalSession, isExternalCliKind, type ExternalCliSession } from "../pi-extension/subagents/external-cli.ts";
 import { handleCliEvent, readCliExitResult, withCliRunLockAsync } from "../pi-extension/subagents/cli-hook.mjs";
 
@@ -19,6 +19,132 @@ function fixture(kind: "claude" | "codex", run: (f: any) => void) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 describe("native CLI hooks", () => {
+  for (const repeatedAnswer of [false, true]) it(`waits for Claude's final transcript flush${repeatedAnswer ? ', even when the previous answer is identical' : ''}`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pi-claude-flush-'));
+    const sessionFile = join(dir, 'session.jsonl'), resultFile = join(dir, 'result.json');
+    const transcript = join(dir, 'transcript.jsonl');
+    writeFileSync(sessionFile, JSON.stringify({ type: 'session', id: 'pi-id' }) + '\n');
+    writeExternalSession(sessionFile, { version: 1, kind: 'claude', nativeId: 'claude-id',
+      cwd: dir, model: null, thinking: null, identity: null, systemPromptMode: null, autoExit: true });
+    writeFileSync(`${resultFile}.inputs.json`, JSON.stringify(['initial', 'update']));
+    const send = (prompt: string) => handleCliEvent('claude', sessionFile, resultFile, 'auto', {
+      session_id: 'claude-id', hook_event_name: 'UserPromptSubmit', prompt_id: 'current', prompt });
+    send('initial'); send('update');
+    const assistant = { type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } };
+    const entries = [
+      { type: 'user', uuid: 'initial', promptId: 'current', message: { content: 'initial' } },
+      { type: 'attachment', uuid: 'update', attachment: { type: 'queued_command', prompt: 'update', origin: { kind: 'human' }, commandMode: 'prompt' } },
+    ];
+    writeFileSync(transcript, repeatedAnswer
+      ? JSON.stringify({ type: 'user', uuid: 'old', promptId: 'old', message: { content: 'old' } }) + '\n' + JSON.stringify(assistant) + '\n'
+      : entries.map(row => JSON.stringify(row)).join('\n') + '\n{"type":');
+    const flushed = [...entries, assistant].map(row => JSON.stringify(row)).join('\n') + '\n';
+    // Flush only AFTER the hook actually reads the stale transcript. A timed
+    // write could happen before Node starts and leave the regression untested.
+    const observer = join(dir, 'observe.mjs');
+    writeFileSync(observer, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const read = fs.readFileSync; let observed = false;
+fs.readFileSync = (path, ...args) => {
+  const value = read(path, ...args);
+  if (!observed && path === ${JSON.stringify(transcript)}) { observed = true; process.stdout.write('transcript-read\\n'); }
+  return value;
+}; syncBuiltinESMExports();`);
+    const child = spawn(process.execPath, ['--import', observer, join(import.meta.dirname, '../pi-extension/subagents/cli-hook.mjs'),
+      'claude', sessionFile, resultFile, 'auto'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdout.once('data', () => writeFileSync(transcript, flushed));
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise(resolve => child.on('exit', resolve));
+    child.stdin.end(JSON.stringify({ session_id: 'claude-id', hook_event_name: 'Stop',
+      prompt_id: 'current', transcript_path: transcript, last_assistant_message: 'done' }));
+    try {
+      assert.equal(await exited, 0, stderr);
+      assert.equal(JSON.parse(readFileSync(resultFile, 'utf8')).summary, 'done');
+      assert.deepEqual(JSON.parse(readFileSync(`${resultFile}.latest`, 'utf8')).completedInputs, ['initial', 'update']);
+    } finally { child.kill(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("reports a bounded hook failure when Claude never flushes its completed turn", () => fixture('claude', f => {
+    const transcript = join(f.dir, 'transcript.jsonl');
+    writeFileSync(transcript, JSON.stringify({ type: 'user', promptId: 'current', message: { content: 'task' } }) + '\n');
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['task']));
+    const child = spawnSync(process.execPath, [join(import.meta.dirname, '../pi-extension/subagents/cli-hook.mjs'),
+      'claude', f.sessionFile, f.resultFile, 'auto'], {
+      input: JSON.stringify({ session_id: 'claude-id', hook_event_name: 'Stop', prompt_id: 'current',
+        transcript_path: transcript, last_assistant_message: 'done' }), encoding: 'utf8', timeout: 8000 });
+    assert.equal(child.status, 1, child.stderr);
+    assert.equal(existsSync(f.resultFile), false);
+    assert.match(JSON.parse(readFileSync(`${f.resultFile}.hook-error`, 'utf8')).errorMessage, /transcript did not flush.*5s/);
+  }));
+  it("completes every Claude submission sharing a prompt_id, including background notifications", () => fixture("claude", f => {
+    const transcript = join(f.dir, 'transcript.jsonl');
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['initial', 'update', 'later']));
+    writeFileSync(transcript, [
+      { type: 'user', uuid: 'initial', promptId: 'shared', message: { content: 'initial' } },
+      { type: 'attachment', uuid: 'update', attachment: { type: 'queued_command', prompt: 'update', origin: { kind: 'human' }, commandMode: 'prompt' } },
+      { type: 'assistant', uuid: 'answer' },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'auto', { session_id: 'claude-id', transcript_path: transcript, ...event });
+    for (const prompt of ['initial', 'update', '<task-notification>background finished</task-notification>']) {
+      send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'shared', prompt });
+    }
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'next', prompt: 'later' });
+    send({ hook_event_name: 'Stop', prompt_id: 'shared', last_assistant_message: 'initial and update done' });
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['initial', 'update']);
+    assert.equal(existsSync(f.resultFile), false, 'a different pending turn must still run');
+    send({ hook_event_name: 'Stop', prompt_id: 'shared', last_assistant_message: 'duplicate' });
+    assert.equal(existsSync(f.resultFile), false);
+    send({ hook_event_name: 'Stop', prompt_id: 'next', last_assistant_message: 'all done' });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'all done');
+  }));
+  it("does not count a shared-ID queued attachment again against a later identical prompt", () => fixture("claude", f => {
+    const transcript = join(f.dir, 'transcript.jsonl');
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['initial', 'same', 'same']));
+    writeFileSync(transcript, [
+      { type: 'user', uuid: 'initial', promptId: 'shared', message: { content: 'initial' } },
+      { type: 'attachment', uuid: 'update', attachment: { type: 'queued_command', prompt: 'same', origin: { kind: 'human' }, commandMode: 'prompt' } },
+      { type: 'assistant', uuid: 'answer' },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'auto', { session_id: 'claude-id', transcript_path: transcript, ...event });
+    for (const prompt of ['initial', 'same']) send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'shared', prompt });
+    send({ hook_event_name: 'Stop', prompt_id: 'shared', last_assistant_message: 'first answer' });
+    assert.equal(existsSync(f.resultFile), false);
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['initial', 'same']);
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'next', prompt: 'same' });
+    send({ hook_event_name: 'Stop', prompt_id: 'next', last_assistant_message: 'second answer' });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'second answer');
+  }));
+  it("waits for an enqueued Claude prompt even when its submit hook reuses the active ID", () => fixture("claude", f => {
+    const transcript = join(f.dir, 'transcript.jsonl');
+    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['initial', 'later']));
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'auto', { session_id: 'claude-id', transcript_path: transcript, ...event });
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'shared', prompt: 'initial' });
+    send({ hook_event_name: 'UserPromptSubmit', prompt_id: 'shared', prompt: 'later' });
+    // Nothing flushed yet. The initial prompt is known, but the queued input
+    // must not be acknowledged just because its hook carried the same ID.
+    send({ hook_event_name: 'Stop', prompt_id: 'shared', last_assistant_message: 'initial done' });
+    assert.equal(existsSync(f.resultFile), false);
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['initial']);
+    writeFileSync(transcript, [
+      { type: 'user', uuid: 'initial', promptId: 'shared', message: { content: 'initial' } },
+      { type: 'assistant', uuid: 'first' },
+      // Native processing assigns a new ID without another submit hook.
+      { type: 'user', uuid: 'later', promptId: 'new', message: { content: 'later' } },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    send({ hook_event_name: 'Stop', prompt_id: 'shared', last_assistant_message: 'duplicate' });
+    assert.equal(existsSync(f.resultFile), false);
+    writeFileSync(transcript, JSON.stringify({ type: 'assistant', uuid: 'last' }) + '\n', { flag: 'a' });
+    send({ hook_event_name: 'Stop', prompt_id: 'new', last_assistant_message: 'later done' });
+    assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'later done');
+    assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['initial', 'later']);
+  }));
+  it("does not discard a Claude failure sharing an earlier successful Stop's prompt_id", () => fixture("claude", f => {
+    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'interactive', { session_id: 'claude-id', prompt_id: 'shared', ...event });
+    send({ hook_event_name: 'Stop', last_assistant_message: 'first answer' });
+    send({ hook_event_name: 'StopFailure', error_details: 'Provider unavailable' });
+    const result = JSON.parse(readFileSync(f.resultFile, 'utf8'));
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.summary, 'Claude Code error: Provider unavailable');
+  }));
   it("does not acknowledge an identical queued prompt twice through hook and transcript", () => fixture("claude", f => {
     const transcript = join(f.dir, 'transcript.jsonl');
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['same', 'same']));
