@@ -39,7 +39,10 @@ it('question waits across delegated notifications, retries failed delivery, and 
   } as any);
   const emit = (name: string, event: any = {}, ctx: any = {}) => (events.get(name) ?? []).map(handler => handler(event, ctx));
   let exits = 0;
-  const end = () => emit('agent_end', { messages: [{ role: 'assistant', stopReason: 'stop' }] }, { shutdown() { exits++; } });
+  const end = () => {
+    emit('agent_end', { messages: [{ role: 'assistant', stopReason: 'stop' }] });
+    emit('agent_settled', { aborted: false }, { shutdown() { exits++; } });
+  };
   const running: any = { id: 'question-test', name: 'waiting-worker', agent: 'worker', task: 'task', surface: '%unit-test', startTime: Date.now(), sessionFile, statusState: createStatusState({ source: 'pi', startTimeMs: Date.now() }) };
   __test__.runningSubagents.set(running.id, running);
   emit('agent_start');

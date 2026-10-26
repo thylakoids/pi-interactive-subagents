@@ -116,6 +116,12 @@ delivery into the parent session, not merely a completed handle.
 
 ### General acceptance
 
+`node --test test/integration/subagent-boundary.test.ts` runs official Pi with
+a controlled provider: one retryable overload, one successful response, and a
+pre-settlement continuation. It verifies three real provider dispatches and no
+completion file until the single final `agent_settled`. This reproduces the
+old premature error report without a paid or nondeterministic provider outage.
+
 `PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model node --test test/integration/workflow-control-live.test.ts`
 checks the Pi control inbox with a real model and interactive TUI. A foreground
 bash tool blocks while the parent sends multiline steering and a queued

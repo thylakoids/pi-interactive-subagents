@@ -45,8 +45,6 @@ import {
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -1386,41 +1384,6 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
-  describe("shouldAutoExitOnAgentEnd", () => {
-    it("auto-exits after normal completion when there was no takeover", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-
-    it("auto-exits after normal completion even when the user sent the prompt", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
-    });
-
-    it("stays open after Escape aborts the run", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
-    });
-
-    it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
-    });
-  });
-
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
@@ -1611,6 +1574,8 @@ describe("subagent-done.ts", () => {
         emit("input");
         let shutdown = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "agent_end is not final settlement");
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
       } finally {
         restore();
@@ -1627,6 +1592,7 @@ describe("subagent-done.ts", () => {
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
       } finally {
         restore();
@@ -1642,12 +1608,14 @@ describe("subagent-done.ts", () => {
         await ask();
         let shutdown1 = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown1 = true; } });
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
+        emit("agent_settled", { aborted: false }, { shutdown() { shutdown2 = true; } });
         assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
       } finally {
         restore();
@@ -1660,13 +1628,12 @@ describe("subagent-done.ts", () => {
 describe("tmux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("unknown completion signals cannot masquerade as successful work", () => {
+    for (const data of [{type:"ping"}, {}, null]) {
+      const result = interpretExitSidecar(data);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage!, /Invalid/);
+    }
   });
 
   it("decodes done payloads", () => {
@@ -1698,10 +1665,6 @@ describe("tmux.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
-  });
 });
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
@@ -1901,14 +1864,14 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       currentNow = 3_000;
-      recorder.agentEndWaiting();
+      recorder.agentSettled(false);
       let read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
       assert.equal(read.activity.waitingSince, 3_000);
 
       currentNow = 4_000;
-      recorder.agentEndDone();
+      recorder.agentSettled(true);
       read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "done");

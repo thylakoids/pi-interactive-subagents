@@ -69,7 +69,10 @@ it('child drains inbox through Pi API at completion before exiting, and closes i
     registerTool() {}, registerShortcut() {}, sendUserMessage(message: string, options: any) { inputs.push({ message, ...options }); },
   } as any);
   let exits = 0;
-  const finish = () => handlers.get('agent_end')!.forEach(fn => fn({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, { shutdown() { exits++; } }));
+  const finish = () => {
+    handlers.get('agent_end')!.forEach(fn => fn({ messages: [{ role: 'assistant', stopReason: 'stop' }] }));
+    handlers.get('agent_settled')!.forEach(fn => fn({ aborted: false }, { shutdown() { exits++; } }));
+  };
   queuePiMessage(file, 'child', { message: 'next\n  code', deliverAs: 'followUp' });
   finish();
   assert.equal(exits, 0);

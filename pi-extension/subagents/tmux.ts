@@ -606,10 +606,9 @@ export interface PollResult {
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
+ * Interpret the final `.exit` signal from subagent-done.ts. Both successful
+ * completion and exhausted retries are published only after agent_settled.
+ * The terminal sentinel also detects startup failures before the bridge loads.
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
@@ -622,7 +621,8 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  if (data?.type === "done") return { reason: "done", exitCode: 0 };
+  return { reason: "error", exitCode: 1, errorMessage: "Invalid Pi subagent completion signal." };
 }
 
 function readExitSidecar(sessionFile: string): PollResult | null {
