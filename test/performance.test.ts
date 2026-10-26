@@ -62,7 +62,7 @@ it('closed workflow branches are not traversed, and only viewport rows are forma
   assert.doesNotThrow(() => new WorkflowPanel({ ...panel.options, views: () => [] }).renderPanel(theme, 80));
 });
 
-it('completion summary and usage share one scan, with old text excluded on Resume', t => {
+it('usage streams once and branch lookup reads its tail, with old text excluded on Resume', t => {
   const dir = fs.mkdtempSync(join(tmpdir(), 'session-summary-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, 'session.jsonl');
@@ -73,7 +73,8 @@ it('completion summary and usage share one scan, with old text excluded on Resum
   ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
   assert.equal(summarizeSession(file, 3).summary, null, 'an empty resumed turn cannot return an old answer');
   const text = '跨越分块边界🙂'.repeat(12000);
-  fs.appendFileSync(file, JSON.stringify({ type: 'message', id: 'new', message: { role: 'assistant', content: [{ type: 'text', text }], usage: { input: 40, output: 50, totalTokens: 90 } } }));
+  const lastRecord = JSON.stringify({ type: 'message', id: 'new', parentId:'request', message: { role: 'assistant', model:'test-model', content: [{ type: 'text', text }], usage: { input: 40, output: 50, totalTokens: 90 } } });
+  fs.appendFileSync(file, lastRecord);
   const read = fs.readSync, readFile = fs.readFileSync;
   let bytes = 0;
   fs.readSync = ((...args: any[]) => { const n = (read as any)(...args); bytes += n; return n; }) as typeof read;
@@ -89,7 +90,8 @@ it('completion summary and usage share one scan, with old text excluded on Resum
     assert.equal(summary.stats.inputTokens, 50);
     assert.equal(summary.stats.outputTokens, 70);
     assert.equal(summary.stats.contextTokens, 90);
-    assert.equal(bytes, fs.statSync(file).size, 'the complete history is read once');
+    assert.ok(bytes <= fs.statSync(file).size + Buffer.byteLength(lastRecord) + 8192,
+      'one streamed usage scan plus the final branch record; no repeated full-history reads');
   } finally { fs.readSync = read; fs.readFileSync = readFile; syncBuiltinESMExports(); }
   fs.appendFileSync(file, '\ninvalid JSON\n');
   assert.throws(() => summarizeSession(file), SyntaxError, 'corrupt history must not become a successful empty completion');

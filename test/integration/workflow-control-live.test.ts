@@ -2,7 +2,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPiInbox, piInbox, queuePiMessage } from '../../pi-extension/subagents/control.ts';
@@ -10,6 +10,8 @@ import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
 import { integrationModel } from './model.ts';
 import { integrationRuntime } from './runtime.ts';
 import { cleanupSession } from './cleanup.ts';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { summarizeSession } from '../../pi-extension/subagents/session.ts';
 
 it('real Pi preserves multiline steering and completes queued followUp before automatic exit', {
   skip: process.env.PI_WORKFLOW_LIVE !== '1', timeout: 300_000,
@@ -56,5 +58,15 @@ it('real Pi preserves multiline steering and completes queued followUp before au
   assert.equal(readFileSync(join(dir, 'observed.txt'), 'utf8'), 'first line\n  中文🙂 $literal\nlast line\n');
   assert.equal(readFileSync(join(dir, 'follow-up.txt'), 'utf8'), 'follow-up');
   assert.ok(entries.filter(entry => entry.message?.role === 'assistant' && entry.message.usage?.output > 0).length >= 3);
+  // Branch a copy of the actual model transcript using official Pi's writer.
+  const branched = join(dir, 'branched.jsonl'); copyFileSync(file, branched);
+  const primary = entries.slice(0, followIndex).findLast(entry => entry.message?.role === 'assistant' && text(entry).includes('PRIMARY_DONE'))!;
+  const original = summarizeSession(branched);
+  const manager = SessionManager.open(branched, dir);
+  manager.branchWithSummary(primary.id, 'Return to the completed primary task.');
+  const result = summarizeSession(branched);
+  assert.equal(result.summary, text(primary));
+  assert.equal(result.stats.outputTokens, original.stats.outputTokens, 'branch selection cannot erase actual spend');
+  assert.equal(summarizeSession(branched, entries.length).summary, null, 'branch metadata alone is not a new answer');
   t.diagnostic('Real provider messages, tool side effects and turn order verified; evidence: ' + dir);
 });

@@ -27,7 +27,7 @@ try {
   const chunk = Array.from({ length: 500 }, (_, i) => JSON.stringify({ type: 'message', id: 'entry-' + i,
     message: { role: 'toolResult', content: [{ type: 'text', text: 'x'.repeat(2000) }] } })).join('\n') + '\n';
   for (let i = 0; i < 50; i++) writeSync(fd, chunk);
-  writeSync(fd, JSON.stringify({ type: 'message', id: 'last-entry', message: { role: 'assistant',
+  writeSync(fd, JSON.stringify({ type: 'message', id: 'last-entry', message: { role: 'assistant', model: 'benchmark',
     content: [{ type: 'text', text: 'Summary ready ✓' }], usage: { input: 123, output: 456, totalTokens: 579 } } }) + '\n');
   closeSync(fd);
   const leaf = measure(() => getLeafId(file));

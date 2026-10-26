@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 export interface SessionEntry {
   type: string;
   id: string;
-  parentId?: string;
+  parentId?: string | null;
   [key: string]: unknown;
 }
 
@@ -238,10 +238,8 @@ function* sessionLines(sessionFile: string): Generator<string> {
   } finally { closeSync(fd); }
 }
 
-/**
- * Return the id of the last entry in the session file (current branch point / leaf).
- */
-export function getLeafId(sessionFile: string): string | null {
+/** Reverse JSONL iterator; keeps one record, including UTF-8 spanning chunks. */
+function* reversedSessionLines(sessionFile: string): Generator<string> {
   const fd = openSync(sessionFile, "r");
   try {
     let offset = fstatSync(fd).size;
@@ -257,19 +255,23 @@ export function getLeafId(sessionFile: string): string | null {
         parts.push(chunk.subarray(i + 1, end));
         const line = Buffer.concat(parts.reverse()).toString("utf8").trim();
         parts = [];
-        if (line) {
-          const entry = JSON.parse(line);
-          if (entry.type !== "session") return entry.id;
-        }
+        if (line) yield line;
         end = i;
       }
       parts.push(chunk.subarray(0, end));
     }
     const first = Buffer.concat(parts.reverse()).toString("utf8").trim();
-    if (!first) return null;
-    const entry = JSON.parse(first);
-    return entry.type === "session" ? null : entry.id;
+    if (first) yield first;
   } finally { closeSync(fd); }
+}
+
+/** Return the last entry's id (the current branch leaf). */
+export function getLeafId(sessionFile: string): string | null {
+  for (const line of reversedSessionLines(sessionFile)) {
+    const entry = JSON.parse(line);
+    if (entry.type !== "session") return entry.id;
+  }
+  return null;
 }
 
 /**
@@ -392,11 +394,11 @@ export interface SessionStats {
  * model, tool-call count, cumulative token usage + cost, and current context
  * size. Cumulative usage fields are summed across every assistant turn; the
  * context size is taken from the last assistant turn's `totalTokens` (the live
- * context window occupancy). Summary and usage share one bounded-memory scan.
+ * context window occupancy). Usage streams once; the active branch is traced
+ * backwards without retaining historical message payloads or a parent-id index.
  */
 export function summarizeSession(sessionFile: string, afterLine = 0): { summary: string | null; stats: SessionStats } {
-  let summary: string | null = null;
-  let line = 0;
+  let lines = 0;
   const stats: SessionStats = {
     model: null,
     toolCount: 0,
@@ -410,21 +412,10 @@ export function summarizeSession(sessionFile: string, afterLine = 0): { summary:
 
   const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
   for (const entry of getNewEntries(sessionFile, 0)) {
-    if (line++ >= afterLine) {
-      const text = assistantMessageText(entry);
-      if (text !== null) summary = text;
-    }
-    if (entry.type === "model_change") {
-      const modelId = (entry as { modelId?: unknown }).modelId;
-      if (typeof modelId === "string" && modelId) stats.model = modelId;
-      continue;
-    }
+    lines++;
     if (entry.type !== "message") continue;
     const msg = (entry as MessageEntry).message;
     if (msg.role !== "assistant") continue;
-
-    const model = (msg as { model?: unknown }).model;
-    if (typeof model === "string" && model) stats.model = model;
 
     for (const block of msg.content) {
       if (block.type === "toolCall") stats.toolCount++;
@@ -436,12 +427,32 @@ export function summarizeSession(sessionFile: string, afterLine = 0): { summary:
       stats.outputTokens += num(usage.output);
       stats.cacheReadTokens += num(usage.cacheRead);
       stats.cacheWriteTokens += num(usage.cacheWrite);
-      const total = num(usage.totalTokens);
-      if (total > 0) stats.contextTokens = total;
       const cost = usage.cost;
       if (cost && typeof cost === "object") stats.cost += num((cost as Record<string, unknown>).total);
     }
   }
 
+  let summary: string | null = null;
+  let parent: string | null | undefined;
+  let model: string | undefined;
+  let contextTokens: number | undefined;
+  for (const line of reversedSessionLines(sessionFile)) {
+    const index = --lines;
+    const entry = JSON.parse(line);
+    if (entry.type === "session") break;
+    if (parent !== undefined && entry.id !== parent) continue;
+    if (entry.type === "model_change" && model === undefined && typeof entry.modelId === "string" && entry.modelId) model = entry.modelId;
+    if (entry.type === "message" && entry.message.role === "assistant") {
+      if (model === undefined && typeof entry.message.model === "string" && entry.message.model) model = entry.message.model;
+      const total = num(entry.message.usage?.totalTokens);
+      if (total > 0) contextTokens ??= total;
+      if (index >= afterLine && summary === null) summary = assistantMessageText(entry);
+    }
+    if ((summary !== null || index < afterLine) && model !== undefined && contextTokens !== undefined) break;
+    parent = entry.parentId;
+    if (parent === null) break;
+  }
+  stats.model = model ?? null;
+  stats.contextTokens = contextTokens ?? 0;
   return { summary, stats };
 }
