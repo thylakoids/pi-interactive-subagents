@@ -136,7 +136,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
       },
       notify: (message, type) => latestCtx?.ui.notify(message, type ?? "info"),
     });
-    options.widget?.bind(() => manager?.list() ?? [], options.shortcut ?? "ctrl+alt+w");
+    options.widget?.bind(() => manager?.running().map(run => run.view()) ?? [], options.shortcut ?? "ctrl+alt+w");
 
     return { manager, panel };
   };

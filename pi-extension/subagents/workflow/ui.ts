@@ -1,7 +1,6 @@
 /** Centered workflow tree. Navigation follows Pi lists and Vim tree conventions. */
 import { isKeyRelease, isKeyRepeat, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { WorkflowAgentResultMeta, WorkflowRunView } from "./types.ts";
-import { summarizeCalls } from "./state.ts";
 
 export interface WorkflowPanelCallbacks {
   focus(name: string, sessionFile?: string): { ok: true } | { error: string } | Promise<{ ok: true } | { error: string }>;
@@ -73,10 +72,11 @@ export function callActions(call: WorkflowAgentResultMeta): Action[] {
   return actions;
 }
 const ACTION_LABEL: Record<Action, string> = { focus: "Focus", skip: "Skip", abort: "Abort workflow", resume: "Resume workflow" };
+const runDate = new Intl.DateTimeFormat("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 
 /** Progress describes issued calls, never a prediction of future script work. */
 export function workflowSummary(view: WorkflowRunView, width: number): string[] {
-  const { settled } = summarizeCalls(view.calls);
+  const settled = Math.round(view.progress * view.totalCount);
   const size = Math.max(4, Math.min(14, Math.floor(width / 6)));
   const filled = view.totalCount ? Math.round(size * settled / view.totalCount) : 0;
   const bar = "▰".repeat(Math.min(size, filled)) + "▱".repeat(Math.max(0, size - filled));
@@ -108,8 +108,13 @@ export class WorkflowPanel {
     const views = this.views();
     if (state.initialized.size === 0 && views.length) state.expanded.add(`run:${views[0].runId}`);
     const nodes: TreeNode[] = [];
+    const names = new Map<string, number>();
+    for (const view of views) names.set(view.meta.name, (names.get(view.meta.name) ?? 0) + 1);
     for (const view of views) {
       const root = `run:${view.runId}`;
+      const stamp = names.get(view.meta.name)! > 1 ? ` · ${runDate.format(view.createdAt)}` : "";
+      nodes.push({ id: root, kind: "run", label: view.meta.name + stamp, depth: 0, branch: true, view });
+      if (!state.expanded.has(root)) continue;
       const phases = new Map<string, WorkflowAgentResultMeta[]>();
       for (const p of view.meta.phases ?? []) phases.set(typeof p === "string" ? p : p.title, []);
       for (const call of view.calls) {
@@ -121,10 +126,6 @@ export class WorkflowPanel {
         state.initialized.add(root);
         for (const phase of phases.keys()) state.expanded.add(`${root}:phase:${phase}`);
       }
-      const duplicate = views.filter(v => v.meta.name === view.meta.name).length > 1;
-      const stamp = new Date(view.createdAt).toLocaleString("en-GB", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
-      nodes.push({ id: root, kind: "run", label: view.meta.name + (duplicate ? ` · ${stamp}` : ""), depth: 0, branch: true, view });
-      if (!state.expanded.has(root)) continue;
       for (const [phase, calls] of phases) {
         const parent = `${root}:phase:${phase}`;
         nodes.push({ id: parent, parent: root, kind: "phase", label: phase, depth: 1, branch: calls.length > 0, view });
@@ -230,7 +231,10 @@ export class WorkflowPanel {
         `${!confirm ? theme.fg("accent", "❯") : " "} Cancel`,
         `${confirm ? theme.fg("accent", "❯") : " "} ${node.action === "skip" ? "Skip call" : ACTION_LABEL[node.action!]}`];
     } else {
-      const rows = nodes.map(node => {
+      const rows = new Map<number, string[]>();
+      const row = (index: number): string[] => {
+        if (rows.has(index)) return rows.get(index)!;
+        const node = nodes[index];
         const indent = "  ".repeat(node.depth);
         const pointer = state.selected === node.id ? theme.fg("accent", "❯") : " ";
         const chevron = node.branch ? (state.expanded.has(node.id) ? "▾" : "▸") : " ";
@@ -252,18 +256,22 @@ export class WorkflowPanel {
         const lines = [line];
         const error = node.kind === "call" ? node.call?.error : node.kind === "run" ? node.view.error : undefined;
         if (error && state.expanded.has(node.id)) lines.push(...wrapTextWithAnsi(error, Math.max(1, inner - indent.length - 4)).map(s => `${indent}    ${theme.fg("error", s)}`));
-        return { node, lines };
-      });
+        rows.set(index, lines);
+        return lines;
+      };
       const selected = Math.max(0, nodes.findIndex(n => n.id === state.selected));
       const extra = state.error ? wrapTextWithAnsi(state.error, inner).slice(0, 3) : state.busy ? ["Opening…"] : [];
       const budget = Math.max(1, cap - 4 - extra.length);
       let start = Math.max(0, Math.min(state.windowStart, selected));
-      const usedThrough = (end: number) => rows.slice(start, end + 1).reduce((sum, r) => sum + r.lines.length, 0);
-      while (start < selected && usedThrough(selected) > budget) start++;
+      let throughSelection = 0;
+      for (let i = selected; i < nodes.length && i >= start; i--) {
+        throughSelection += row(i).length;
+        if (throughSelection > budget) { start = Math.min(selected, i + 1); break; }
+      }
       state.windowStart = start;
       let used = 0;
-      for (let i = start; i < rows.length && used < budget; i++) {
-        const lines = rows[i].lines.slice(0, budget - used);
+      for (let i = start; i < nodes.length && used < budget; i++) {
+        const lines = row(i).slice(0, budget - used);
         body.push(...lines); used += lines.length;
       }
       if (!nodes.length) body = [theme.fg("dim", "No workflow runs in this session.")];

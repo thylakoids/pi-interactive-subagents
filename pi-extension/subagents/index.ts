@@ -45,8 +45,6 @@ import { assertExternalOptions, isExternalCliKind, prepareExternalLaunch, prepar
 
 import {
   countSessionEntryLines,
-  findLastAssistantMessage,
-  getNewEntries,
   getLeafId,
   getSessionId,
   readNameRegistry,
@@ -54,7 +52,7 @@ import {
   registerName,
   resolveNameInRegistry,
   seedSubagentSessionFile,
-  summarizeSessionStats,
+  summarizeSession,
   writeSubagentLoadout,
   type SessionStats,
   type SubagentLoadout,
@@ -777,6 +775,8 @@ interface RunningSubagent {
   cli?: ExternalCliKind;
   /** Structured result written by the native completion hook or launch shell. */
   sentinelFile?: string;
+  /** Resume summaries exclude old messages; usage still covers the whole session. */
+  summaryAfterLine?: number;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -944,28 +944,29 @@ function renderSubagentWidgetLines(
 }
 
 function updateWidget() {
-  if (runningSubagents.size === 0 && !workflowViews().some(view => view.status === "running")) {
+  const views = latestCtx?.hasUI ? workflowViews() : [];
+  if (!latestCtx?.hasUI || (runningSubagents.size === 0 && !views.some(view => view.status === "running"))) {
     if (latestCtx?.hasUI) latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
     }
-    return;
+    return false;
   }
 
-  if (!latestCtx?.hasUI) return;
   latestCtx.ui.setWidget(
     "subagent-status",
     (_tui: any, _theme: any) => {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, views);
         },
       };
     },
     { placement: "aboveEditor" },
   );
+  return true;
 }
 
 /**
@@ -1311,7 +1312,6 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
-      observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
         shouldRefreshWidget = true;
@@ -1369,6 +1369,8 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
+  updateWidget,
+  startWidgetRefresh,
   deliverPendingQuestion,
   getToolExtensionPath,
   resolveRunningByName,
@@ -1395,7 +1397,7 @@ export const __test__ = {
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
-  updateWidget(); // immediate first render
+  if (!updateWidget()) return;
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
@@ -1950,15 +1952,14 @@ async function watchSubagent(
       ? `Subagent error: ${result.errorMessage}`
       : result.exitCode !== 0
         ? `Sub-agent exited with code ${result.exitCode}`
-        : "Sub-agent exited without output";
-    const response = existsSync(sessionFile)
-      ? findLastAssistantMessage(getNewEntries(sessionFile, 0)) ?? fallback
-      : fallback;
+        : running.summaryAfterLine === undefined ? "Sub-agent exited without output" : "Resumed session exited without new output";
+    const parsed = existsSync(sessionFile) ? summarizeSession(sessionFile, running.summaryAfterLine) : null;
+    const response = parsed?.summary ?? fallback;
     const summary = result.reason === "closed"
       ? `${response}\n\n${result.errorMessage}`
       : response;
 
-    const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
+    const stats = parsed?.stats;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
     return {
@@ -2614,6 +2615,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             verifyScratchDir,
             activityFile,
             interactive,
+            summaryAfterLine: entryCountBefore,
             statusState: createStatusState({
               source: "pi",
               startTimeMs: startTime,
@@ -2629,15 +2631,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
           watchSubagent(running, watcherAbort.signal)
             .then((result) => {
-              const allEntries = getNewEntries(sessionPath, entryCountBefore);
-              const summary = result.exitCode !== 0 ? result.summary : findLastAssistantMessage(allEntries) ??
-                (result.errorMessage
-                  ? `Subagent error: ${result.errorMessage}`
-                  : result.exitCode !== 0
-                    ? `Resumed session exited with code ${result.exitCode}`
-                    : "Resumed session exited without new output");
               publishSubagentResult(pi,
-                { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
+                { ...result, sessionFile: sessionPath, sessionId: resumedSessionId },
                 loadout.agent ?? undefined);
             })
             .catch((err) => publishSubagentError(pi, name, err));

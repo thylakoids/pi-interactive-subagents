@@ -4,6 +4,7 @@
 import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { getLeafId } from './session.ts';
 
 function atomicJson(path, value) {
   const temp = `${path}.tmp-${process.pid}-${randomUUID()}`;
@@ -231,10 +232,8 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     atomicJson(`${resultFile}.claude-seen.json`, seen);
   }
   if (turnId && !completedTurns.includes(turnId)) completedTurns.push(turnId);
-  const lines = readFileSync(sessionFile, 'utf8').trim().split('\n');
-  const leaf = JSON.parse(lines.at(-1));
   appendFileSync(sessionFile, JSON.stringify({
-    type: 'message', id: randomUUID(), parentId: leaf.id,
+    type: 'message', id: randomUUID(), parentId: getLeafId(sessionFile),
     timestamp: new Date().toISOString(),
     message: { role: 'assistant', content: [{ type: 'text', text: summary }],
       model: session.model || session.kind, provider: session.kind,

@@ -20,9 +20,8 @@ import {
   writeSubagentLoadout,
   loadoutSidecarPath,
   type SubagentLoadout,
-  findLastAssistantMessage,
   seedSubagentSessionFile,
-  summarizeSessionStats,
+  summarizeSession,
 } from "../pi-extension/subagents/session.ts";
 
 import { parseSessionHead, shellEscape } from "../pi-extension/subagents/tmux.ts";
@@ -251,21 +250,21 @@ describe("session.ts", () => {
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      const entries = getNewEntries(file, 2);
+      const entries = [...getNewEntries(file, 2)];
       assert.equal(entries.length, 2);
       assert.equal(entries[0].id, "user-001");
       assert.equal(entries[1].id, "asst-001");
     });
 
-    it("returns empty array when no new entries", () => {
+    it("yields no entries when the session is unchanged", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
-      const entries = getNewEntries(file, 2);
+      const entries = [...getNewEntries(file, 2)];
       assert.equal(entries.length, 0);
     });
 
-    it("countSessionEntryLines matches getNewEntries(0).length without parsing", () => {
+    it("countSessionEntryLines matches the number of yielded entries without parsing", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      assert.equal(countSessionEntryLines(file), getNewEntries(file, 0).length);
+      assert.equal(countSessionEntryLines(file), [...getNewEntries(file, 0)].length);
       assert.equal(countSessionEntryLines(file), 4);
     });
 
@@ -356,7 +355,8 @@ describe("session.ts", () => {
     });
   });
 
-  describe("findLastAssistantMessage", () => {
+  describe("session summary text", () => {
+    const findLastAssistantMessage = (entries: any[]) => summarizeSession(createSessionFile(dir, entries)).summary;
     it("finds last assistant text", () => {
       const entries = [USER_MSG, ASSISTANT_MSG, ASSISTANT_MSG_2] as any[];
       const text = findLastAssistantMessage(entries);
@@ -505,7 +505,7 @@ describe("session.ts", () => {
     });
   });
 
-  describe("summarizeSessionStats", () => {
+  describe("summarizeSession", () => {
     const asstWithUsage = (id: string, opts: {
       model?: string;
       tools?: string[];
@@ -539,7 +539,7 @@ describe("session.ts", () => {
           usage: { input: 30, output: 70, cacheRead: 2000, cacheWrite: 0, totalTokens: 3500, cost: { total: 0.02 } },
         }),
       ]);
-      const stats = summarizeSessionStats(file)!;
+      const stats = summarizeSession(file)!.stats;
       assert.equal(stats.model, "claude-sonnet-4-6");
       assert.equal(stats.toolCount, 3);
       assert.equal(stats.inputTokens, 130);
@@ -557,20 +557,20 @@ describe("session.ts", () => {
         { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-haiku-4-5" },
         asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
       ]);
-      assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+      assert.equal(summarizeSession(file)!.stats.model, "claude-sonnet-4-6");
     });
 
     it("handles missing usage gracefully", () => {
       const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const stats = summarizeSessionStats(file)!;
+      const stats = summarizeSession(file)!.stats;
       assert.equal(stats.toolCount, 0);
       assert.equal(stats.inputTokens, 0);
       assert.equal(stats.cost, 0);
       assert.equal(stats.contextTokens, 0);
     });
 
-    it("returns null for an unreadable file", () => {
-      assert.equal(summarizeSessionStats(join(dir, "does-not-exist.jsonl")), null);
+    it("reports an unreadable file", () => {
+      assert.throws(() => summarizeSession(join(dir, "does-not-exist.jsonl")), /ENOENT/);
     });
   });
 });
@@ -2622,7 +2622,7 @@ describe("workflow summary in the subagent widget", () => {
       startTime: Date.now(), sessionFile: "/tmp/child.jsonl", statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }) },
       { id: "b", name: "worker", agent: "scout", task: "", surface: "%2", startTime: Date.now(),
         sessionFile: "/tmp/worker.jsonl", statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }) }];
-    const views = [{ meta: { name: "workflow" }, status: "running", activeCount: 1, totalCount: 2,
+    const views = [{ meta: { name: "workflow" }, status: "running", activeCount: 1, totalCount: 2, progress: 0.5,
       calls: [{ status: "completed" }, { status: "running" }], usage: { totalTokens: 310100, cost: 0.08 } }];
     const body = api.renderSubagentWidgetLines(agents, 100, views, "Alt+W").join("\n");
     assert.match(body, /Subagents/);

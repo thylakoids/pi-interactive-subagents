@@ -116,6 +116,16 @@ delivery into the parent session, not merely a completed handle.
 
 ### General acceptance
 
+For CPU and memory profiling without model calls, run
+`node --expose-gc test/benchmarks/runtime.mjs`. It measures leaf lookup and result
+extraction from a 50 MB session, then redraws a panel with 500 historical runs.
+It reports elapsed time, CPU time, allocation, retained heap after GC, and RSS;
+compare repeated runs on the same machine instead of using timing thresholds
+in CI. `test/performance.test.ts` checks deterministic work bounds: tail-sized
+reads, one-pass summaries, visible-row formatting, live-only status queries,
+no idle/headless widget timer or history rebuild on input redraws, and release
+of finished replay payloads while cold Resume still reuses journal results.
+
 The session lifecycle live probe drives the production workflow tool through
 actual `/reload`, `/quit`, SIGTERM and an unreported child-pane death. It checks
 abort journals, shutdown markers, lock release and pane removal before the parent

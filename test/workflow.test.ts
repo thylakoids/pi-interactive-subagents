@@ -1966,7 +1966,7 @@ describe("observability", () => {
     assert.match(panel.renderPanel(theme, 80, state, 25).join("\n"), /structured_output/);
   });
   it("puts progress and usage in the first-layer summary", () => {
-    const summary = workflowSummary(run({ calls: [call({ status: "completed" })] }), 100).join("\n");
+    const summary = workflowSummary(run({ calls: [call({ status: "completed" })], progress: 1, activeCount: 0, completedCount: 1 }), 100).join("\n");
     assert.match(summary, /1\/1 settled/); assert.match(summary, /1.2k tokens/); assert.match(summary, /\$0.12/);
   });
   it("freezes settled durations and retains Focus on a restored completed call", () => {

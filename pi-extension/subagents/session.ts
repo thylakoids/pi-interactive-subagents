@@ -2,6 +2,7 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -212,20 +213,63 @@ export function resolveNameInRegistry(
   return entry && typeof entry.sessionFile === "string" ? entry : null;
 }
 
-function readEntries(sessionFile: string): SessionEntry[] {
-  const raw = readFileSync(sessionFile, "utf8");
-  return raw
-    .split("\n")
-    .filter((line) => line.trim())
-    .map((line) => JSON.parse(line) as SessionEntry);
+/** Keep at most one JSONL record in memory, including records spanning chunks. */
+function* sessionLines(sessionFile: string): Generator<string> {
+  const fd = openSync(sessionFile, "r");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let parts: Buffer[] = [];
+  try {
+    for (;;) {
+      const bytes = readSync(fd, buffer, 0, buffer.length, null);
+      if (!bytes) break;
+      let start = 0;
+      for (let end = buffer.indexOf(10, start); end >= 0 && end < bytes; end = buffer.indexOf(10, start)) {
+        const line = parts.length
+          ? Buffer.concat([...parts, buffer.subarray(start, end)]).toString("utf8")
+          : buffer.toString("utf8", start, end);
+        parts = [];
+        if (line.trim()) yield line;
+        start = end + 1;
+      }
+      if (start < bytes) parts.push(Buffer.from(buffer.subarray(start, bytes)));
+    }
+    const last = Buffer.concat(parts).toString("utf8");
+    if (last.trim()) yield last;
+  } finally { closeSync(fd); }
 }
 
 /**
  * Return the id of the last entry in the session file (current branch point / leaf).
  */
 export function getLeafId(sessionFile: string): string | null {
-  const entries = readEntries(sessionFile).filter(entry => entry.type !== "session");
-  return entries.length > 0 ? entries[entries.length - 1].id : null;
+  const fd = openSync(sessionFile, "r");
+  try {
+    let offset = fstatSync(fd).size;
+    let parts: Buffer[] = [];
+    while (offset > 0) {
+      const length = Math.min(offset, 4096);
+      offset -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      const bytes = readSync(fd, chunk, 0, length, offset);
+      let end = bytes;
+      for (let i = bytes - 1; i >= 0; i--) {
+        if (chunk[i] !== 10) continue;
+        parts.push(chunk.subarray(i + 1, end));
+        const line = Buffer.concat(parts.reverse()).toString("utf8").trim();
+        parts = [];
+        if (line) {
+          const entry = JSON.parse(line);
+          if (entry.type !== "session") return entry.id;
+        }
+        end = i;
+      }
+      parts.push(chunk.subarray(0, end));
+    }
+    const first = Buffer.concat(parts.reverse()).toString("utf8").trim();
+    if (!first) return null;
+    const entry = JSON.parse(first);
+    return entry.type === "session" ? null : entry.id;
+  } finally { closeSync(fd); }
 }
 
 /**
@@ -285,13 +329,8 @@ export function getSessionId(sessionFile: string): string | null {
  */
 export function countSessionEntryLines(sessionFile: string): number {
   try {
-    const raw = readFileSync(sessionFile, "utf8");
-    // Count non-blank lines, mirroring getNewEntries' `.filter(line => line.trim())`
-    // but skipping the per-line JSON.parse that makes resume slow on big files.
     let count = 0;
-    for (const line of raw.split("\n")) {
-      if (line.trim()) count++;
-    }
+    for (const _line of sessionLines(sessionFile)) count++;
     return count;
   } catch {
     return 0;
@@ -299,47 +338,37 @@ export function countSessionEntryLines(sessionFile: string): number {
 }
 
 /**
- * Return entries added after `afterLine` (1-indexed count of existing entries).
+ * Iterate entries after `afterLine` (the count of existing non-blank records).
  */
-export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
-  const raw = readFileSync(sessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
-  return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+export function* getNewEntries(sessionFile: string, afterLine: number): Generator<SessionEntry> {
+  let line = 0;
+  for (const text of sessionLines(sessionFile)) {
+    if (line++ >= afterLine) yield JSON.parse(text) as SessionEntry;
+  }
 }
 
 /**
- * Find the last assistant message text in a list of entries.
+ * Extract usable text from one assistant entry.
  *
  * Falls back to the `errorMessage` field when the last assistant message has
  * `stopReason: "error"` and no usable text content — this happens when
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
-export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type !== "message") continue;
-    const msg = entry as MessageEntry;
-    if (msg.message.role !== "assistant") continue;
+function assistantMessageText(entry: SessionEntry): string | null {
+  if (entry.type !== "message") return null;
+  const msg = entry as MessageEntry;
+  if (msg.message.role !== "assistant") return null;
 
-    const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
-      )
-      .map((block) => block.text as string);
+  const texts = msg.message.content
+    .filter(block => block.type === "text" && typeof block.text === "string" && block.text.trim() !== "")
+    .map(block => block.text as string);
+  if (texts.length > 0) return texts.join("\n");
 
-    if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
-
-    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
-      return `Subagent error: ${errorMessage.trim()}`;
-    }
+  const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
+  const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
+  if (stopReason === "error" && typeof errorMessage === "string" && errorMessage.trim() !== "") {
+    return `Subagent error: ${errorMessage.trim()}`;
   }
   return null;
 }
@@ -363,16 +392,11 @@ export interface SessionStats {
  * model, tool-call count, cumulative token usage + cost, and current context
  * size. Cumulative usage fields are summed across every assistant turn; the
  * context size is taken from the last assistant turn's `totalTokens` (the live
- * context window occupancy). Returns null if the file can't be read.
+ * context window occupancy). Summary and usage share one bounded-memory scan.
  */
-export function summarizeSessionStats(sessionFile: string): SessionStats | null {
-  let entries: SessionEntry[];
-  try {
-    entries = readEntries(sessionFile);
-  } catch {
-    return null;
-  }
-
+export function summarizeSession(sessionFile: string, afterLine = 0): { summary: string | null; stats: SessionStats } {
+  let summary: string | null = null;
+  let line = 0;
   const stats: SessionStats = {
     model: null,
     toolCount: 0,
@@ -384,7 +408,12 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     cost: 0,
   };
 
-  for (const entry of entries) {
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  for (const entry of getNewEntries(sessionFile, 0)) {
+    if (line++ >= afterLine) {
+      const text = assistantMessageText(entry);
+      if (text !== null) summary = text;
+    }
     if (entry.type === "model_change") {
       const modelId = (entry as { modelId?: unknown }).modelId;
       if (typeof modelId === "string" && modelId) stats.model = modelId;
@@ -403,7 +432,6 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
 
     const usage = (msg as { usage?: Record<string, unknown> }).usage;
     if (usage && typeof usage === "object") {
-      const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
       stats.inputTokens += num(usage.input);
       stats.outputTokens += num(usage.output);
       stats.cacheReadTokens += num(usage.cacheRead);
@@ -415,5 +443,5 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     }
   }
 
-  return stats;
+  return { summary, stats };
 }

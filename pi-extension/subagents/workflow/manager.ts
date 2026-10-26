@@ -43,7 +43,7 @@ import {
 import { defaultConcurrency, runScript } from "./runner.ts";
 import { prepareWorkflowWorktree } from "./worktree.ts";
 import { workflowResultSchema } from "./structured-output.ts";
-import { summarizeSessionStats } from "../session.ts";
+import { summarizeSession } from "../session.ts";
 import { isCallSettled, summarizeCalls } from "./state.ts";
 import { WorkflowScriptError, parseScript, readScriptFile, resolveSavedScriptPath } from "./script.ts";
 import type {
@@ -1218,6 +1218,10 @@ export class WorkflowRun {
   private finish(): void {
     if (this.finished) return;
     this.finished = true;
+    // Replay values and prompts are durable in the journal. Historical UI
+    // views need only call metadata; Resume reloads its own cache from disk.
+    this.cache.clear();
+    for (const call of this.live.values()) call.prompt = "";
     if (this.lockPath && !releaseLock(this.lockPath)) this.note("could not persist lock release; retained ownership for a later retry");
     this.manager.onSettled?.(this.view());
   }
@@ -1283,7 +1287,7 @@ export class WorkflowRun {
   private viewFor(callKey: string): WorkflowAgentResultMeta | undefined {
     const live = this.live.get(callKey);
     if (!live) return undefined;
-    const status = this.manager.service.status(live.name ?? "");
+    const status = live.status === "running" ? this.manager.service.status(live.name ?? "") : undefined;
     return {
       callKey: live.callKey,
       label: live.label,
@@ -1830,7 +1834,7 @@ function addUsage(previous?: WorkflowUsage, current?: WorkflowUsage): WorkflowUs
 function usageFromSession(path?: string): WorkflowUsage | undefined {
   if (!path) return undefined;
   let stats;
-  try { stats = summarizeSessionStats(path); } catch { return undefined; }
+  try { stats = summarizeSession(path).stats; } catch { return undefined; }
   if (!stats) return undefined;
   return {
     ...(stats.model ? { model: stats.model } : {}), inputTokens: stats.inputTokens, outputTokens: stats.outputTokens,
