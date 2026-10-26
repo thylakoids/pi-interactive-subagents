@@ -64,7 +64,14 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running Pi child** — an atomic inbox delivers the original text through Pi's
+  message API, preserving newlines and code. `deliverAs: "steer"` (default)
+  supplements current work; `deliverAs: "followUp"` queues another turn after it.
+  The call acknowledges queueing immediately; the eventual result arrives automatically.
+  Messages racing completion are accepted before the inbox closes or explicitly
+  rejected so the caller can resume after completion. Each launch has its own inbox.
+- **Running native CLI** — messages use the backend's multiline paste protocol.
+  `followUp` is rejected; resume after completion to start another turn.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.

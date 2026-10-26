@@ -178,6 +178,7 @@ REAL codex native TUI lifecycle
 real workflow survives reload, records child crash, and drains parent shutdown
 real parent answers workflow questions, worker delegates, and waiting workflow can Abort
 real models execute old templates, advance pipeline independently and recover after Abort
+real Pi preserves multiline steering and completes queued followUp before automatic exit
 cancels a launch before its child starts and runs a read-only step under the sandbox
 billed workflows prove cache, schema, worktree, nested limits and stall recovery
 EOF

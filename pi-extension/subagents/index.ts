@@ -35,6 +35,7 @@ import {
 import { waitForSurfaceOwner, disposeSurfaceOwner, surfaceOwnerDirectory } from "./surface-owner.ts";
 
 import { randomUUID } from "node:crypto";
+import { createPiInbox, piInbox, queuePiMessage, type PiDelivery } from "./control.ts";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
@@ -1223,17 +1224,15 @@ function resolveRunningByName(name: string):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
-/**
- * Type a follow-up into the live pane. Native CLIs receive bracketed multiline
- * paste; pi messages retain the existing flattened input path.
- */
+/** Pi uses its control inbox; native CLIs retain their explicit paste protocol. */
 async function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
   signal?: AbortSignal,
+  deliverAs: PiDelivery = "steer",
 ): Promise<{ ok: true } | { error: string }> {
   if (running.cli) {
+    if (deliverAs === "followUp") return { error: "Native CLI backends do not support followUp delivery; send a steer or resume after completion." };
     try {
       return await withCliRunLockAsync(running.sentinelFile!, () => {
         if (existsSync(running.sentinelFile!)) {
@@ -1253,18 +1252,16 @@ async function steerSubagent(
     }
   }
 
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
-    send(running.surface, flattened);
+    queuePiMessage(running.sessionFile, running.id, { message, deliverAs }, signal);
     return { ok: true };
   } catch (error: any) {
-    return { error: `Failed to deliver message to subagent "${running.name}" via tmux: ${error?.message ?? String(error)}` };
+    return { error: `Failed to deliver message to subagent "${running.name}": its Pi inbox is closed or unavailable. Retry after completion to resume it. ${error?.message ?? String(error)}` };
   }
 }
 
 async function handleSubagentSteer(
-  params: { name?: string; message?: string; signal?: AbortSignal },
-  send: (surface: string, command: string) => void = sendCommand,
+  params: { name?: string; message?: string; signal?: AbortSignal; deliverAs?: PiDelivery },
 ) {
   const message = params.message;
   if (!message?.trim()) {
@@ -1281,7 +1278,7 @@ async function handleSubagentSteer(
     return { content: [{ type: "text" as const, text: error }], details: { error } };
   }
   observeRunningSubagent(running, Date.now());
-  const steer = await steerSubagent(running, message, send, params.signal);
+  const steer = await steerSubagent(running, message, params.signal, params.deliverAs);
   if ("error" in steer) {
     return { content: [{ type: "text" as const, text: steer.error }],
       details: { error: steer.error, id: running.id, name: running.name } };
@@ -1290,8 +1287,8 @@ async function handleSubagentSteer(
   updateWidget();
   return {
     content: [{ type: "text" as const,
-      text: `Message delivered to running subagent "${running.name}". It picks this up at its next turn boundary. If it exits, its result still arrives as a steer message.` }],
-    details: { id: running.id, name: running.name, status: "steered" },
+      text: `Message queued for running subagent "${running.name}" (${params.deliverAs ?? "steer"}). The result still arrives automatically.` }],
+    details: { id: running.id, name: running.name, status: params.deliverAs === "followUp" ? "queued" : "steered" },
   };
 }
 
@@ -1420,6 +1417,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
   let sessionPath: string | undefined;
   let ownsOpening = false;
   let verifyScratchDir: string | undefined;
+  let inboxPath: string | undefined;
   try {
     const current = [...runningSubagents.values()].find(r =>
       r.name === name || (savedSession && resolve(r.sessionFile) === resolve(savedSession)));
@@ -1463,6 +1461,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     const id = randomUUID().slice(0, 8);
     const activityFile = getSubagentActivityFile(artifactDir, id);
     mkdirSync(dirname(activityFile), { recursive: true });
+    inboxPath = createPiInbox(sessionPath, id);
     const parts = ["pi", "--session", shellEscape(sessionPath), "-e", shellEscape(join(SUBAGENTS_DIR, "subagent-done.ts"))];
     verifyScratchDir = applySandboxToParts(parts, loadout, { artifactDir, name });
     // Explicitly clear inherited workflow contracts; viewing must stay interactive.
@@ -1498,6 +1497,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     if (surface && ![...runningSubagents.values()].some(r => r.surface === surface)) {
       try { closeSurface(surface); } catch {}
       cleanupVerifyScratch(verifyScratchDir);
+      if (inboxPath) rmSync(inboxPath, { recursive: true, force: true });
     }
     return { error: `Cannot focus ${name}: ${error?.message ?? String(error)}` };
   } finally {
@@ -1751,6 +1751,7 @@ async function launchSubagent(
     envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+    createPiInbox(subagentSessionFile, id);
     for (const [key, value] of Object.entries(options?.extraEnv ?? {})) {
       envParts.push(`${key}=${shellEscape(value)}`);
     }
@@ -1823,6 +1824,7 @@ async function launchSubagent(
     return running;
   } catch (error) {
     cleanupVerifyScratch(verifyScratchDir);
+    rmSync(piInbox(subagentSessionFile, id), { recursive: true, force: true });
     // Only a surface this launch created may be torn down: a pre-created one
     // (parallel mode) belongs to the caller, which decides what happens next.
     if (!surfacePreCreated) {
@@ -1999,6 +2001,7 @@ async function watchSubagent(
 function cleanupRunningSubagent(running: RunningSubagent): void {
   if (!runningSubagents.delete(running.id)) return;
   try { closeSurfaceTree(running.surface); } catch {}
+  if (!running.cli) rmSync(piInbox(running.sessionFile, running.id), { recursive: true, force: true });
   cleanupVerifyScratch(running.verifyScratchDir);
 }
 
@@ -2330,6 +2333,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
+        "For Pi children, deliverAs is steer (default, during current work) or followUp (after current work). Native CLI backends reject followUp. " +
         "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
@@ -2348,6 +2352,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           description:
             "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
         }),
+        deliverAs: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], {
+          description: "Pi only: steer supplements current work; followUp queues a new turn after it. Default: steer.",
+        })),
       }),
 
       renderCall(args, theme) {
@@ -2362,12 +2369,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderResult(result, _opts, theme) {
         const details = result.details as any;
 
-        if (details?.status === "steered") {
+        if (details?.status === "steered" || details?.status === "queued") {
           return new Text(
             theme.fg("success", "✓") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-              theme.fg("dim", " — message delivered"),
+              theme.fg("dim", " — message queued"),
             0,
             0,
           );
@@ -2410,7 +2417,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message, signal });
+          return handleSubagentSteer({ name: requestedName, message: params.message, signal, deliverAs: params.deliverAs });
         }
 
         // ── Resume a finished session by name ──
@@ -2454,12 +2461,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
-            return handleSubagentSteer({ name: r.name, message: params.message, signal });
+            return handleSubagentSteer({ name: r.name, message: params.message, signal, deliverAs: params.deliverAs });
           }
         }
 
         const external = readExternalSession(sessionPath);
         if (external) {
+          if (params.deliverAs === "followUp") {
+            const error = "Native CLI backends do not support followUp delivery; resume without deliverAs or use steer.";
+            return { content: [{ type: "text" as const, text: error }], details: { error } };
+          }
           if (!external.nativeId) {
             const error = `Subagent "${name}" has no native CLI session ID; start a fresh subagent.`;
             return { content: [{ type: "text" as const, text: error }], details: { error } };
@@ -2536,6 +2547,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
           const activityFile = getSubagentActivityFile(artifactDir, id);
           mkdirSync(dirname(activityFile), { recursive: true });
+          createPiInbox(sessionPath, id);
 
           // Replay the model, identity, and default-deny tool/extension sandbox.
           verifyScratchDir = applySandboxToParts(parts, loadout, { artifactDir, name });
@@ -2650,6 +2662,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         } catch (error) {
           cleanupVerifyScratch(verifyScratchDir);
+          rmSync(piInbox(sessionPath, id), { recursive: true, force: true });
           try { closeSurface(surface); } catch {}
           runningSubagents.delete(id);
           throw error;

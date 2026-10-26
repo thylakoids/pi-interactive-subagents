@@ -116,6 +116,13 @@ delivery into the parent session, not merely a completed handle.
 
 ### General acceptance
 
+`PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model node --test test/integration/workflow-control-live.test.ts`
+checks the Pi control inbox with a real model and interactive TUI. A foreground
+bash tool blocks while the parent sends multiline steering and a queued
+`followUp`. Acceptance requires exact transcript text, actual file contents,
+the primary response before the follow-up turn, and automatic exit only after
+the follow-up finishes. No normal native CLI history is used.
+
 For CPU and memory profiling without model calls, run
 `node --expose-gc test/benchmarks/runtime.mjs`. It measures leaf lookup and result
 extraction from a 50 MB session, then redraws a panel with 500 historical runs.

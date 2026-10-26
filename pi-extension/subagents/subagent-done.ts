@@ -17,6 +17,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { closePiInbox, drainPiInbox } from "./control.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -120,6 +121,12 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
+  const launchId = process.env.PI_SUBAGENT_ID;
+  let inboxTimer: ReturnType<typeof setInterval> | undefined;
+  const drain = (closing = false) => sessionFile && launchId
+    ? drainPiInbox(sessionFile, launchId, input => pi.sendUserMessage(input.message, { deliverAs: input.deliverAs }), closing)
+    : 0;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -194,6 +201,11 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+    if (sessionFile && launchId && !inboxTimer) {
+      inboxTimer = setInterval(() => drain(), 250);
+      inboxTimer.unref();
+      drain();
+    }
   });
 
   pi.on("input", (event) => {
@@ -252,6 +264,7 @@ export default function (pi: ExtensionAPI) {
       shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
+      if (drain(true)) return; // Input accepted before the closing gate gets its turn.
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
       // overload, etc.) to the parent via the .exit sidecar so the watcher
       // can report a clear failure with the underlying error message.
@@ -345,6 +358,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    if (inboxTimer) clearInterval(inboxTimer);
+    inboxTimer = undefined;
+    if (sessionFile && launchId) closePiInbox(sessionFile, launchId);
     recorder.sessionShutdown((event as any).reason);
   });
 

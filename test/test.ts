@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { createPiInbox, drainPiInbox } from "../pi-extension/subagents/control.ts";
 
 import {
   getLeafId,
@@ -1822,8 +1823,8 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["message", "name"],
-      "only name/message should remain (sessionId dropped)",
+      ["deliverAs", "message", "name"],
+      "name addressing and optional delivery mode",
     );
     assert.equal(props.message.type, "string");
     assert.equal(props.name.type, "string");
@@ -2129,29 +2130,25 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", async () => {
+  it("steers a running subagent through its inbox, preserving multiline text", async () => {
     const testApi = (subagentsModule as any).__test__;
-    let sentSurface = "";
-    let sentText = "";
-    const running = makeRunning();
-
-    const result = await testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
-      sentSurface = surface;
-      sentText = text;
-    });
-
-    assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
+    const dir = createTestDir();
+    const running = makeRunning({ sessionFile: join(dir, "child.jsonl") });
+    try {
+      createPiInbox(running.sessionFile, running.id);
+      const result = await testApi.steerSubagent(running, "do this\nthen that");
+      assert.deepEqual(result, { ok: true });
+      const inputs: any[] = [];
+      drainPiInbox(running.sessionFile, running.id, input => inputs.push(input));
+      assert.deepEqual(inputs, [{ message: "do this\nthen that", deliverAs: "steer" }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = await testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
-    });
+    const result = await testApi.steerSubagent(running, "hi");
 
     assert.match(result.error, /Failed to deliver message/);
   });
@@ -2159,8 +2156,8 @@ describe("subagent interruption", () => {
   it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
-    let sentSurface = "";
     let sentText = "";
+    const dir = createTestDir();
     runningMap.clear();
 
     const activeState = observeStatus(
@@ -2179,24 +2176,23 @@ describe("subagent interruption", () => {
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      const running = makeRunning({ statusState: activeState, sessionFile: join(dir, "child.jsonl") });
+      createPiInbox(running.sessionFile, running.id);
+      runningMap.set("a1", running);
 
       const result = await withMockedNowAsync(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
-          sentSurface = surface;
-          sentText = text;
-        }),
+        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }),
       );
-
-      assert.equal(sentSurface, "pane-1");
+      drainPiInbox(running.sessionFile, running.id, input => { sentText = input.message; });
       assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
+      assert.equal(result.content[0].text.includes('Message queued for running subagent "Worker"'), true);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -2206,7 +2202,7 @@ describe("subagent interruption", () => {
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " });
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
@@ -2237,9 +2233,7 @@ describe("subagent interruption", () => {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
       const result = await withMockedNowAsync(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
-          throw new Error("mux write failed");
-        }),
+        testApi.handleSubagentSteer({ name: "Worker", message: "go" }),
       );
 
       assert.match(result.content[0].text, /Failed to deliver message/);

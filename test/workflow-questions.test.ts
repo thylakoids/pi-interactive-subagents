@@ -1,4 +1,4 @@
-/** Real question tool, notification delivery and reply routing; transport is injected. */
+/** Real question tool, notification delivery and reply routing through the Pi inbox. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import extension, { __test__ } from '../pi-extension/subagents/index.ts';
 import childExtension from '../pi-extension/subagents/subagent-done.ts';
 import { createStatusState } from '../pi-extension/subagents/status.ts';
+import { createPiInbox, drainPiInbox } from '../pi-extension/subagents/control.ts';
 
 it('question waits across delegated notifications, retries failed delivery, and resumes on a routed parent reply', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'workflow-question-'));
@@ -68,8 +69,10 @@ it('question waits across delegated notifications, retries failed delivery, and 
   let reply = '';
   let transformed: any;
   const images = [{ type: 'image', data: 'test-image', mimeType: 'image/png' }];
-  const result = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'secret-token' }, (_surface: string, message: string) => {
-    reply = message; transformed = emit('input', { text: message, images })[0]; emit('agent_start');
+  createPiInbox(sessionFile, running.id);
+  const result = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'secret-token' });
+  drainPiInbox(sessionFile, running.id, input => {
+    reply = input.message; transformed = emit('input', { text: reply, images })[0]; emit('agent_start');
   });
   assert.equal(result.details.status, 'steered');
   assert.equal(reply, 'secret-token');
@@ -95,6 +98,6 @@ it('question waits across delegated notifications, retries failed delivery, and 
   writeFileSync(sessionFile + '.workflow-aborted', 'aborted');
   __test__.deliverPendingQuestion(running);
   assert.equal(delivered.length, 1, 'No stale question notification after Abort');
-  const late = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'late answer' }, () => assert.fail('Aborted child must not receive a reply'));
+  const late = await __test__.handleSubagentSteer({ name: 'waiting-worker', message: 'late answer' });
   assert.match(late.details.error!, /aborted/);
 });
