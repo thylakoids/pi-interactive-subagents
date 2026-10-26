@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { WorkflowManager } from "../../../pi-extension/subagents/workflow/manager.ts";
 import { WorkflowPanel } from "../../../pi-extension/subagents/workflow/ui.ts";
 import subagentsExtension, { __test__ } from "../../../pi-extension/subagents/index.ts";
-import { seedSubagentSessionFile, writeSubagentLoadout } from "../../../pi-extension/subagents/session.ts";
+import { registerName, seedSubagentSessionFile, readSubagentLoadout, writeSubagentLoadout } from "../../../pi-extension/subagents/session.ts";
 import { createStatusState } from "../../../pi-extension/subagents/status.ts";
 import type { WorkflowRunView } from "../../../pi-extension/subagents/workflow/types.ts";
 
@@ -56,6 +56,15 @@ export default function fixture(pi: any) {
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() } }) + "\n");
     writeSubagentLoadout(child, { agent: "workflow-subagent", toolAllowlist: "read", model: null, thinking: null,
       identity: null, systemPromptMode: null, spawnable: null, autoExit: true, cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR! });
+    const other = join(dir, "second.jsonl");
+    seedSubagentSessionFile({ mode: "lineage-only", parentSessionFile: ctx.sessionManager.getSessionFile(), childSessionFile: other, childCwd: dir });
+    appendFileSync(other, JSON.stringify({ type:"message", id:"second-history", parentId:null, timestamp,
+      message:{role:"assistant",content:[{type:"text",text:"SECOND_AGENT_HISTORY"}],api:"anthropic-messages",provider:"anthropic",model:"claude-sonnet-4-5",
+        usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:"stop",timestamp:Date.now()} })+"\n");
+    writeSubagentLoadout(other, readSubagentLoadout(child)!);
+    const registry = join(ctx.sessionManager.getSessionDir(), "artifacts", ctx.sessionManager.getSessionId());
+    registerName(registry, "saved-original", { sessionFile:child });
+    registerName(registry, "saved-second", { sessionFile:other });
     // A previous parent may have died before consuming this exit report.
     writeFileSync(child + '.exit', JSON.stringify({ type: 'error', errorMessage: 'STALE_PREVIOUS_EXIT' }));
     run = await manager.start({ source: `export const meta = { name: 'ui-fixture', description: 'UI test', phases: ['Probe', 'Verify'] }

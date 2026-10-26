@@ -39,7 +39,11 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `workflow` | Run a JavaScript program that orchestrates sub-agents deterministically (see [Dynamic workflows](#dynamic-workflows)) |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+Use `/subagent` to select and Focus a running or saved child in this parent
+session. Running children appear first; saved sessions reopen their original
+history and sandbox without submitting a prompt. The list uses Pi's native
+selector and shows state plus the recorded Pi model when available.
+`/subagent <agent> <task>` still spawns directly.
 
 ### Spawning
 

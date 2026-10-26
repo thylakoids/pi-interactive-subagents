@@ -110,5 +110,25 @@ describe("workflow tree terminal", { skip: !available, timeout: 90_000 }, () => 
     key("Enter");
     await waitFor(() => events().split('focus:{"ok":true}').length === 3, () => screen() + events());
     assert.equal(tmux(["list-panes", "-s", "-t", session, "-F", "#{pane_id}"]).split("\n").length, 2);
+    // Bare /subagent uses the same production Focus path for ordinary saved sessions.
+    key("/subagent", "Enter");
+    await waitFor(() => screen().includes("Focus subagent") && screen().includes("saved-second"), screen);
+    key("Escape");
+    await waitFor(() => !screen().includes("Focus subagent"), screen);
+    assert.equal(tmux(["list-panes", "-s", "-t", session, "-F", "#{pane_id}"]).split("\n").length, 2, "cancel must not open a pane");
+    key("/subagent", "Enter");
+    await waitFor(() => screen().includes("Focus subagent"), screen);
+    key("Down", "Enter");
+    await waitFor(() => tmux(["list-panes", "-s", "-t", session, "-F", "#{pane_id}"]).split("\n").length === 3, screen);
+    const secondPane = tmux(["display-message", "-p", "-t", session, "#{pane_id}"]);
+    assert.notEqual(secondPane, childPane);
+    await waitFor(() => tmux(["capture-pane", "-p", "-t", secondPane]).includes("SECOND_AGENT_HISTORY"), () => tmux(["capture-pane", "-p", "-t", secondPane]));
+    const secondEntries = readFileSync(join(dir, "second.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(secondEntries.filter(entry => entry.type === "message" && entry.message.role === "user").length, 0);
+    key("/subagent", "Enter");
+    await waitFor(() => screen().includes("Focus subagent"), screen);
+    key("Enter"); // First item is the already-open original child.
+    await waitFor(() => tmux(["display-message", "-p", "-t", session, "#{pane_id}"]) === childPane, screen);
+    assert.equal(tmux(["list-panes", "-s", "-t", session, "-F", "#{pane_id}"]).split("\n").length, 3);
   });
 });

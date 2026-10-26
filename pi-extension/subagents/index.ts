@@ -36,6 +36,7 @@ import { waitForSurfaceOwner, disposeSurfaceOwner, surfaceOwnerDirectory } from 
 
 import { randomUUID } from "node:crypto";
 import { createPiInbox, piInbox, queuePiMessage, type PiDelivery } from "./control.ts";
+import { openSubagentPicker } from "./subagent-picker.ts";
 import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
@@ -2670,13 +2671,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name
+  // Bare /subagent focuses an existing child; arguments retain direct spawning.
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+    description: "Focus a subagent, or spawn with /subagent <agent> <task>",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        await openSubagentPicker(ctx,
+          getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()),
+          [...runningSubagents.values()], focusSubagentSession);
         return;
       }
 
