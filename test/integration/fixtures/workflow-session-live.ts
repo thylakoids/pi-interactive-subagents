@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import subagentsExtension from '../../../pi-extension/subagents/index.ts';
+import { shellEscape } from '../../../pi-extension/subagents/tmux.ts';
 
 export default function fixture(pi: any) {
   const dir = process.env.PI_SESSION_LIVE_DIR!;
@@ -15,7 +16,7 @@ export default function fixture(pi: any) {
   pi.on('before_agent_start', (event: any) => ({
     systemPrompt: event.systemPrompt + '\nThis session is an automated lifecycle probe driven by slash commands. Workflow failures, including syntax-probe, are intentional. On notifications, acknowledge briefly and end the turn; do not inspect files, call tools, repair scripts, or start/resume workflows. Child agents receive their own independent tasks.',
   }));
-  pi.on('agent_end', () => writeFileSync(join(dir, 'parent-idle.json'), JSON.stringify({ generation })));
+  pi.on('agent_settled', () => writeFileSync(join(dir, 'parent-idle.json'), JSON.stringify({ generation })));
   let generation = 0;
   pi.on('session_start', (_event: any, ctx: any) => {
     const path = join(dir, 'ready.json');
@@ -28,7 +29,9 @@ export default function fixture(pi: any) {
     if (result.isError) throw new Error(result.content[0].text);
     return result.details;
   };
-  const prompt = (command: string) => 'Execute exactly the fenced bash command once, then reply DONE. Existing marker files intentionally preserve earlier attempts. Do not inspect files, prepend/append commands, or add setup/cleanup that deletes, truncates or resets markers. Do not delegate.\n```sh\n' + command + '\n```';
+  const prompt = (command: string) => 'Make an actual bash TOOL CALL executing the entire fenced script once, then reply DONE. '
+    + 'Plain text does not execute a tool. Existing marker files intentionally preserve earlier attempts. Do not inspect files, prepend/append commands, or add setup/cleanup that deletes, truncates or resets markers. Do not delegate.\n```sh\n'
+    + 'cd ' + shellEscape(dir) + '\n' + command + '\n```';
   pi.registerCommand('lifecycle-syntax', { description: 'Check actual QuickJS diagnostics before any billed child', handler: async (_args: string, ctx: any) => {
     const bad = '\nexport const meta = {name:"syntax-probe",description:"syntax probe"}\n\nconst broken = ;\nawait agent("must not run");';
     const checked = await tools.get('workflow').execute('validate', { action: 'validate', script: bad }, undefined, undefined, ctx);

@@ -7,6 +7,7 @@ import subagentsExtension from '../../../pi-extension/subagents/index.ts';
 import { WorkflowManager } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { RUN_LOCK_HELPER } from '../../../pi-extension/subagents/workflow/run-lock.ts';
 import { BUNDLED_WORKFLOWS_DIR } from '../../../pi-extension/subagents/workflow/script.ts';
+import { shellEscape } from '../../../pi-extension/subagents/tmux.ts';
 import { readSubagentLoadout } from '../../../pi-extension/subagents/session.ts';
 import type { WorkflowRunView } from '../../../pi-extension/subagents/workflow/types.ts';
 
@@ -21,8 +22,10 @@ const script = (name: string, body: string) =>
 
 // Keep prose punctuation outside executable commands, including file names.
 const bashPrompt = (command: string, reply: string) =>
-  'Use bash to execute exactly the command inside this fenced block (timeout 240 seconds):\n```sh\n' +
-  command + '\n```\nAfter the command succeeds, reply ' + reply + '.';
+  'Your FIRST action must be an actual bash TOOL CALL executing the entire fenced script (timeout 240 seconds). '
+  + 'Plain text, a command in your answer, or a claim that it ran does not execute it and fails the test.\n```sh\n'
+  + 'cd ' + shellEscape(process.env.PI_WORKFLOW_LIVE_DIR!) + '\n' + command
+  + '\n```\nOnly after the tool succeeds, reply ' + reply + '.';
 
 export default function liveFixture(pi: any) {
   subagentsExtension(pi);
@@ -133,7 +136,10 @@ export default function liveFixture(pi: any) {
         const pipelineExecution = gated.execute();
         try {
           await until(() => existsSync(join(dir, 'slow-start')), 'real slow agent enters its blocking tool');
-          await until(() => existsSync(join(dir, 'fast-verify')), 'fast Verify while slow Recon remains blocked');
+          await until(() => existsSync(join(dir, 'fast-verify')) || gated.view().calls.some(call =>
+            call.label === 'verify-fast' && ['completed','failed','skipped','aborted'].includes(call.status)),
+          'fast Verify while slow Recon remains blocked');
+          assert.ok(existsSync(join(dir, 'fast-verify')), 'fast verifier finished without executing its required tool; text alone is not verification');
           const view = gated.view();
           assert.equal(view.calls.find(call => call.label === 'recon-slow')?.status, 'running');
           assert.equal(existsSync(join(dir, 'slow-end')), false);

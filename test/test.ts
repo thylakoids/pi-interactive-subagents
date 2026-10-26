@@ -1576,14 +1576,14 @@ describe("subagent-done.ts", () => {
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, false, "agent_end is not final settlement");
         emit("agent_settled", { aborted: false }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        assert.equal(shutdown, true, "reply consumed mid-run → settlement should exit, not park");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    it("parks as waiting at agent_end while the reply is still pending (no input yet)", async () => {
+    it("parks as waiting after settlement while the reply is still pending (no input yet)", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
@@ -1616,7 +1616,7 @@ describe("subagent-done.ts", () => {
         let shutdown2 = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
         emit("agent_settled", { aborted: false }, { shutdown() { shutdown2 = true; } });
-        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+        assert.equal(shutdown2, true, "after the reply turn settles, the child should exit");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });

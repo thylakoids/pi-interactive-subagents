@@ -322,7 +322,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", (event) => {
     if (inboxTimer) clearInterval(inboxTimer);
     inboxTimer = undefined;
-    if (sessionFile && launchId) closePiInbox(sessionFile, launchId);
+    if (event.reason !== "reload" && sessionFile && launchId) closePiInbox(sessionFile, launchId);
     recorder.sessionShutdown((event as any).reason);
   });
 

@@ -1,6 +1,6 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { closePiInbox, createPiInbox, drainPiInbox, piInbox, queuePiMessage, type PiInput } from '../pi-extension/subagents/control.ts';
@@ -91,4 +91,26 @@ it('native CLI followUp is rejected before any terminal input or metadata mutati
     assert.match((result as any).error, /do not support followUp/);
   }
   assert.deepEqual(readdirSync(dir), []);
+});
+
+it('reloading a child keeps its launch inbox available; quitting closes it', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-inbox-reload-'));
+  const keys = ['PI_SUBAGENT_SESSION','PI_SUBAGENT_ID'];
+  const saved = keys.map(key=>process.env[key]);
+  t.after(()=>{
+    keys.forEach((key,i)=>{if(saved[i]===undefined)delete process.env[key];else process.env[key]=saved[i];});
+    rmSync(dir,{recursive:true,force:true});
+  });
+  const file=join(dir,'session.jsonl');
+  Object.assign(process.env,{PI_SUBAGENT_SESSION:file,PI_SUBAGENT_ID:'reload'});
+  createPiInbox(file,'reload');
+  let shutdown: Function;
+  child({on(name:string,fn:Function){if(name==='session_shutdown')shutdown=fn;},registerTool(){},registerShortcut(){}} as any);
+  shutdown!({reason:'reload'});
+  queuePiMessage(file,'reload',{message:'after reload',deliverAs:'steer'});
+  const inputs:PiInput[]=[];
+  drainPiInbox(file,'reload',input=>inputs.push(input));
+  assert.deepEqual(inputs,[{message:'after reload',deliverAs:'steer'}]);
+  shutdown!({reason:'quit'});
+  assert.throws(()=>queuePiMessage(file,'reload',{message:'after quit',deliverAs:'steer'}),/ENOENT/);
 });

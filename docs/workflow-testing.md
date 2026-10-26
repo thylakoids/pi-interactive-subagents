@@ -116,18 +116,28 @@ delivery into the parent session, not merely a completed handle.
 
 ### General acceptance
 
+Live prompts must require actual tool calls and name the working directory.
+Keep executable commands in fenced blocks with an explicit `cd`; a prompt
+artifact's directory is not the workspace. Plain-text function syntax or
+"DONE" is not evidence of execution. Require transcript tool records and real
+side effects, and fail promptly when a settled step omitted its required marker.
+
 `node --test test/integration/subagent-boundary.test.ts` runs official Pi with
 a controlled provider: one retryable overload, one successful response, and a
 pre-settlement continuation. It verifies three real provider dispatches and no
 completion file until the single final `agent_settled`. This reproduces the
 old premature error report without a paid or nondeterministic provider outage.
+The same suite reloads an idle child in official Pi and checks that its inbox
+continues delivering input, while quitting closes the inbox explicitly.
 
 `PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model node --test test/integration/workflow-control-live.test.ts`
 checks the Pi control inbox with a real model and interactive TUI. A foreground
 bash tool blocks while the parent sends multiline steering and a queued
 `followUp`. Acceptance requires exact transcript text, actual file contents,
 the primary response before the follow-up turn, and automatic exit only after
-the follow-up finishes. No normal native CLI history is used.
+the follow-up finishes. It then reopens that real history, reloads the child,
+and requires a new real model/tool result through the inbox before quitting.
+No normal native CLI history is used.
 
 For CPU and memory profiling without model calls, run
 `node --expose-gc test/benchmarks/runtime.mjs`. It measures leaf lookup and result
@@ -135,7 +145,8 @@ extraction from a 50 MB session, then redraws a panel with 500 historical runs.
 It reports elapsed time, CPU time, allocation, retained heap after GC, and RSS;
 compare repeated runs on the same machine instead of using timing thresholds
 in CI. `test/performance.test.ts` checks deterministic work bounds: tail-sized
-reads, streamed usage plus a backwards active-branch lookup, visible-row formatting, live-only status queries,
+reads, streamed usage plus a backwards active-branch lookup, visible-row
+formatting, live-only status queries,
 no idle/headless widget timer or history rebuild on input redraws, and release
 of finished replay payloads while cold Resume still reuses journal results.
 

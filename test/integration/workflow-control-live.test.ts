@@ -2,7 +2,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPiInbox, piInbox, queuePiMessage } from '../../pi-extension/subagents/control.ts';
@@ -38,8 +38,8 @@ it('real Pi preserves multiline steering and completes queued followUp before au
   const pane = tmux('new-session', '-d', '-s', session, '-x', '120', '-y', '36', '-P', '-F', '#{pane_id}');
   const runtime = integrationRuntime();
   const root = resolve(import.meta.dirname, '../..');
-  const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_SUBAGENT_SESSION=${shellEscape(file)} PI_SUBAGENT_ID=${id} PI_SUBAGENT_NAME=control-live PI_SUBAGENT_AUTO_EXIT=1 PI_SUBAGENT_ALLOWED= PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(join(dir, 'activity.json'))} ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --tools bash,read --model ${shellEscape(integrationModel())} --thinking off -e ${shellEscape(join(root, 'pi-extension/subagents/subagent-done.ts'))} --session ${shellEscape(file)} ${shellEscape(initial)} 2>${shellEscape(join(dir, 'stderr.log'))}; echo $? > ${shellEscape(join(dir, 'exit'))}; sleep 30`;
-  tmux('respawn-pane', '-k', '-t', pane, command);
+  const command = (launchId: string, autoExit: boolean, prompt: string, exit: string) => `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_SUBAGENT_SESSION=${shellEscape(file)} PI_SUBAGENT_ID=${launchId} PI_SUBAGENT_NAME=control-live PI_SUBAGENT_AUTO_EXIT=${autoExit?'1':'0'} PI_SUBAGENT_ALLOWED= PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(join(dir, 'activity.json'))} ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --tools bash,read --model ${shellEscape(integrationModel())} --thinking off -e ${shellEscape(join(root, 'pi-extension/subagents/subagent-done.ts'))} --session ${shellEscape(file)} ${prompt?shellEscape(prompt):''} 2>${shellEscape(join(dir, 'stderr.log'))}; echo $? > ${shellEscape(join(dir, exit))}; sleep 30`;
+  tmux('respawn-pane', '-k', '-t', pane, command(id,true,initial,'exit'));
   await until(() => existsSync(join(dir, 'ready')), 'real model must enter the blocking bash tool');
   queuePiMessage(file, id, { message: steer, deliverAs: 'steer' });
   queuePiMessage(file, id, { message: next, deliverAs: 'followUp' });
@@ -68,5 +68,22 @@ it('real Pi preserves multiline steering and completes queued followUp before au
   assert.equal(result.summary, text(primary));
   assert.equal(result.stats.outputTokens, original.stats.outputTokens, 'branch selection cannot erase actual spend');
   assert.equal(summarizeSession(branched, entries.length).summary, null, 'branch metadata alone is not a new answer');
+  // Reopen the same real history interactively, reload its production bridge,
+  // then require another real model/tool response through the same launch inbox.
+  const reopened='control-reopened';
+  const activity=()=>JSON.parse(readFileSync(join(dir,'activity.json'),'utf8'));
+  const previousStart=activity().createdAt;
+  createPiInbox(file,reopened); rmSync(file+'.exit',{force:true});
+  tmux('respawn-pane','-k','-t',pane,command(reopened,false,'','reopened-exit'));
+  await until(()=>activity().createdAt>previousStart && tmux('capture-pane','-p','-t',pane).includes('FOLLOWUP_DONE'),'original real history reopens');
+  const beforeReload=activity().createdAt;
+  tmux('send-keys','-t',pane,'/reload','Enter');
+  await until(()=>activity().createdAt>beforeReload,'child finishes actual reload');
+  queuePiMessage(file,reopened,{message:'Use the actual bash TOOL once to execute `printf reload-proof > reload-proof.txt`, then answer RELOAD_DONE. Plain text does not execute the tool.',deliverAs:'steer'});
+  await until(()=>existsSync(join(dir,'reload-proof.txt')) && summarizeSession(file).summary?.includes('RELOAD_DONE')===true,'real model executes the message after child reload');
+  assert.equal(readFileSync(join(dir,'reload-proof.txt'),'utf8'),'reload-proof');
+  tmux('send-keys','-t',pane,'/quit','Enter');
+  await until(()=>existsSync(join(dir,'reopened-exit')),'interactive child quits');
+  assert.throws(()=>queuePiMessage(file,reopened,{message:'after quit',deliverAs:'steer'}),/ENOENT/);
   t.diagnostic('Real provider messages, tool side effects and turn order verified; evidence: ' + dir);
 });

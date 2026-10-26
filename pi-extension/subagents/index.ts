@@ -20,7 +20,6 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,

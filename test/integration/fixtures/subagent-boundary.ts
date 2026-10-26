@@ -1,5 +1,5 @@
 /** Script only provider responses; official Pi owns retries, continuations and settlement. */
-import { appendFileSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/compat';
 import child from '../../../pi-extension/subagents/subagent-done.ts';
@@ -7,6 +7,14 @@ import child from '../../../pi-extension/subagents/subagent-done.ts';
 export default function fixture(pi: any) {
   child(pi);
   const dir = process.env.PI_BOUNDARY_DIR!;
+  const ready = join(dir,'generation');
+  pi.on('session_start', () => writeFileSync(ready,String(existsSync(ready) ? Number(readFileSync(ready,'utf8'))+1 : 1)));
+  pi.on('input', (event:any) => {
+    if (event.text === 'INBOX_RELOAD_PROOF') {
+      writeFileSync(join(dir,'received'),event.text);
+      return {action:'handled'};
+    }
+  });
   const record = (event: string, detail: any = {}) => appendFileSync(join(dir, 'events.jsonl'), JSON.stringify({event, ...detail}) + '\n');
   let requests = 0, continuations = 0;
   pi.registerProvider('boundary', {

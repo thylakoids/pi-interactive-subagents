@@ -5,7 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { WorkflowManager, type WorkflowManagerOptions } from '../../../pi-extension/subagents/workflow/manager.ts';
 import { __test__ } from '../../../pi-extension/subagents/index.ts';
-import { surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
+import { shellEscape, surfaceExists } from '../../../pi-extension/subagents/tmux.ts';
 import { getSessionId, readNameRegistry } from '../../../pi-extension/subagents/session.ts';
 
 export async function delegationProbe(options: WorkflowManagerOptions, dir: string) {
@@ -21,7 +21,8 @@ export async function delegationProbe(options: WorkflowManagerOptions, dir: stri
     try { return !execFileSync('ps', ['-o','stat=','-p',String(id)], { encoding: 'utf8' }).trim().startsWith('Z'); }
     catch (error) { if ((error as any).status !== 1) throw error; return false; }
   };
-  const prompt = (command: string) => 'Execute exactly this bash command once, then reply DONE. Existing marker files intentionally preserve earlier attempts. Do not add setup/cleanup or reset files. Do not delegate: ' + command;
+  const prompt = (command: string) => 'Use the actual bash TOOL to execute this command exactly once in working directory '
+    + JSON.stringify(dir) + ', then reply DONE. Do not change into the prompt artifact directory. Existing marker files intentionally preserve earlier attempts. Do not add setup/cleanup or reset files. Do not delegate.\n```sh\n' + command + '\n```';
   const blocking = (name: string) => prompt(`timeout 240 sh -c 'echo $$ > ${name}-pid; echo started >> ${name}-started; while ! test -f ${name}-release; do sleep 0.2; done; echo done >> ${name}-done'`);
   const delegate = (agent: string, task: string) => 'Call subagent exactly once with ' + JSON.stringify({ agent, name: agent + '-probe', task }) + '. End your turn and wait for the actual subagent result. Then return that result. Do not do its work yourself.';
   const source = (name: string, body: string) => 'export const meta = ' + JSON.stringify({ name, description: 'Delegation isolation probe' }) + '\n' + body;
@@ -31,7 +32,7 @@ export async function delegationProbe(options: WorkflowManagerOptions, dir: stri
     await until(() => existsSync(join(dir, 'sibling-pid')), 'independent workflow blocks');
     const siblingPid = pid('sibling');
     const branch = await manager.start({ source: source('nested-branch', `
-      const saved = await agent(${JSON.stringify(prompt('echo once >> branch-saved'))}, {agent:'leaf',label:'saved'});
+      const saved = await agent(${JSON.stringify(prompt('echo once >> ' + shellEscape(join(dir,'branch-saved'))))}, {agent:'leaf',label:'saved'});
       if (!saved) throw new Error('saved failed');
       return await agent(${JSON.stringify(delegate('relay', delegate('leaf', blocking('branch'))))}, {agent:'branch',label:'branch'});`), args: {} });
     const first = branch.execute(); executions.push(first);

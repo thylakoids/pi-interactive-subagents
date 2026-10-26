@@ -74,7 +74,7 @@ export default function collaboration(pi: any) {
     try {
       const options = { baseDir: join(dir, 'artifacts'), cwd: dir, agentDir: process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME!, '.pi', 'agent'), sessionFile: ctx.sessionManager.getSessionFile(), sessionId: ctx.sessionManager.getSessionId(), service: (globalThis as any).__pi_interactive_subagents.workflow };
       manager = new WorkflowManager(options);
-      run = await manager.start({ source: body('live-question-reply', 'First call ask_question with exactly: REPLY_CASE: What is the verification token? You do not know it; do not inspect parent sessions or guess. Immediately after asking, deliberately attempt subagent to delegate to scout named delegate-proof: read fixture.txt and return its exact contents. Include the task context explicitly. This early attempt intentionally probes the runtime waiting gate before the parent reply; it must be rejected. Then stop and wait for the parent response. After receiving the token, follow the runtime notice about blocked calls and obtain the actual scout result; do not do its work yourself. Only after receiving both the parent token and scout result, use bash to write the token to answered.txt, then return the token and the scout result as your final value.'), args: {}, reuse: 'none' });
+      run = await manager.start({ source: body('live-question-reply', 'Your FIRST actual TOOL CALL must be ask_question with arguments {"question":"REPLY_CASE: What is the verification token? You do not know it; do not inspect parent sessions or guess."}. Writing ask_question(...) as plain text does not invoke the tool and fails this test. Immediately after the question tool returns, deliberately attempt subagent to delegate to scout named delegate-proof: read fixture.txt and return its exact contents. Include the task context explicitly. This early attempt intentionally probes the runtime waiting gate before the parent reply; it must be rejected. Then stop and wait for the parent response. After receiving the token, follow the runtime notice about blocked calls and obtain the actual scout result; do not do its work yourself. Only after receiving both the parent token and scout result, use bash to write the token to answered.txt, then return the token and the scout result as your final value.'), args: {}, reuse: 'none' });
       event('reply-run-start', { runId: run.runId });
       const replied = await run.execute();
       save('replied', replied);
@@ -103,7 +103,7 @@ export default function collaboration(pi: any) {
       save('delegated', { ...scout, entries: rows(scout.sessionFile).length });
       event('reply-and-delegation-passed');
 
-      run = await manager.start({ source: body('live-question-abort', 'Call ask_question with exactly: ABORT_CASE: May I continue? Then stop and wait for your parent. Do not write forbidden-after-abort.txt, do not delegate, and do not invent an answer.'), args: {}, reuse: 'none' });
+      run = await manager.start({ source: body('live-question-abort', 'Make an actual ask_question TOOL CALL with arguments {"question":"ABORT_CASE: May I continue?"}; plain text does not invoke it. Then stop and wait for your parent. Do not write forbidden-after-abort.txt, do not delegate, and do not invent an answer.'), args: {}, reuse: 'none' });
       event('abort-run-start', { runId: run.runId });
       const aborted = await run.execute();
       save('aborted', aborted);
