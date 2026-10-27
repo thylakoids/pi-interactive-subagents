@@ -137,14 +137,6 @@ fs.readFileSync = (path, ...args) => {
     assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'later done');
     assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['initial', 'later']);
   }));
-  it("does not discard a Claude failure sharing an earlier successful Stop's prompt_id", () => fixture("claude", f => {
-    const send = (event: any) => handleCliEvent('claude', f.sessionFile, f.resultFile, 'interactive', { session_id: 'claude-id', prompt_id: 'shared', ...event });
-    send({ hook_event_name: 'Stop', last_assistant_message: 'first answer' });
-    send({ hook_event_name: 'StopFailure', error_details: 'Provider unavailable' });
-    const result = JSON.parse(readFileSync(f.resultFile, 'utf8'));
-    assert.equal(result.exitCode, 1);
-    assert.equal(result.summary, 'Claude Code error: Provider unavailable');
-  }));
   it("does not acknowledge an identical queued prompt twice through hook and transcript", () => fixture("claude", f => {
     const transcript = join(f.dir, 'transcript.jsonl');
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(['same', 'same']));
@@ -176,8 +168,11 @@ fs.readFileSync = (path, ...args) => {
     assert.equal(JSON.parse(readFileSync(f.resultFile, 'utf8')).summary, 'later done');
     assert.deepEqual(JSON.parse(readFileSync(`${f.resultFile}.latest`, 'utf8')).completedInputs, ['first', 'later']);
   }));
-  it("baselines complete history at SessionStart and accepts a completed record without a newline", () => fixture("claude", f => {
+  it("baselines complete history at SessionStart after rejecting malformed records and accepts a completed record without a newline", () => fixture("claude", f => {
     const transcript = join(f.dir, "transcript.jsonl");
+    writeFileSync(transcript, 'invalid JSON\n');
+    assert.throws(() => handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", {
+      hook_event_name: "SessionStart", session_id: "claude-id", transcript_path: transcript }), SyntaxError);
     const oldInput = { type: "user", uuid: "old", message: { content: "old task" } };
     writeFileSync(transcript, JSON.stringify(oldInput) + '\n' + JSON.stringify({ type: "assistant", uuid: "old-answer", message: { content: [] } }) + '\n{"type":');
     handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "SessionStart", session_id: "claude-id", transcript_path: transcript });
@@ -190,42 +185,31 @@ fs.readFileSync = (path, ...args) => {
     handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript, last_assistant_message: "done" });
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "done");
   }));
-  it("does not silently accept malformed complete transcript records", () => fixture("claude", f => {
-    const transcript = join(f.dir, "transcript.jsonl");
-    writeFileSync(transcript, 'invalid JSON\n');
-    assert.throws(() => handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", {
-      hook_event_name: "SessionStart", session_id: "claude-id", transcript_path: transcript }), SyntaxError);
-  }));
-
-  it("can be imported by a Node stdin program", () => {
+  it("can be imported when the caller's executable cannot be resolved or is absent", () => {
     const hook = new URL("../pi-extension/subagents/cli-hook.mjs", import.meta.url).href;
-    const output = execFileSync(process.execPath, ["--input-type=module", "-"],
-      { input: `import { readCliExitResult } from ${JSON.stringify(hook)}; console.log(typeof readCliExitResult);`, encoding: "utf8" });
-    assert.equal(output.trim(), "function");
-  });
-  for (const code of ["EACCES", "ENOENT"]) {
-    it("can be imported when the caller's executable cannot be resolved: " + code, () => {
-      const hook = new URL("../pi-extension/subagents/cli-hook.mjs", import.meta.url).href;
+    for (const code of [undefined, "EACCES", "ENOENT"]) {
       const child = spawnSync(process.execPath, ["--input-type=module", "-"], {
         input: `
           import fs from 'node:fs';
           import { syncBuiltinESMExports } from 'node:module';
-          process.argv[1] = '/virtual/pi-hook-import-probe';
-          const original = fs.realpathSync;
-          fs.realpathSync = (path, ...args) => {
-            if (path === process.argv[1]) throw Object.assign(new Error('unresolvable caller'), {code:${JSON.stringify(code)}});
-            return original(path, ...args);
-          };
-          syncBuiltinESMExports();
+          if (${JSON.stringify(code ?? null)}) {
+            process.argv[1] = '/virtual/pi-hook-import-probe';
+            const original = fs.realpathSync;
+            fs.realpathSync = (path, ...args) => {
+              if (path === process.argv[1]) throw Object.assign(new Error('unresolvable caller'), { code: ${JSON.stringify(code ?? null)} });
+              return original(path, ...args);
+            };
+            syncBuiltinESMExports();
+          }
           const {readCliExitResult} = await import(${JSON.stringify(hook)});
           console.log(typeof readCliExitResult);
         `,
         encoding: "utf8",
       });
-      assert.equal(child.status, 0, child.stderr);
-      assert.equal(child.stdout.trim(), "function");
-    });
-  }
+      assert.equal(child.status, 0, (code ?? "stdin") + ": " + child.stderr);
+      assert.equal(child.stdout.trim(), "function", code ?? "stdin");
+    }
+  });
   it("keeps a completed Claude response when the transcript has an unfinished tail", () => fixture("claude", f => {
     const transcript = join(f.dir, "transcript.jsonl");
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["task"]));
@@ -248,7 +232,7 @@ fs.readFileSync = (path, ...args) => {
       hook_event_name: "Stop", session_id: "claude-id", transcript_path: transcript, prompt_id: "p1" });
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "done");
   }));
-  it("does not append or replace the answer for a repeated Claude prompt_id", () => fixture("claude", f => {
+  it("does not append or replace a repeated Claude answer, but retains a later StopFailure sharing its prompt_id", () => fixture("claude", f => {
     const event = { hook_event_name: "Stop", session_id: "claude-id", prompt_id: "p1", last_assistant_message: "first answer" };
     handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", event);
     const session = readFileSync(f.sessionFile, "utf8");
@@ -258,6 +242,11 @@ fs.readFileSync = (path, ...args) => {
     assert.equal(readFileSync(`${f.resultFile}.latest`, "utf8"), latest);
     handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", { ...event, prompt_id: "p2", last_assistant_message: "next answer" });
     assert.equal(JSON.parse(readFileSync(`${f.resultFile}.latest`, "utf8")).summary, "next answer");
+    handleCliEvent("claude", f.sessionFile, f.resultFile, "interactive", {
+      hook_event_name: "StopFailure", session_id: "claude-id", prompt_id: "p2", error_details: "Provider unavailable" });
+    const result = JSON.parse(readFileSync(f.resultFile, "utf8"));
+    assert.equal(result.exitCode, 1);
+    assert.equal(result.summary, "Claude Code error: Provider unavailable");
   }));
 
   it("runs the executable hook through a symbolic link", () => fixture("claude", f => {
@@ -291,13 +280,20 @@ fs.readFileSync = (path, ...args) => {
 
   it("retains the latest answer and pending work after an interrupted exit", () => fixture("codex", f => {
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["first", "queued"]));
-    writeFileSync(`${f.resultFile}.latest`, JSON.stringify({ summary: "first answer", completedInputs: ["first"], nativeId: "native" }));
+    handleCliEvent("codex", f.sessionFile, f.resultFile, "auto", {
+      type: "agent-turn-complete", "thread-id": "native", "turn-id": "1",
+      "input-messages": ["first"], "last-assistant-message": "first answer" });
+    assert.equal(existsSync(f.resultFile), false);
     const result = readCliExitResult(f.resultFile, 1, "Pane closed");
     assert.equal(result.exitCode, 1);
     assert.equal(result.nativeId, "native");
     assert.match(result.summary, /first answer/);
     assert.match(result.summary, /Pane closed/);
     assert.match(result.summary, /1 submitted prompt.*pending/);
+    handleCliEvent("exit", f.sessionFile, f.resultFile, "0", {});
+    const exited = JSON.parse(readFileSync(f.resultFile, "utf8"));
+    assert.equal(exited.exitCode, 1);
+    assert.match(exited.summary, /1 submitted prompt.*pending/);
   }));
   it("reports executable hook errors without replacing a canonical result", () => fixture("claude", f => {
     writeFileSync(f.resultFile, JSON.stringify({ summary: "finished", exitCode: 0 }));
@@ -306,14 +302,12 @@ fs.readFileSync = (path, ...args) => {
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "finished");
     assert.ok(JSON.parse(readFileSync(`${f.resultFile}.hook-error`, "utf8")).errorMessage);
   }));
-  it("rejects valid JSON metadata with an unsupported CLI kind", () => fixture("codex", f => {
-    writeFileSync(`${f.sessionFile}.cli.json`, JSON.stringify({ ...f.session, kind: "codexx" }));
-    assert.throws(() => readExternalSession(f.sessionFile), /Unsupported or invalid native CLI session metadata/);
-  }));
-  it("distinguishes missing metadata from damaged metadata", () => fixture("codex", f => {
+  it("distinguishes missing, damaged, and unsupported CLI metadata", () => fixture("codex", f => {
     assert.equal(readExternalSession(join(f.dir, "missing")), null);
     writeFileSync(`${f.sessionFile}.cli.json`, "invalid JSON");
     assert.throws(() => readExternalSession(f.sessionFile), /cli.json/);
+    writeFileSync(`${f.sessionFile}.cli.json`, JSON.stringify({ ...f.session, kind: "codexx" }));
+    assert.throws(() => readExternalSession(f.sessionFile), /Unsupported or invalid native CLI session metadata/);
   }));
 
   it("captures the exact Codex thread and response without searching concurrent rollouts", () => fixture("codex", f => {
@@ -337,7 +331,7 @@ fs.readFileSync = (path, ...args) => {
     assert.equal(readExternalSession(f.sessionFile)?.nativeId, "main-thread");
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "Actual work completed");
   }));
-  it("captures native interactive turns on the bound Codex thread", () => fixture("codex", f => {
+  it("captures native interactive turns on the bound Codex thread and returns the latest turn on exit", () => fixture("codex", f => {
     writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["Initial task"]));
     handleCliEvent("codex", f.sessionFile, f.resultFile, "interactive", {
       type: "agent-turn-complete", "thread-id": "main-thread", "turn-id": "1",
@@ -348,8 +342,14 @@ fs.readFileSync = (path, ...args) => {
     handleCliEvent("codex", f.sessionFile, f.resultFile, "interactive", {
       type: "agent-turn-complete", "thread-id": "main-thread", "turn-id": "2",
       "input-messages": ["Typed directly into the native CLI"], "last-assistant-message": "Latest response" });
+    assert.equal(JSON.parse(readFileSync(`${f.resultFile}.latest`, "utf8")).summary, "Latest response");
+    assert.equal(existsSync(f.resultFile), false);
+    for (const n of [1, 2]) handleCliEvent("codex", f.sessionFile, f.resultFile, "interactive", {
+      type: "agent-turn-complete", "thread-id": "main-thread", "turn-id": `turn-${n}`,
+      "last-assistant-message": `answer-${n}` });
+    assert.equal(existsSync(f.resultFile), false);
     handleCliEvent("exit", f.sessionFile, f.resultFile, "0", {});
-    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "Latest response");
+    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "answer-2");
   }));
   for (const history of ["turn-local", "cumulative", "local then cumulative", "cumulative then local"] as const) {
     it(`acknowledges identical Codex follow-ups with ${history} callbacks exactly once`, () => fixture("codex", f => {
@@ -447,27 +447,10 @@ fs.readFileSync = (path, ...args) => {
     stop("third");
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "third");
   }));
-  it("does not report a successful native exit with queued prompts still outstanding", () => fixture("codex", f => {
-    writeFileSync(`${f.resultFile}.inputs.json`, JSON.stringify(["initial", "queued"]));
-    handleCliEvent("codex", f.sessionFile, f.resultFile, "auto", {
-      type: "agent-turn-complete", "thread-id": "main", "turn-id": "1",
-      "input-messages": ["initial"], "last-assistant-message": "first done" });
-    handleCliEvent("exit", f.sessionFile, f.resultFile, "0", {});
-    const result = JSON.parse(readFileSync(f.resultFile, "utf8"));
-    assert.equal(result.exitCode, 1);
-    assert.match(result.summary, /1 submitted prompt.*pending/);
-  }));
   it("completes Claude resumed and steered turns without counting human messages", () => fixture("claude", f => {
     handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "Stop", session_id: "claude-id", stop_hook_active: true, last_assistant_message: "follow-up done" });
     assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "follow-up done");
     assert.equal(readFileSync(f.sessionFile, "utf8").trim().split("\n").length, 2);
-  }));
-  it("keeps interactive sessions open and returns the latest turn on exit", () => fixture("codex", f => {
-    for (const n of [1, 2]) handleCliEvent("codex", f.sessionFile, f.resultFile, "interactive", {
-      type: "agent-turn-complete", "thread-id": "thread-a", "turn-id": `turn-${n}`, "last-assistant-message": `answer-${n}` });
-    assert.equal(existsSync(f.resultFile), false);
-    handleCliEvent("exit", f.sessionFile, f.resultFile, "0", {});
-    assert.equal(JSON.parse(readFileSync(f.resultFile, "utf8")).summary, "answer-2");
   }));
   it("reports Claude API failure as failure and ignores foreign sessions", () => fixture("claude", f => {
     handleCliEvent("claude", f.sessionFile, f.resultFile, "auto", { hook_event_name: "Stop", session_id: "foreign", last_assistant_message: "wrong" });
@@ -523,7 +506,7 @@ describe("native CLI command construction", () => {
     assert.equal(prepareExternalPrompt("claude", text), text);
   });
   for (const kind of ["codex", "claude"] as const) {
-    it(`${kind}: opens a saved conversation without a prompt`, () => fixture(kind, f => {
+    it(`${kind}: opens a saved conversation without a prompt, then resumes with literal multiline prompt data`, () => fixture(kind, f => {
       const bin = join(f.dir, "fake-cli");
       const argsFile = join(f.dir, "focus-args.json");
       writeFileSync(bin, `#!${process.execPath}\nrequire('fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)))\n`, { mode: 0o700 });
@@ -542,35 +525,28 @@ describe("native CLI command construction", () => {
         assert.ok(args.includes("original-conversation"));
         assert.ok(!args.includes(""), "no empty prompt argument");
         assert.doesNotMatch(command, /\$\(cat/);
-      } finally {
-        if (previous === undefined) delete process.env[key]; else process.env[key] = previous;
-      }
-    }));
-    it(`${kind}: executes literal multiline prompt data and resumes the saved ID`, () => fixture(kind, f => {
-      const bin = join(f.dir, "fake-cli");
-      const argsFile = join(f.dir, "args.json");
-      writeFileSync(bin, `#!${process.execPath}\nrequire('fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)))\n`, { mode: 0o700 });
-      const key = kind === "codex" ? "PI_CODEX_BIN" : "PI_CLAUDE_BIN";
-      const old = process.env[key]; process.env[key] = bin;
-      try {
+
         const prompt = 'resume\n"single\'quote" $(touch SHOULD_NOT_EXIST) `touch SHOULD_NOT_EXIST`';
         const taskFile = join(f.dir, "task.md"); writeFileSync(taskFile, prompt);
         f.session.nativeId = "native-id";
-        const command = prepareExternalLaunch({ session: f.session, sessionFile: f.sessionFile,
+        f.session.autoExit = true;
+        const resumedCommand = prepareExternalLaunch({ session: f.session, sessionFile: f.sessionFile,
           resultFile: f.resultFile, taskFile, hookFile: join(f.dir, "absent-hook"),
           settingsFile: join(f.dir, "settings.json"), resume: true });
-        execFileSync("bash", ["-c", command], { stdio: "ignore" });
-        const args = JSON.parse(readFileSync(argsFile, "utf8"));
-        assert.equal(args.at(-1), prompt);
-        assert.ok(args.includes("native-id"));
+        execFileSync("bash", ["-c", resumedCommand], { stdio: "ignore" });
+        const resumedArgs = JSON.parse(readFileSync(argsFile, "utf8"));
+        assert.equal(resumedArgs.at(-1), prompt);
+        assert.ok(resumedArgs.includes("native-id"));
         assert.equal(existsSync(join(f.dir, "SHOULD_NOT_EXIST")), false);
-        if (kind === "codex") { assert.equal(args[0], "resume"); assert.ok(!args.includes("exec")); }
+        if (kind === "codex") { assert.equal(resumedArgs[0], "resume"); assert.ok(!resumedArgs.includes("exec")); }
         else {
-          assert.ok(!args.includes("--model"), "cc-switch controls the default model");
+          assert.ok(!resumedArgs.includes("--model"), "cc-switch controls the default model");
           const settings = JSON.parse(readFileSync(join(f.dir, "settings.json"), "utf8"));
           assert.equal(settings.env, undefined, "hook settings must not replace cc-switch credentials or model aliases");
         }
-      } finally { if (old === undefined) delete process.env[key]; else process.env[key] = old; }
+      } finally {
+        if (previous === undefined) delete process.env[key]; else process.env[key] = previous;
+      }
     }));
   }
 });

@@ -26,7 +26,13 @@ function surfaceFixture() {
 }
 
 it('reserves a workflow launch before await so manual and concurrent launches cannot alias it', async () => {
-  const { surface } = surfaceFixture();
+  const { surface, closed } = surfaceFixture();
+  const manual = 'review-manual-exact';
+  assert.equal(__test__.reserveRunningName(manual, new Set(), true), manual);
+  try {
+    assert.throws(() => __test__.reserveRunningName(manual, new Set(), true), /already in use/);
+    assert.throws(() => __test__.reserveRunningName('persisted-name', new Set(['persisted-name']), true), /already in use/);
+  } finally { __test__.reservedNames.delete(manual); }
   const gate = deferred<void>();
   const launch = surface.launch;
   surface.launch = async (params: any) => { await gate.promise; return launch(params); };
@@ -46,27 +52,17 @@ it('reserves a workflow launch before await so manual and concurrent launches ca
   await handle.completion;
   assert.equal(surface.reservedNames.has(name), false, 'the durable name registry replaces the pending claim');
   assert.ok(service.takenNames().has(name));
-});
+  let launches = 0;
+  surface.launch = async () => { launches++; throw new Error('launch cancelled'); };
+  await assert.rejects(service.spawn({ agentType: 'worker', name, task: 'duplicate registered session' }), /already in use/);
+  assert.equal(launches, 0, 'a persisted name is rejected before opening a child');
 
-it('manual explicit launches reserve before await and reject duplicate persisted names', () => {
-  const name = 'review-manual-exact';
-  assert.equal(__test__.reserveRunningName(name, new Set(), true), name);
-  try {
-    assert.throws(() => __test__.reserveRunningName(name, new Set(), true), /already in use/);
-    assert.throws(() => __test__.reserveRunningName('persisted-name', new Set(['persisted-name']), true), /already in use/);
-  } finally { __test__.reservedNames.delete(name); }
-});
-
-it('a failed pending workflow launch releases its name without closing another surface', async () => {
-  const { surface, closed } = surfaceFixture();
-  const name = 'review-failed-reservation';
-  surface.launch = async () => { throw new Error('launch cancelled'); };
-  const service = createWorkflowSubagentService(surface);
-  await assert.rejects(service.spawn({ agentType: 'worker', name, task: 'test' }), /launch cancelled/);
-  assert.equal(surface.reservedNames.has(name), false);
-  assert.equal(service.takenNames().has(name), false);
-  assert.equal(__test__.uniqueRunningName(name, new Set()), name);
-  assert.deepEqual(closed, []);
+  const failed = 'review-failed-reservation';
+  await assert.rejects(service.spawn({ agentType: 'worker', name: failed, task: 'test' }), /launch cancelled/);
+  assert.equal(surface.reservedNames.has(failed), false);
+  assert.equal(service.takenNames().has(failed), false);
+  assert.equal(__test__.uniqueRunningName(failed, new Set()), failed);
+  assert.deepEqual(closed, [], 'a failed pending launch cannot close another surface');
 });
 
 for (const fault of ['registry', 'watcher']) {
@@ -91,12 +87,3 @@ for (const fault of ['registry', 'watcher']) {
     assert.equal(existsSync(scratch), false, 'failed setup must release its private verification scratch');
   });
 }
-
-it('rejects an already registered name before opening a child', async () => {
-  const { surface, names } = surfaceFixture();
-  names['review-existing'] = { sessionFile: '/existing.jsonl' };
-  let launches = 0;
-  surface.launch = async () => { launches++; throw new Error('must not launch'); };
-  await assert.rejects(createWorkflowSubagentService(surface).spawn({ agentType: 'worker', name: 'review-existing', task: 'test' }), /already in use/);
-  assert.equal(launches, 0);
-});

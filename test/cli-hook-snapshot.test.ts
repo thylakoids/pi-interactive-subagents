@@ -106,6 +106,17 @@ test('a Stop keeps its verified snapshot when a later turn flushes while acquiri
   mkdirSync(`${f.resultFile}.lock`);
   const observer = join(f.dir, 'observer.mjs');
   writeFileSync(observer, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const mkdir = fs.mkdirSync; let observedLock = false;
+fs.mkdirSync = (path, ...args) => {
+  try { return mkdir(path, ...args); }
+  catch (error) {
+    if (!observedLock && path === ${JSON.stringify(f.resultFile + '.lock')} && error.code === 'EEXIST') {
+      observedLock = true;
+      process.stdout.write('lock-wait' + String.fromCharCode(10));
+    }
+    throw error;
+  }
+};
 const original = fs.readFileSync;
 fs.readFileSync = (path, ...args) => {
   const value = original(path, ...args);
@@ -120,8 +131,9 @@ fs.readFileSync = (path, ...args) => {
   child.stderr.on('data', chunk => { stderr += chunk; });
   child.stdout.on('data', chunk => {
     stdout += chunk;
-    if (released) return;
+    if (released || !stdout.includes('lock-wait')) return;
     released = true;
+    // Release only after the hook actually contends; observing the read alone can race lock acquisition.
     // Even an identical later answer must not extend the completed snapshot.
     appendFileSync(f.transcript, rows([user('later', 'later'), answer('a2', 'done')]));
     rmdirSync(`${f.resultFile}.lock`);
@@ -131,7 +143,7 @@ fs.readFileSync = (path, ...args) => {
   t.after(() => clearTimeout(timeout));
   child.stdin.end(JSON.stringify(f.event({ last_assistant_message: 'done' })));
   assert.equal(await exited, 0, stderr);
-  assert.equal(stdout.trim(), 'read', 'flush verification and acknowledgement must share one transcript read');
+  assert.equal(stdout.trim(), ['read', 'lock-wait'].join(String.fromCharCode(10)), 'flush verification and acknowledgement must share one transcript read');
   assert.deepEqual(f.json('.latest').completedInputs, ['first']);
   assert.deepEqual(f.json('.claude-seen.json'), ['first']);
   assert.equal(existsSync(f.resultFile), false);
@@ -166,8 +178,11 @@ syncBuiltinESMExports();`);
   assert.equal(f.json().summary, 'done');
 });
 
-test('a sidechain assistant cannot acknowledge the next main-thread input', t => {
+test('complete malformed records stay strict after the bounded turn and sidechains cannot acknowledge the next input on recovery', t => {
   const f = fixture(t);
+  writeFileSync(f.transcript, rows([user('first', 'first'), answer('a1', 'first done')]) + 'invalid JSON\n');
+  assert.throws(() => f.send({ last_assistant_message: 'first done' }), SyntaxError);
+  assert.equal(existsSync(`${f.resultFile}.latest`), false);
   writeFileSync(f.transcript, rows([
     user('first', 'first'), answer('a1', 'first done'), user('later', 'later'),
     { ...answer('child', 'child done'), isSidechain: true },
@@ -175,11 +190,4 @@ test('a sidechain assistant cannot acknowledge the next main-thread input', t =>
   f.send({ prompt_id: undefined, last_assistant_message: 'first done' });
   assert.deepEqual(f.json('.latest').completedInputs, ['first']);
   assert.equal(existsSync(f.resultFile), false);
-});
-
-test('complete malformed records stay strict even after the bounded completed turn', t => {
-  const f = fixture(t);
-  writeFileSync(f.transcript, rows([user('first', 'first'), answer('a1', 'first done')]) + 'invalid JSON\n');
-  assert.throws(() => f.send({ last_assistant_message: 'first done' }), SyntaxError);
-  assert.equal(existsSync(`${f.resultFile}.latest`), false);
 });

@@ -230,59 +230,36 @@ describe("session.ts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  describe("getLeafId", () => {
-    it("returns null when only the session header exists", () => {
-      assert.equal(getLeafId(createSessionFile(dir, [SESSION_HEADER])), null);
-    });
-    it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
-      assert.equal(getLeafId(file), "asst-001");
-    });
-
-    it("returns null for empty file", () => {
-      const file = join(dir, "empty.jsonl");
+  describe("session lookup", () => {
+    it("tracks empty, header-only, populated, and headerless session files", () => {
+      const file = join(dir, "test-session.jsonl");
       writeFileSync(file, "");
-      assert.equal(getLeafId(file), null);
+      assert.equal(getLeafId(file), null, "empty session has no leaf");
+      createSessionFile(dir, [SESSION_HEADER]);
+      assert.equal(getLeafId(file), null, "header alone has no leaf");
+      createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      assert.equal(getLeafId(file), "asst-001", "last entry is the leaf");
+      createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
+      assert.equal(getSessionId(file), "sess-001", "header provides the session id");
+      createSessionFile(dir, [USER_MSG]);
+      assert.equal(getSessionId(file), null, "a message cannot supply a session header");
     });
   });
 
   describe("getNewEntries", () => {
-    it("returns entries after a given line", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+    it("counts and yields appended entries, ignoring blank lines and missing files", () => {
+      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
+      assert.deepEqual([...getNewEntries(file, 2)], [], "unchanged session has no new entries");
+      createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
       const entries = [...getNewEntries(file, 2)];
-      assert.equal(entries.length, 2);
+      assert.equal(entries.length, 2, "only appended messages are yielded");
       assert.equal(entries[0].id, "user-001");
       assert.equal(entries[1].id, "asst-001");
-    });
-
-    it("yields no entries when the session is unchanged", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE]);
-      const entries = [...getNewEntries(file, 2)];
-      assert.equal(entries.length, 0);
-    });
-
-    it("countSessionEntryLines matches the number of yielded entries without parsing", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
       assert.equal(countSessionEntryLines(file), [...getNewEntries(file, 0)].length);
-      assert.equal(countSessionEntryLines(file), 4);
-    });
-
-    it("countSessionEntryLines ignores blank lines and returns 0 for missing files", () => {
-      const file = join(dir, "blanks.jsonl");
+      assert.equal(countSessionEntryLines(file), 4, "header and all entries count");
       writeFileSync(file, JSON.stringify({ type: "session", id: "x" }) + "\n\n\n");
-      assert.equal(countSessionEntryLines(file), 1);
-      assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0);
-    });
-  });
-
-  describe("getSessionId", () => {
-    it("reads the header id from a session file", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG]);
-      assert.equal(getSessionId(file), "sess-001");
-    });
-    it("returns null for a file without a session header", () => {
-      const file = createSessionFile(dir, [USER_MSG]);
-      assert.equal(getSessionId(file), null);
+      assert.equal(countSessionEntryLines(file), 1, "blank lines do not count");
+      assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0, "missing session counts as empty");
     });
   });
 
@@ -300,57 +277,34 @@ describe("session.ts", () => {
       agentDir: "/home/u/.pi/agent",
     };
 
-    it("writes the sidecar next to the session file", () => {
-      const sf = join(dir, "s1.jsonl");
+    it("persists the full loadout beside the session and tolerates absent/corrupt sidecars", () => {
+      const sf = join(dir, "loadout.jsonl");
+      assert.equal(readSubagentLoadout(sf), null, "absent sidecar has no loadout");
       writeSubagentLoadout(sf, sample);
       assert.equal(loadoutSidecarPath(sf), sf + ".loadout.json");
       assert.ok(existsSync(sf + ".loadout.json"));
-    });
-
-    it("round-trips the full loadout", () => {
-      const sf = join(dir, "s2.jsonl");
-      writeSubagentLoadout(sf, sample);
-      assert.deepEqual(readSubagentLoadout(sf), sample);
-    });
-
-    it("returns null when the sidecar is absent", () => {
-      assert.equal(readSubagentLoadout(join(dir, "missing.jsonl")), null);
-    });
-
-    it("returns null when the sidecar is corrupt", () => {
-      const sf = join(dir, "s3.jsonl");
+      assert.deepEqual(readSubagentLoadout(sf), sample, "all loadout fields round-trip");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
-      assert.equal(readSubagentLoadout(sf), null);
+      assert.equal(readSubagentLoadout(sf), null, "corrupt sidecar has no loadout");
     });
   });
 
   describe("subagent name registry", () => {
-    it("registers and resolves a name to its session file", () => {
-      const adir = join(dir, "art-1");
+    it("creates, accumulates, overwrites, and tolerates corruption in one name registry", () => {
+      const adir = join(dir, "registry");
+      assert.equal(resolveNameInRegistry(adir, "nope"), null, "unknown name in absent registry");
+      assert.deepEqual(readNameRegistry(adir), {}, "missing registry is empty");
       registerName(adir, "worker", { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
-      const entry = resolveNameInRegistry(adir, "worker");
-      assert.deepEqual(entry, { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
+      assert.deepEqual(resolveNameInRegistry(adir, "worker"), { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
       assert.ok(existsSync(nameRegistryPath(adir)));
-    });
-
-    it("accumulates multiple names and overwrites on re-register", () => {
-      const adir = join(dir, "art-2");
       registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
       registerName(adir, "scout-2", { sessionFile: "/s/scout2.jsonl", sessionId: "id-scout2" });
-      const reg = readNameRegistry(adir);
-      assert.deepEqual(Object.keys(reg).sort(), ["scout", "scout-2"]);
-      // Overwrite scout with a new session file.
+      assert.deepEqual(Object.keys(readNameRegistry(adir)).sort(), ["scout", "scout-2", "worker"]);
+      assert.equal(resolveNameInRegistry(adir, "nope"), null, "unknown name in populated registry");
       registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
       assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
-    });
-
-    it("returns null for unknown names and {} for a missing/corrupt registry", () => {
-      const adir = join(dir, "art-3");
-      assert.equal(resolveNameInRegistry(adir, "nope"), null);
-      assert.deepEqual(readNameRegistry(adir), {});
-      mkdirSync(adir, { recursive: true });
       writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
-      assert.deepEqual(readNameRegistry(adir), {});
+      assert.deepEqual(readNameRegistry(adir), {}, "corrupt registry is empty");
     });
   });
 
@@ -358,12 +312,6 @@ describe("session.ts", () => {
     const findLastAssistantMessage = (entries: any[]) => summarizeSession(createSessionFile(dir, entries)).summary;
     it("finds last assistant text", () => {
       const entries = [USER_MSG, ASSISTANT_MSG, ASSISTANT_MSG_2] as any[];
-      const text = findLastAssistantMessage(entries);
-      assert.equal(text, "Updated plan with details.");
-    });
-
-    it("skips thinking blocks, gets text only", () => {
-      const entries = [ASSISTANT_MSG_2] as any[];
       const text = findLastAssistantMessage(entries);
       assert.equal(text, "Updated plan with details.");
     });
@@ -584,30 +532,32 @@ describe("status.ts", () => {
     });
   });
 
-  it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
-
-    assert.deepEqual(config, {
-      enabled: true,
-      lineLimit: 4,
-    });
-  });
-
-  it("loads the shared example when local config is absent", () => {
+  it("validates config file precedence from absent through valid and corrupt files", () => {
+    const sharedExample = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    assert.deepEqual(loadStatusConfig(sharedExample), { enabled: true, lineLimit: 4 });
     withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
       const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
+      const valid = JSON.stringify({ status: { enabled: true } }, null, 2) + "\n";
+      assert.throws(
+        () => loadStatusConfig(configPath, examplePath),
+        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
+        "both config paths are absent",
       );
-
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
-
-      assert.deepEqual(config, {
-        enabled: true,
-        lineLimit: 4,
-      });
+      writeFileSync(examplePath, "{\n");
+      assert.throws(
+        () => loadStatusConfig(configPath, examplePath),
+        /Invalid JSON in subagent config .*config\.json\.example/,
+        "invalid fallback reports the example path",
+      );
+      writeFileSync(examplePath, valid);
+      assert.deepEqual(loadStatusConfig(configPath, examplePath), { enabled: true, lineLimit: 4 });
+      writeFileSync(configPath, "{\n");
+      assert.throws(
+        () => loadStatusConfig(configPath, examplePath),
+        /Invalid JSON in subagent config .*config\.json/,
+        "invalid local config must not fall back to the valid example",
+      );
     });
   });
 
@@ -620,44 +570,6 @@ describe("status.ts", () => {
       () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
     );
-  });
-
-  it("reports when neither local nor shared config exists", () => {
-    withTempDir((dir) => {
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
-        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
-      );
-    });
-  });
-
-  it("reports invalid JSON from the shared example path", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, "{\n");
-
-      assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
-        /Invalid JSON in subagent config .*config\.json\.example/,
-      );
-    });
-  });
-
-  it("fails on invalid local config instead of falling back to the shared example", () => {
-    withTempDir((dir) => {
-      const configPath = join(dir, "config.json");
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(configPath, "{\n");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
-        /Invalid JSON in subagent config .*config\.json/,
-      );
-    });
   });
 
   it("keeps a missing snapshot as starting until the fixed watchdog threshold", () => {
@@ -975,66 +887,43 @@ describe("status.ts", () => {
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  it("loads session-mode from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "lineage-mode-test-agent",
-        [
-          "name: lineage-mode-test-agent",
-          "model: anthropic/test-lineage",
-          "session-mode: lineage-only",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, "lineage-only");
+  it("loads session and system-prompt modes from frontmatter", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      for (const [value, expected] of [
+        ["lineage-only", "lineage-only"], ["sideways", undefined],
+      ] as const) {
+        writeAgentFile(projectAgentsDir, "mode-test-agent", `model: anthropic/test-lineage\nsession-mode: ${value}`);
+        const loaded = testApi.loadAgentDefaults("mode-test-agent");
+        assert.ok(loaded, `expected agent with session-mode ${value} to load`);
+        assert.equal(loaded.sessionMode, expected, `session-mode: ${value}`);
+      }
+      for (const [value, expected, body] of [
+        ["replace", "replace", "You are a specialized agent."],
+        ["append", "append", "You are an appended identity."],
+        [undefined, undefined, "You are a default agent."],
+        ["foobar", undefined, "Body here."],
+        ["replace", "replace", ""],
+      ] as const) {
+        writeAgentFile(projectAgentsDir, "mode-test-agent",
+          `model: anthropic/test-lineage${value ? `\nsystem-prompt: ${value}` : ""}`, body);
+        const loaded = testApi.loadAgentDefaults("mode-test-agent");
+        assert.ok(loaded, `expected system-prompt ${value ?? "unset"} agent to load`);
+        assert.equal(loaded.systemPromptMode, expected, `system-prompt: ${value ?? "unset"}`);
+        assert.equal(loaded.body, body || undefined, `body with system-prompt ${value ?? "unset"}`);
+      }
     });
   });
 
   it("loads explicit interactive flag from frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-true-test-agent",
-        [
-          "name: interactive-true-test-agent",
-          "model: anthropic/test-interactive-true",
-          "interactive: true",
-        ].join("\n"),
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-false-test-agent",
-        [
-          "name: interactive-false-test-agent",
-          "model: anthropic/test-interactive-false",
-          "interactive: false",
-        ].join("\n"),
-      );
-
-      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
-      assert.equal(loadedTrue?.interactive, true);
-
-      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
-      assert.equal(loadedFalse?.interactive, false);
-    });
-  });
-
-  it("leaves interactive undefined when not set in frontmatter", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "interactive-unset-test-agent",
-        [
-          "name: interactive-unset-test-agent",
-          "model: anthropic/test-interactive-unset",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
-      assert.equal(loaded?.interactive, undefined);
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      for (const value of ["true", "false", undefined]) {
+        writeAgentFile(projectAgentsDir, "interactive-test-agent",
+          `model: anthropic/test-interactive${value ? `\ninteractive: ${value}` : ""}`);
+        const loaded = testApi.loadAgentDefaults("interactive-test-agent");
+        assert.ok(loaded, `expected interactive ${value ?? "unset"} agent to load`);
+        assert.equal(loaded.interactive, value === undefined ? undefined : value === "true",
+          `interactive: ${value ?? "unset"}`);
+      }
     });
   });
 
@@ -1129,36 +1018,6 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("ignores invalid session-mode values", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-      writeAgentFile(
-        projectAgentsDir,
-        "invalid-mode-test-agent",
-        [
-          "name: invalid-mode-test-agent",
-          "model: anthropic/test-invalid",
-          "session-mode: sideways",
-        ].join("\n"),
-      );
-
-      const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
-      assert.ok(loaded, "expected agent to load");
-      assert.equal(loaded.sessionMode, undefined);
-    });
-  });
-
-  it("resolves session mode from frontmatter (standalone default)", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
-    assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
-      "lineage-only",
-    );
-    assert.equal(
-      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "fork" }),
-      "fork",
-    );
-  });
-
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
     assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
       sessionMode: "standalone",
@@ -1186,16 +1045,13 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
+  it("buildSubagentToolAllowlist adds child control tools only to explicit restrictions", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
       "read,bash,web_search,ask_question",
     );
-  });
-
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null, "absent restriction stays unrestricted");
+    assert.equal(testApi.buildSubagentToolAllowlist(""), null, "empty restriction stays unrestricted");
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1232,6 +1088,25 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+      for (const mode of ["replace", "append", null] as const) {
+        for (const identity of ["You are X.", null]) {
+          const identityParts: string[] = [];
+          testApi.applySandboxToParts(identityParts, {
+            agent: null, toolAllowlist: null, model: null, thinking: null,
+            systemPromptMode: mode, identity, spawnable: null, autoExit: false,
+            cwd: null, agentDir: null,
+          }, { artifactDir: d, name: "identity" });
+          const label = `mode=${mode ?? "unset"}, identity=${identity ?? "absent"}`;
+          if (identity) {
+            assert.equal(identityParts[0], mode === "replace" ? "--system-prompt" : "--append-system-prompt", label);
+            assert.equal(identityParts.length, 2, `only identity flag and path: ${label}`);
+            const promptPath = identityParts[1].slice(1, -1);
+            assert.equal(readFileSync(promptPath, "utf8"), identity, `persisted identity: ${label}`);
+          } else {
+            assert.deepEqual(identityParts, [], `no prompt flag without identity: ${label}`);
+          }
+        }
+      }
     });
   });
 
@@ -1258,24 +1133,20 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
+  it("buildPiPromptArgs separates artifact-backed skills while preserving direct and skill-free launches", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
       ["", "/skill:review", "/skill:lint", "@artifact.md"],
     );
-  });
-
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
       ["@artifact.md"],
+      "artifact launch without skills needs no separator",
     );
-  });
-
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["/skill:review", "do the task"],
+      "direct launch with skills needs no separator",
     );
   });
 
@@ -1799,14 +1670,6 @@ describe("tool registration", () => {
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
-
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const names = registeredTools.map((tool) => tool.name);
-    assert.equal(names.includes("subagent_interrupt"), false);
-    assert.equal(names.includes("subagent_resume"), false);
-  });
 });
 
 describe("subagent activity snapshots", () => {
@@ -2269,7 +2132,7 @@ describe("subagent status renderer", () => {
     };
   }
 
-  it("renders only capped lines plus overflow", () => {
+  it("renders capped lines and overflow within wide and narrow widths", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2301,16 +2164,7 @@ describe("subagent status renderer", () => {
       assert.match(output, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
     assert.match(output, /\+2 more running\./);
-  });
-
-  it("stays within narrow widths", () => {
-    const { api, registeredMessageRenderers } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-
-    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_status");
-    assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
-
-    const rendered = rendererEntry.renderer(
+    const narrowRendered = rendererEntry.renderer(
       {
         customType: "subagent_status",
         content: "Subagent status:\n• Worker running 5m, active (bash 2m).",
@@ -2321,7 +2175,7 @@ describe("subagent status renderer", () => {
     );
 
     for (const width of [4, 5, 6]) {
-      for (const line of rendered.render(width)) {
+      for (const line of narrowRendered.render(width)) {
         assert.ok(
           visibleWidth(line) <= width,
           `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
@@ -2332,33 +2186,18 @@ describe("subagent status renderer", () => {
 });
 
 describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
+  it("uses the default startup delay until the environment overrides it", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
     const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
     try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
+      delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      assert.equal(testApi.getShellReadyDelayMs(), 500, "unset delay defaults to 500ms");
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+      assert.equal(testApi.getShellReadyDelayMs(), 2500, "explicit delay overrides the default");
     } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+      restoreEnvVar("PI_SUBAGENT_SHELL_READY_DELAY_MS", original);
     }
   });
 });
@@ -2470,13 +2309,10 @@ describe("subagent display helpers", () => {
   });
 
   describe("formatContextUsage", () => {
-    it("shows a percent gauge when the window is known", () => {
+    it("shows known window percentages and falls back to context tokens for unknown windows", () => {
       assert.equal(testApi.formatContextUsage(36_000, 200_000), "18.0%/200k");
       assert.equal(testApi.formatContextUsage(500_000, 1_000_000), "50.0%/1.0M");
-    });
-
-    it("falls back to a window-less ctx label when unknown", () => {
-      assert.equal(testApi.formatContextUsage(37_000, undefined), "37k ctx");
+      assert.equal(testApi.formatContextUsage(37_000, undefined), "37k ctx", "unknown window falls back to context tokens");
     });
   });
 
@@ -2493,9 +2329,6 @@ describe("subagent display helpers", () => {
         cost: 0.042,
       });
       assert.deepEqual(segs, ["↑3.2k", "↓890", "R45k", "$0.042"]);
-    });
-
-    it("returns an empty list when there is no usage", () => {
       assert.deepEqual(
         testApi.formatUsageSegments({
           model: null,

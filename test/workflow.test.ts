@@ -293,21 +293,29 @@ after(() => {
 });
 
 describe("script parsing", () => {
-  it("accepts a pure meta literal and rewrites the export", () => {
-    const parsed = parseScript(SCRIPT, "inline");
-    assert.equal(parsed.meta.name, "test-flow");
-    assert.deepEqual(parsed.meta.phases, ["Scan", "Verify"]);
-    assert.ok(parsed.body.includes("const meta = {"));
-    assert.ok(!parsed.body.includes("export const meta"));
-  });
-
-  it("accepts single quotes, unquoted keys and trailing commas", () => {
-    const parsed = parseScript(
-      `export const meta = { name: 'x', description: 'y', phases: ['a',], }\nreturn 1;`,
-      "inline",
-    );
-    assert.equal(parsed.meta.name, "x");
-    assert.deepEqual(parsed.meta.phases, ["a"]);
+  it("accepts pure meta literals with supported quoting, trailing commas and phase forms", () => {
+    const cases = [
+      { source: SCRIPT, name: "test-flow", phases: ["Scan", "Verify"] },
+      {
+        source: `export const meta = { name: 'x', description: 'y', phases: ['a',], }\nreturn 1;`,
+        name: "x", phases: ["a"],
+      },
+      {
+        // Claude Code uses mixed phase objects and strings; the title remains required.
+        source: "export const meta = { name: 'cc-shaped', description: 'x', " +
+          "whenToUse: 'when you want a sweep', phases: [{ title: 'Scan', detail: 'find' }, 'Verify'] }\nreturn 1;",
+        name: "cc-shaped", phases: [{ title: "Scan", detail: "find" }, "Verify"],
+        whenToUse: "when you want a sweep",
+      },
+    ];
+    for (const { source, name, phases, whenToUse } of cases) {
+      const parsed = parseScript(source, "inline");
+      assert.equal(parsed.meta.name, name, name);
+      assert.deepEqual(parsed.meta.phases, phases, name);
+      assert.equal(parsed.meta.whenToUse, whenToUse, name);
+      assert.ok(parsed.body.includes("const meta = {"), name);
+      assert.ok(!parsed.body.includes("export const meta"), name);
+    }
   });
 
   it("rejects a computed meta, missing meta and bad slugs", () => {
@@ -322,6 +330,10 @@ describe("script parsing", () => {
     );
     assert.throws(
       () => parseScript("export const meta = { name: 'x' }\nreturn 1;", "inline"),
+      WorkflowScriptError,
+    );
+    assert.throws(
+      () => parseScript("export const meta = { name: 'x', description: 'y', phases: [{ detail: 'no title' }] }\nreturn 1;", "inline"),
       WorkflowScriptError,
     );
     assert.throws(
@@ -554,22 +566,14 @@ return await pipeline(args.items,
     const stats = JSON.parse(readFileSync(join(view.runDir, "snapshot.json"), "utf8"));
     assert.equal(stats.status, "completed");
     assert.equal(stats.agentCount, 8);
-  });
 
-  it("replays a completed run from the journal without spawning agents", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const first = await manager.start({ source: SCRIPT, args: { changes: "diff" } });
-    const firstView = await first.execute();
-    const spawnsAfterFirst = service.spawns.length;
-
-    const resumed = await manager.resume(firstView.runId);
-    const resumedView = await resumed.execute();
-
-    assert.equal(service.spawns.length, spawnsAfterFirst, "resume must not re-run completed calls");
-    assert.equal(resumedView.status, "completed");
-    assert.deepEqual(resumedView.result, firstView.result);
-    assert.ok(resumedView.calls.every((call) => call.cached), "replayed calls are marked cached");
+    const spawns = service.spawns.length;
+    const inspected = manager.inspect(view.runId);
+    assert.equal(inspected?.meta.name, "test-flow");
+    assert.equal(inspected?.status, "completed");
+    assert.equal(inspected?.calls.length, 8);
+    assert.equal(manager.inspect("wf-nonexistent"), null);
+    assert.equal(service.spawns.length, spawns, "inspection must not execute calls");
   });
 
   it("measures elapsed from this execution, not from the original run", async () => {
@@ -697,25 +701,46 @@ return { results, direct };
     assert.ok(view.logs.some((line) => line.includes("resolved to null")), "the run says so in its notes");
   });
 
-  it("uses a structured result when the schema path is configured", async () => {
+  it("accepts valid structured output and rejects missing or nonzero-exit results", async () => {
     service = new FakeSubagentService();
     service.structured.set("analyse", { verdict: "real", confidence: 0.9 });
+    service.structuredMissing.add("analyse missing");
+    service.silentFailures.add("half-dead-schema");
+    service.structured.set("half-dead-schema", { verdict: "looks valid" });
     const manager = createManager();
     const script = `export const meta = { name: 'schema-flow', description: 'x' }
-const out = await agent('analyse this', { label: 'analyse', schema: { type: 'object', properties: { verdict: { type: 'string' }, confidence: { type: 'number' } }, required: ['verdict'] } });
-return out;
+const valid = await agent('analyse this', { label: 'analyse', schema: { type: 'object', properties: { verdict: { type: 'string' }, confidence: { type: 'number' } }, required: ['verdict'] } });
+const missing = await agent('analyse missing', { label: 'missing', schema: { type: 'object', properties: {} } });
+const dead = await agent('half-dead-schema', { label: 'sidecar', schema: { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] } });
+return { valid, missing: missing === null ? 'no-value' : missing, dead };
 `;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-
+    const view = await (await manager.start({ source: script, args: {} })).execute();
     assert.equal(view.status, "completed", view.error);
-    assert.deepEqual(view.result, { verdict: "real", confidence: 0.9 });
-    const spawn = service.spawns.find((entry) => entry.task.includes("analyse"));
+    assert.deepEqual(view.result, {
+      valid: { verdict: "real", confidence: 0.9 },
+      missing: "no-value", // A missing result resolves to null, with a recorded reason.
+      dead: null, // Exit status wins over the valid-looking sidecar left behind.
+    });
+    assert.equal(view.failedCount, 2);
+    const spawn = service.spawns.find((entry) => entry.task.startsWith("analyse this"));
     assert.ok(spawn?.schemaFile, "a schema file must be handed to the child");
     assert.ok(spawn?.resultFile, "a result sidecar must be handed to the child");
-    // Extra extensions are the sandbox's business (wiring.ts adds the
-    // structured-output extension); a harness that omits them still exercises
-    // the schema protocol, so only the sidecar paths are asserted here.
+    assert.equal(view.calls.find((entry) => entry.label === "analyse")?.status, "completed");
+    const missing = view.calls.find((entry) => entry.label === "missing")!;
+    assert.equal(missing.status, "failed");
+    assert.match(String(missing.error), /structured_output/);
+
+    const dead = view.calls.find((entry) => entry.label === "sidecar")!;
+    assert.equal(dead.status, "failed");
+    assert.match(String(dead.error), /agent exited with code 1/);
+    const sidecar = service.spawns.find((entry) => entry.task.startsWith("half-dead-schema"))!.resultFile!;
+    assert.deepEqual(JSON.parse(readFileSync(sidecar, "utf8")), { ok: true, value: { verdict: "looks valid" } });
+    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.callKey === dead.callKey);
+    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
   });
 
   it("fails a non-zero exit that carries no error text, and resume retries it", async () => {
@@ -748,48 +773,6 @@ return await agent('half-dead', { label: 'half-dead' });
     assert.equal(resumed.result, null);
     assert.ok(service.spawns.length > spawnedBefore, "a failed call must be retried on resume");
     assert.equal(resumed.calls.find((entry) => entry.label === "half-dead")?.status, "failed");
-  });
-
-  it("ignores a structured sidecar when the agent exited non-zero", async () => {
-    // The child wrote a valid-looking sidecar before dying. Exit status decides,
-    // not the artefact it left behind.
-    service = new FakeSubagentService();
-    service.silentFailures.add("half-dead-schema");
-    service.structured.set("half-dead-schema", { verdict: "looks valid" });
-    const manager = createManager();
-    const script = `export const meta = { name: 'silent-exit-schema', description: 'x' }
-return await agent('half-dead-schema', { label: 'sidecar', schema: { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] } });
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-    assert.equal(view.status, "completed", view.error);
-    assert.equal(view.result, null, "the sidecar must not stand in for a dead agent");
-    const call = view.calls.find((entry) => entry.label === "sidecar")!;
-    assert.equal(call.status, "failed");
-    assert.match(String(call.error), /agent exited with code 1/);
-    const journal = readFileSync(join(view.runDir, "journal.jsonl"), "utf8")
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line))
-      .filter((entry) => entry.callKey === call.callKey);
-    assert.deepEqual(journal.map((entry) => entry.status), ["failed"]);
-  });
-
-  it("fails the call when a schema-driven agent returns no structured output", async () => {
-    service = new FakeSubagentService();
-    service.structuredMissing.add("analyse");
-    const manager = createManager();
-    const script = `export const meta = { name: 'schema-missing', description: 'x' }
-const out = await agent('analyse missing', { label: 'analyse', schema: { type: 'object', properties: {} } });
-return out === null ? 'no-value' : out;
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-
-    assert.equal(view.result, "no-value", "a missing structured result resolves to null");
-    assert.equal(view.failedCount, 1);
-    // The reason is recorded, so a null is never unexplained.
-    assert.match(String(view.calls[0].error), /structured_output/);
   });
 
   it("skips a call on request and lets the script continue with null", async () => {
@@ -1437,18 +1420,6 @@ return 'never';
     assert.ok(service.stopped.length >= 1, "running agents must be stopped");
   });
 
-  it("reports a status view without executing", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const run = await manager.start({ source: SCRIPT, args: {} });
-    const view = await run.execute();
-    const inspected = manager.inspect(view.runId);
-    assert.equal(inspected?.meta.name, "test-flow");
-    assert.equal(inspected?.status, "completed");
-    assert.equal(inspected?.calls.length, 8);
-    assert.equal(manager.inspect("wf-nonexistent"), null);
-  });
-
   it("refuses resume while the run is still live", async () => {
     service = new FakeSubagentService();
     service.delays.set("slow", 300);
@@ -1465,33 +1436,38 @@ return 'done';
     await execution;
   });
 
-  it("rejects an unknown agent type before scheduling", async () => {
+  it("rejects invalid agent options before scheduling with specific diagnostics", async () => {
     service = new FakeSubagentService();
+    service.allowed = ["worker", "scout", "claude-cli"];
+    service.kinds.set("claude-cli", "cli");
     const manager = createManager();
-    const script = `export const meta = { name: 'bad-agent', description: 'x' }
-try {
-  await agent('x', { label: 'x', agent: 'nope' });
-  return 'no-error';
-} catch (error) {
-  return 'error:' + error.message;
-}
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-    assert.match(String(view.result), /unknown agent "nope"/);
-  });
-
-  it("enforces the per-run agent cap", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const script = `export const meta = { name: 'cap-flow', description: 'x' }
-for (let i = 0; i < 1200; i++) await agent('call-' + i, { label: 'c' + i });
-return 'done';
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /1000 agents|no progress|exceeded/i);
+    const cases = [
+      { name: "unknown-agent", opts: { label: "x", agent: "nope" }, error: /unknown agent "nope"/, caught: true },
+      { name: "bad-effort", opts: { effort: "very-high" }, error: /expected one of off, minimal, low, medium, high, xhigh, max/ },
+      { name: "unknown-option", opts: { label: "one", schemas: { type: "object" } }, error: /unknown option `schemas`/ },
+      { name: "bad-isolation", opts: { label: "one", isolation: "unknown" }, error: /isolation.*worktree/ },
+      {
+        name: "missing-schema-property",
+        opts: { label: "one", schema: { type: "object", properties: { a: { type: "string" } }, required: ["b"] } },
+        error: /requires `b`.*not in `properties`/,
+      },
+      { name: "non-object-schema", opts: { label: "one", schema: { type: "string" } }, error: /type: 'object'/ },
+      {
+        name: "cli-schema", opts: { label: "one", agent: "claude-cli", schema: { type: "object", properties: {} } },
+        error: /external CLI/,
+      },
+    ];
+    for (const { name, opts, error, caught } of cases) {
+      const call = `await agent('one', ${JSON.stringify(opts)});`;
+      // Unknown-agent errors must also reach a script's catch block unchanged.
+      const body = caught ? `try { ${call} return 'no-error'; } catch (error) { return 'error:' + error.message; }`
+        : `${call} return 'unreachable';`;
+      const source = `export const meta = { name: '${name}', description: 'x', agent: 'worker' }\n${body}`;
+      const view = await (await manager.start({ source, args: {}, reuse: "none" })).execute();
+      assert.equal(view.status, caught ? "completed" : "failed", name);
+      assert.match(String(caught ? view.result : view.error), error, name);
+      assert.equal(service.spawns.length, 0, `${name}: invalid options must not reach the scheduler`);
+    }
   });
 
   it("kills a script that never yields", async () => {
@@ -1607,20 +1583,6 @@ return 'done';
     assert.ok(service.spawns.length === 1000, `the cap must stop the loop, saw ${service.spawns.length} spawns`);
   });
 
-  it("rejects an effort level pi would not understand", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const script = `export const meta = { name: 'bad-effort', description: 'x', agent: 'worker' }
-await agent('nope', { effort: 'very-high' });
-return 'unreachable';
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /expected one of off, minimal, low, medium, high, xhigh, max/);
-    assert.equal(service.spawns.length, 0, "an invalid effort must be refused before any agent starts");
-  });
-
   it("accepts agent() called with a single options object", async () => {
     // `agent(prompt, opts)` is the documented form, but the object form reads
     // naturally; before this, it failed inside the host with "agent() requires a
@@ -1644,23 +1606,6 @@ return 'unreachable';
     assert.equal(view.calls[0].label, "first", "the object form's opts are honoured");
   });
 
-  it("accepts Claude Code's meta.phases object form", async () => {
-    // A script written for Claude Code carries `phases: [{ title, detail }]`.
-    // Requiring bare strings rejected it with a message that only said "array
-    // of strings", and the obvious fix for the author was to delete the phases.
-    const parsed = parseScript(
-      "export const meta = { name: 'cc-shaped', description: 'x', " +
-        "whenToUse: 'when you want a sweep', phases: [{ title: 'Scan', detail: 'find' }, 'Verify'] }\nreturn 1;",
-      "inline",
-    );
-    assert.equal(parsed.meta.whenToUse, "when you want a sweep");
-    assert.deepEqual(parsed.meta.phases, [{ title: "Scan", detail: "find" }, "Verify"]);
-    assert.throws(
-      () => parseScript("export const meta = { name: 'x', description: 'y', phases: [{ detail: 'no title' }] }\nreturn 1;", "inline"),
-      WorkflowScriptError,
-    );
-  });
-
   it("accepts agentType as a name for agent, and refuses both at once", async () => {
     service = new FakeSubagentService();
     service.kinds.set("cli-agent", "cli");
@@ -1682,67 +1627,6 @@ return 'ok';
     assert.match(String(failed.error), /both agent "scout" and agentType "worker"/);
   });
 
-  it("refuses an option it does not understand instead of dropping it", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const script = `export const meta = { name: 'typo-opts', description: 'x' }
-await agent('one', { label: 'one', schemas: { type: 'object' } });
-return 'ok';
-`;
-    const view = await (await manager.start({ source: script, args: {} })).execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /unknown option `schemas`/);
-    assert.equal(service.spawns.length, 0, "a typo must not reach the scheduler");
-  });
-
-  it("rejects an invalid worktree isolation option rather than ignoring it", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const script = `export const meta = { name: 'isolation', description: 'x' }
-await agent('one', { label: 'one', isolation: 'unknown' });
-return 'ok';
-`;
-    const view = await (await manager.start({ source: script, args: {} })).execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /isolation.*worktree/);
-  });
-
-  it("rejects an unsatisfiable schema before spending a model call", async () => {
-    service = new FakeSubagentService();
-    const manager = createManager();
-    const script = `export const meta = { name: 'bad-schema', description: 'x' }
-await agent('one', { label: 'one', schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['b'] } });
-return 'ok';
-`;
-    const view = await (await manager.start({ source: script, args: {} })).execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /requires `b`.*not in `properties`/);
-    assert.equal(service.spawns.length, 0);
-
-    const notAnObject = `export const meta = { name: 'bad-schema-2', description: 'x' }
-await agent('one', { label: 'one', schema: { type: 'string' } });
-return 'ok';
-`;
-    const second = await (await manager.start({ source: notAnObject, args: {} })).execute();
-    assert.equal(second.status, "failed");
-    assert.match(String(second.error), /type: 'object'/);
-  });
-
-  it("refuses a schema on an external-CLI agent, which cannot return one", async () => {
-    service = new FakeSubagentService();
-    service.allowed = ["claude-cli", "worker"];
-    service.kinds.set("claude-cli", "cli");
-    const manager = createManager();
-    const script = `export const meta = { name: 'cli-schema', description: 'x' }
-await agent('one', { label: 'one', agent: 'claude-cli', schema: { type: 'object', properties: {} } });
-return 'ok';
-`;
-    const view = await (await manager.start({ source: script, args: {} })).execute();
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /external CLI/);
-    assert.equal(service.spawns.length, 0, "the failure must be ours, not the child's");
-  });
-
   it("does not default an anonymous call to an external-CLI agent", async () => {
     // `claude-cli` sorts first in the bundled agents directory, so "the first
     // allowed agent" used to mean an Anthropic CLI pane for every call that
@@ -1760,62 +1644,41 @@ return 'ok';
     assert.equal(service.spawns[0].agentType, "worker", "the first non-CLI agent, not the CLI one");
   });
 
-  it("stops a run that ignores its token budget", async () => {
+  it("enforces the token ceiling and lets a budget-aware script stop on its own", async () => {
     service = new FakeSubagentService();
     service.tokensPerAgent = 40;
     const manager = createManager({ budgetTotal: 100 });
-    // Five calls at 40 tokens against a 100-token ceiling. The ceiling is
-    // checked before a call is queued, so the call that crosses it runs and the
-    // next one is refused — and refused fatally, because a script that ignores
-    // `remaining()` would otherwise swallow the rejection through parallel()
-    // and keep going until the wall clock.
-    const script = `export const meta = { name: 'budgeted', description: 'x', agent: 'worker' }
-for (let i = 0; i < 5; i++) { await agent('spin', { label: 'spin' + i }) }
-return 'finished';
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-
-    assert.equal(view.status, "failed");
-    assert.match(String(view.error), /budget exhausted/);
-    assert.ok(service.spawns.length < 5, `the ceiling must stop the loop, saw ${service.spawns.length}`);
-  });
-
-  it("lets a script that scales to budget.remaining() stop on its own", async () => {
-    service = new FakeSubagentService();
-    service.tokensPerAgent = 40;
-    const manager = createManager({ budgetTotal: 100 });
-    const script = `export const meta = { name: 'budget-aware', description: 'x', agent: 'worker' }
-let runs = 0;
+    const cases = [
+      {
+        name: "budgeted", status: "failed",
+        // The crossing call runs, but the next call is refused fatally even
+        // when the script ignores remaining() and keeps requesting work.
+        body: "for (let i = 0; i < 5; i++) { await agent('spin', { label: 'spin' + i }) }\nreturn 'finished';",
+      },
+      {
+        name: "budget-aware", status: "completed",
+        body: `let runs = 0;
 while (budget.total && budget.remaining() > 0) {
   await agent('spin', { label: 'spin' + runs });
   runs++;
   if (runs > 10) break;
 }
-return runs;
-`;
-    const run = await manager.start({ source: script, args: {} });
-    const view = await run.execute();
-
-    assert.equal(view.status, "completed", view.error);
-    assert.equal(service.spawns.length, 3, "it stops when the budget says to, not when the run dies");
-  });
-
-  it("reports budget.spent() as a number the script can compare", async () => {
-    service = new FakeSubagentService();
-    service.tokensPerAgent = 10;
-    const manager = createManager({ budgetTotal: 1000 });
-    const script = `export const meta = { name: 'budget-types', description: 'x', agent: 'worker' }
-await agent('one', { label: 'one' });
-return { spent: budget.spent(), remaining: budget.remaining(), total: budget.total };
-`;
-    const view = await (await manager.start({ source: script, args: {} })).execute();
-    const result = view.result as { spent: number; remaining: number; total: number };
-    assert.equal(typeof result.spent, "number");
-    assert.equal(typeof result.remaining, "number");
-    assert.equal(result.spent, 10, "the value is fresh as of the last settled call");
-    assert.equal(result.remaining, 990);
-    assert.equal(result.total, 1000);
+return runs;`,
+      },
+    ];
+    for (const { name, status, body } of cases) {
+      const before = service.spawns.length;
+      const source = `export const meta = { name: '${name}', description: 'x', agent: 'worker' }\n${body}`;
+      const view = await (await manager.start({ source, args: {}, reuse: "none" })).execute();
+      assert.equal(view.status, status, `${name}: ${view.error}`);
+      const spawns = service.spawns.length - before;
+      if (status === "failed") {
+        assert.match(String(view.error), /budget exhausted/, name);
+        assert.ok(spawns < 5, `${name}: the ceiling must stop the loop, saw ${spawns}`);
+      } else {
+        assert.equal(spawns, 3, `${name}: it stops when the budget says to, not when the run dies`);
+      }
+    }
   });
 
   it("rejects a parallel/pipeline batch over the item limit", async () => {

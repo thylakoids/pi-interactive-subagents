@@ -70,87 +70,64 @@ describe("workflow worktree isolation", () => {
     });
   }
 
-  it("creates a detached worktree at <runDir>/worktrees/<callKey> from HEAD", async () => {
+  it("creates, isolates and reuses a detached worktree without changing parent files or agent work", async () => {
     const { repo, runDir } = repoWithRun();
     const head = git(repo, ["rev-parse", "HEAD"]);
-    const worktree = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-abc123" });
+    const first = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-lifecycle" });
+    assert.equal(first.cwd, join(runDir, "worktrees", "call-lifecycle"));
+    assert.equal(first.created, true);
+    assert.equal(first.baseCommit, head);
+    assert.equal(git(first.cwd, ["rev-parse", "HEAD"]), head);
+    assert.equal(git(first.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD", "the worktree is detached");
+    assert.equal(readFileSync(join(first.cwd, "README.md"), "utf8"), "base\n");
 
-    assert.equal(worktree.cwd, join(runDir, "worktrees", "call-abc123"));
-    assert.equal(worktree.created, true);
-    assert.equal(worktree.baseCommit, head);
-    assert.equal(git(worktree.cwd, ["rev-parse", "HEAD"]), head);
-    assert.equal(git(worktree.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD", "the worktree is detached");
-    assert.equal(readFileSync(join(worktree.cwd, "README.md"), "utf8"), "base\n");
-  });
+    writeFileSync(join(first.cwd, "only-in-worktree.txt"), "isolated\n");
+    assert.equal(existsSync(join(repo, "only-in-worktree.txt")), false);
+    assert.match(git(first.cwd, ["status", "--porcelain"]), /only-in-worktree\.txt/);
+    assert.equal(git(repo, ["status", "--porcelain"]), "", "agent writes leave a clean parent clean");
 
-  it("leaves a dirty main checkout exactly as it was", async () => {
-    const { repo, runDir } = repoWithRun();
     writeFileSync(join(repo, "README.md"), "changed in main\n");
     writeFileSync(join(repo, "scratch.txt"), "not committed\n");
-    const statusBefore = git(repo, ["status", "--porcelain"]);
-
-    const worktree = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-dirty-main" });
-
+    const parentStatus = git(repo, ["status", "--porcelain"]);
+    const isolated = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-dirty-main" });
     assert.equal(readFileSync(join(repo, "README.md"), "utf8"), "changed in main\n");
     assert.equal(readFileSync(join(repo, "scratch.txt"), "utf8"), "not committed\n");
-    assert.equal(git(repo, ["status", "--porcelain"]), statusBefore, "the main checkout is untouched");
-    assert.equal(readFileSync(join(worktree.cwd, "README.md"), "utf8"), "base\n", "the worktree starts from HEAD, not the dirty tree");
-  });
+    assert.equal(git(repo, ["status", "--porcelain"]), parentStatus, "a dirty parent stays unchanged");
+    assert.equal(readFileSync(join(isolated.cwd, "README.md"), "utf8"), "base\n", "isolation starts from HEAD, not dirty content");
 
-  it("isolates writes: a file created in the worktree stays out of the main checkout", async () => {
-    const { repo, runDir } = repoWithRun();
-    const worktree = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-writes" });
-
-    writeFileSync(join(worktree.cwd, "only-in-worktree.txt"), "isolated\n");
-    assert.equal(existsSync(join(repo, "only-in-worktree.txt")), false);
-    assert.match(git(worktree.cwd, ["status", "--porcelain"]), /only-in-worktree\.txt/);
-    assert.equal(git(repo, ["status", "--porcelain"]), "");
-  });
-
-  it("reuses an existing worktree, keeping its modifications and commits", async () => {
-    const { repo, runDir } = repoWithRun();
-    const first = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-reuse" });
     writeFileSync(join(first.cwd, "work.txt"), "draft\n");
     commit(first.cwd, "work in progress");
     writeFileSync(join(first.cwd, "uncommitted.txt"), "still dirty\n");
-    const headInWorktree = git(first.cwd, ["rev-parse", "HEAD"]);
-    const statusInWorktree = git(first.cwd, ["status", "--porcelain"]);
-
-    const second = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-reuse" });
-
-    assert.equal(second.created, false);
-    assert.equal(second.cwd, first.cwd);
-    assert.equal(second.baseCommit, first.baseCommit, "the recorded base commit does not drift");
-    assert.equal(git(second.cwd, ["rev-parse", "HEAD"]), headInWorktree, "the commit made inside is kept");
-    assert.equal(git(second.cwd, ["status", "--porcelain"]), statusInWorktree, "nothing is reset or cleaned");
-    assert.equal(readFileSync(join(second.cwd, "work.txt"), "utf8"), "draft\n");
-    assert.equal(readFileSync(join(second.cwd, "uncommitted.txt"), "utf8"), "still dirty\n");
+    const agentHead = git(first.cwd, ["rev-parse", "HEAD"]);
+    const agentStatus = git(first.cwd, ["status", "--porcelain"]);
+    const reused = await prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-lifecycle" });
+    assert.equal(reused.created, false);
+    assert.equal(reused.cwd, first.cwd);
+    assert.equal(reused.baseCommit, first.baseCommit, "the recorded base commit does not drift");
+    assert.equal(git(reused.cwd, ["rev-parse", "HEAD"]), agentHead, "agent commits survive reuse");
+    assert.equal(git(reused.cwd, ["status", "--porcelain"]), agentStatus, "nothing is reset or cleaned");
+    assert.equal(readFileSync(join(reused.cwd, "work.txt"), "utf8"), "draft\n");
+    assert.equal(readFileSync(join(reused.cwd, "uncommitted.txt"), "utf8"), "still dirty\n");
   });
 
-  it("refuses a foreign directory at the target path and never deletes it", async () => {
+  it("refuses file and foreign-directory targets without touching their contents", async () => {
     const { repo, runDir } = repoWithRun();
     const target = join(runDir, "worktrees", "call-foreign");
-    mkdirSync(target, { recursive: true });
+    mkdirSync(join(runDir, "worktrees"), { recursive: true });
+    writeFileSync(target, "user file\n");
+    await assert.rejects(
+      prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-foreign" }),
+      (error: unknown) => error instanceof WorktreeIsolationError,
+    );
+    assert.equal(readFileSync(target, "utf8"), "user file\n", "a rejected file stays intact");
+    rmSync(target);
+    mkdirSync(target);
     writeFileSync(join(target, "user-data.txt"), "precious\n");
-
     await assert.rejects(
       prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-foreign" }),
       (error: unknown) => error instanceof WorktreeIsolationError && /not a git worktree|refusing to reuse/i.test(String((error as Error).message)),
     );
     assert.equal(readFileSync(join(target, "user-data.txt"), "utf8"), "precious\n");
-  });
-
-  it("refuses a plain file at the target path", async () => {
-    const { repo, runDir } = repoWithRun();
-    const target = join(runDir, "worktrees", "call-file");
-    mkdirSync(join(runDir, "worktrees"), { recursive: true });
-    writeFileSync(target, "user file\n");
-
-    await assert.rejects(
-      prepareWorkflowWorktree({ cwd: repo, runDir, callKey: "call-file" }),
-      (error: unknown) => error instanceof WorktreeIsolationError,
-    );
-    assert.equal(readFileSync(target, "utf8"), "user file\n");
   });
 
   it("refuses a working directory that is not a git repository", async () => {

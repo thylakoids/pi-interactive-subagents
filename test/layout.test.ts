@@ -40,57 +40,30 @@ function window(id: string, width: number, height: number, panes: PaneInfo[]): W
   return { id, width, height, panes };
 }
 
-describe("columnCapacity", () => {
-  it("holds four subagents beside the parent on a 58-row terminal", () => {
-    // The geometry this came from: 13/13/13/16 rows per column pane.
-    assert.equal(columnCapacity(238, 58), 4);
-    assert.equal(columnCapacity(200, 58), 4);
+describe("pane capacity tables", () => {
+  it("fits the side column to measured geometry, minimum dimensions and its readability ceiling", () => {
+    const cases = [
+      [238, 58, 4], [200, 58, 4], // measured 13/13/13/16-row column
+      [238, 50, 3],               // four panes would fall below the 12-row floor
+      [238, 64, 5], [238, 200, 6],
+      [120, 58, 0], [100, 58, 0], [121, 58, 4],
+      [238, 12, 1], [238, 10, 0],
+    ];
+    for (const [width, height, expected] of cases) {
+      assert.equal(columnCapacity(width, height), expected, 'column capacity at ' + width + 'x' + height);
+    }
   });
 
-  it("drops to three rows-worth of panes when the window is 50 rows", () => {
-    // K=4 would leave 11 rows each, under the 12-row floor.
-    assert.equal(columnCapacity(238, 50), 3);
-  });
-
-  it("grows with the window and then stops", () => {
-    assert.equal(columnCapacity(238, 64), 5);
-    assert.equal(columnCapacity(238, 200), 6);
-  });
-
-  it("is zero when the window is too narrow to hold both halves", () => {
-    // 120 columns would leave the parent and the column under 60 each.
-    assert.equal(columnCapacity(120, 58), 0);
-    assert.equal(columnCapacity(100, 58), 0);
-    assert.equal(columnCapacity(121, 58), 4);
-  });
-
-  it("is zero when a single column pane would be too short", () => {
-    assert.equal(columnCapacity(238, 12), 1);
-    assert.equal(columnCapacity(238, 10), 0);
-  });
-});
-
-describe("overflowCapacity", () => {
-  it("matches the grids tiled actually produces", () => {
-    // 3x3 on both, the shape measured at 9 panes.
-    assert.equal(overflowCapacity(238, 58), 9);
-    assert.equal(overflowCapacity(200, 50), 9);
-  });
-
-  it("stops growing past the readability ceiling", () => {
-    assert.equal(overflowCapacity(300, 80), 12);
-    assert.equal(overflowCapacity(600, 200), 12);
-  });
-
-  it("uses tmux's grid shape, not floor(width/64) x floor(height/16)", () => {
-    // 12 panes at 400x50 are a 3x4 grid (132x11), below the 16-row floor.
-    assert.equal(overflowCapacity(400, 50), 9);
-    assert.equal(overflowCapacity(320, 58), 9);
-  });
-
-  it("never returns less than one, so a spawn always has somewhere to go", () => {
-    assert.equal(overflowCapacity(50, 20), 1);
-    assert.equal(overflowCapacity(1, 1), 1);
+  it("uses tmux tiled geometry, caps readable grids and always leaves overflow room for one pane", () => {
+    const cases = [
+      [238, 58, 9], [200, 50, 9], // measured 3x3 grids
+      [300, 80, 12], [600, 200, 12],
+      [400, 50, 9], [320, 58, 9], // a 12-pane grid would fall below the 16-row floor
+      [50, 20, 1], [1, 1, 1],
+    ];
+    for (const [width, height, expected] of cases) {
+      assert.equal(overflowCapacity(width, height), expected, 'overflow capacity at ' + width + 'x' + height);
+    }
   });
 });
 

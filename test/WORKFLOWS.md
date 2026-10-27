@@ -36,6 +36,9 @@ for terminal descendants before deleting artifacts.
 These are not live model quality evaluations. Source fetching, reasoning quality,
 and whether an LLM chooses an appropriate workflow require separate provider runs.
 
+See [test maintenance](../docs/test-maintenance.md) for fixture consolidation and
+coverage-comparison rules.
+
 ## Avoid false confidence
 
 - Parsing a template proves syntax/discovery, not executable behavior.

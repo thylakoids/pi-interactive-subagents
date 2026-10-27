@@ -69,83 +69,22 @@ describe("structured output schemas", () => {
   it("keeps a nested object without properties free-form", async () => {
     // The regression: this used to be { type: 'object', properties: {},
     // additionalProperties: false }, so { meta: { any: 1 } } failed validation.
-    await withExtension(rootWithMeta, (tool) => {
+    await withExtension(rootWithMeta, async (tool, resultFile) => {
+      assert.equal(existsSync(resultFile), false, "registration does not write a result");
       assert.equal(Value.Check(tool.parameters, { verdict: "v", meta: { any: 1, nested: { x: 2 } } }), true);
       assert.equal(Value.Check(tool.parameters, { verdict: "v", meta: {} }), true);
       assert.equal(Value.Check(tool.parameters, { verdict: "v" }), true, "meta stays optional");
       assert.equal(Value.Check(tool.parameters, { meta: {} }), false, "the root required field still applies");
-    });
-  });
+      assert.equal(Value.Check(tool.parameters, { verdict: "v", unexpected: 1 }), false, "the declared root stays closed");
 
-  it("keeps a root object with declared properties closed by default", async () => {
-    // Unchanged contract: unknown root keys stay rejected unless the schema
-    // explicitly opens the object.
-    await withExtension(rootWithMeta, (tool) => {
-      assert.equal(Value.Check(tool.parameters, { verdict: "v", unexpected: 1 }), false);
-    });
-  });
-
-  it("keeps declared nested objects closed and required-aware", async () => {
-    await withExtension(
-      {
-        type: "object",
-        properties: {
-          finding: {
-            type: "object",
-            properties: { file: { type: "string" } },
-            required: ["file"],
-          },
-        },
-        required: ["finding"],
-      },
-      (tool) => {
-        assert.equal(Value.Check(tool.parameters, { finding: { file: "a.ts" } }), true);
-        assert.equal(Value.Check(tool.parameters, { finding: {} }), false, "required nested field");
-        assert.equal(Value.Check(tool.parameters, { finding: { file: "a.ts", extra: 1 } }), false, "declared object stays closed");
-      },
-    );
-  });
-
-  it("treats an explicitly empty properties set as closed", async () => {
-    // Only an *absent* properties declaration is free-form. An author who wrote
-    // `properties: {}` keeps the explicit empty-object contract.
-    await withExtension({ type: "object", properties: {} }, (tool) => {
-      assert.equal(Value.Check(tool.parameters, {}), true);
-      assert.equal(Value.Check(tool.parameters, { anything: 1 }), false);
-    });
-  });
-
-  it("honours an explicit additionalProperties: true", async () => {
-    await withExtension(
-      { type: "object", properties: { verdict: { type: "string" } }, additionalProperties: true },
-      (tool) => {
-        assert.equal(Value.Check(tool.parameters, { verdict: "v", extra: { deep: true } }), true);
-        assert.equal(Value.Check(tool.parameters, { verdict: "v" }), true);
-      },
-    );
-  });
-
-  it("honours an explicit additionalProperties: false", async () => {
-    await withExtension(
-      { type: "object", properties: { verdict: { type: "string" } }, additionalProperties: false },
-      (tool) => {
-        assert.equal(Value.Check(tool.parameters, { verdict: "v", extra: 1 }), false);
-      },
-    );
-  });
-
-  it("honours an additionalProperties schema", async () => {
-    await withExtension(
-      { type: "object", properties: { verdict: { type: "string" } }, additionalProperties: { type: "string" } },
-      (tool) => {
-        assert.equal(Value.Check(tool.parameters, { verdict: "v", extra: "ok" }), true);
-        assert.equal(Value.Check(tool.parameters, { verdict: "v", extra: 1 }), false);
-      },
-    );
-  });
-
-  it("passes unknown allowed keys through instead of rewriting them", async () => {
-    await withExtension(rootWithMeta, async (tool, resultFile) => {
+      const parentView = workflowResultSchema(rootWithMeta as JsonSchema);
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(parentView)),
+        JSON.parse(JSON.stringify(tool.parameters)),
+        "the exported builder must match the schema the child tool registered",
+      );
+      assert.equal(Value.Check(parentView, { verdict: "v", meta: { any: 1 } }), true);
+      assert.equal(Value.Check(parentView, { verdict: 1 }), false);
       assert.equal(
         Value.Check(tool.parameters, { verdict: "v", meta: { anything: { nested: [1, 2] } } }),
         true,
@@ -154,10 +93,82 @@ describe("structured output schemas", () => {
 
       const payload = { verdict: "v", meta: { custom: { keep: "me" }, list: [1, 2] } };
       await tool.execute("call-1", payload);
-      const written = JSON.parse(readFileSync(resultFile, "utf8"));
-      assert.deepEqual(written, { ok: true, value: payload }, "the recorded value is exactly what the child sent");
+      const recorded = readFileSync(resultFile, "utf8");
+      assert.deepEqual(JSON.parse(recorded), { ok: true, value: payload }, "the recorded value is exactly what the child sent");
+      const rejected = await tool.execute("call-root-extra", { verdict: "v", unexpected: 1 });
+      assert.equal(rejected.isError, true, "an unknown root key stays rejected after a valid result");
+      assert.equal(rejected.details.recorded, false);
+      assert.equal(readFileSync(resultFile, "utf8"), recorded, "rejection must preserve the recorded valid result");
     });
   });
+
+  it("keeps declared objects closed and required-aware, including empty properties", async () => {
+    const cases = [
+      {
+        name: "declared nested object",
+        schema: {
+          type: "object",
+          properties: {
+            finding: {
+              type: "object", properties: { file: { type: "string" } }, required: ["file"],
+            },
+          },
+          required: ["finding"],
+        },
+        values: [
+          { value: { finding: { file: "a.ts" } }, valid: true, why: "declared field" },
+          { value: { finding: {} }, valid: false, why: "required nested field" },
+          { value: { finding: { file: "a.ts", extra: 1 } }, valid: false, why: "declared object stays closed" },
+        ],
+      },
+      {
+        // Only absent properties are free-form; an explicit empty set stays closed.
+        name: "explicitly empty properties", schema: { type: "object", properties: {} },
+        values: [
+          { value: {}, valid: true, why: "empty object" },
+          { value: { anything: 1 }, valid: false, why: "undeclared field" },
+        ],
+      },
+    ];
+    for (const { name, schema, values } of cases) {
+      await withExtension(schema, (tool) => {
+        for (const { value, valid, why } of values) {
+          assert.equal(Value.Check(tool.parameters, value), valid, `${name}: ${why}`);
+        }
+      });
+    }
+  });
+
+  it("honours explicit additionalProperties policies", async () => {
+    const policies = [
+      {
+        name: "additionalProperties: true", additionalProperties: true,
+        values: [
+          { value: { verdict: "v", extra: { deep: true } }, valid: true },
+          { value: { verdict: "v" }, valid: true },
+        ],
+      },
+      {
+        name: "additionalProperties: false", additionalProperties: false,
+        values: [{ value: { verdict: "v", extra: 1 }, valid: false }],
+      },
+      {
+        name: "additionalProperties: string schema", additionalProperties: { type: "string" },
+        values: [
+          { value: { verdict: "v", extra: "ok" }, valid: true },
+          { value: { verdict: "v", extra: 1 }, valid: false },
+        ],
+      },
+    ];
+    for (const { name, additionalProperties, values } of policies) {
+      await withExtension({ type: "object", properties: { verdict: { type: "string" } }, additionalProperties }, (tool) => {
+        for (const { value, valid } of values) {
+          assert.equal(Value.Check(tool.parameters, value), valid, `${name}: ${JSON.stringify(value)}`);
+        }
+      });
+    }
+  });
+
 });
 
 describe("parent-side and direct-call validation", () => {
@@ -167,19 +178,6 @@ describe("parent-side and direct-call validation", () => {
       assert.equal(Value.Check(schema, { meta: { key: value } }), true);
     }
   });
-  it("exposes the same schema the child registered, for sidecar validation", async () => {
-    await withExtension(rootWithMeta, (tool) => {
-      const parentView = workflowResultSchema(rootWithMeta as JsonSchema);
-      assert.deepEqual(
-        JSON.parse(JSON.stringify(parentView)),
-        JSON.parse(JSON.stringify(tool.parameters)),
-        "the exported builder must match the schema the child tool registered",
-      );
-      assert.equal(Value.Check(parentView, { verdict: "v", meta: { any: 1 } }), true);
-      assert.equal(Value.Check(parentView, { verdict: 1 }), false);
-    });
-  });
-
   it("rejects a direct execute that does not satisfy the schema", async () => {
     await withExtension(rootWithMeta, async (tool, resultFile) => {
       const missing = await tool.execute("call-1", { meta: {} });
