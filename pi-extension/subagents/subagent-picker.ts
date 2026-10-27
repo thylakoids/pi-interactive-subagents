@@ -11,13 +11,14 @@ export async function openSubagentPicker(
   running: RunningSubagent[],
   focus: (name: string, sessionFile: string) => Promise<{ ok: true } | { error: string }>,
 ): Promise<void> {
+  const now = Date.now();
   const entries = new Map<string, { name: string; sessionFile: string; state: string }>();
   for (const child of running) entries.set(resolve(child.sessionFile), {
-    name: child.name, sessionFile: child.sessionFile, state: classifyStatus(child.statusState).kind,
+    name: child.name, sessionFile: child.sessionFile, state: classifyStatus(child.statusState, now).kind,
   });
   for (const [name, saved] of Object.entries(readNameRegistry(artifactDir)).reverse()) {
     const path = resolve(saved.sessionFile);
-    if (!entries.has(path)) entries.set(path, { name, sessionFile: saved.sessionFile, state: "saved" });
+    if (!entries.has(path)) entries.set(path, { name, sessionFile: saved.sessionFile, state: "closed" });
   }
   const items = [...entries.values()].map(entry => {
     const model = readSubagentLoadout(entry.sessionFile)?.model;
