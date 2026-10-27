@@ -31,7 +31,7 @@ os.waitpid(pid, 0)
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.doesNotThrow(() => process.kill(pid, 0), 'PID existence alone incorrectly says this owner is alive');
-  const lock = acquireLock(dir);
+  const lock = await acquireLock(dir);
   assert.equal(lock.ok, true, JSON.stringify(lock));
-  if (lock.ok) releaseLock(lock.path);
+  if (lock.ok) await releaseLock(lock.path);
 });

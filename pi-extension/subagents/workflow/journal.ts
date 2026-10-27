@@ -16,7 +16,7 @@
 import { closeSync, existsSync, fsyncSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
-import { runLockTransaction } from "./run-lock.ts";
+import { runLockTransaction, type RunLockResult } from "./run-lock.ts";
 import type { WorkflowJournalEntry, WorkflowMeta, WorkflowRunSnapshot } from "./types.ts";
 
 export const RUNS_DIRNAME = "workflows";
@@ -99,11 +99,16 @@ export function occurrenceKey(base: string, occurrence: number): string {
   return occurrence === 0 ? base : `${base}-${occurrence}`;
 }
 
-/** Atomic JSON write: temp file in the same directory, then rename. */
-export function writeJsonAtomic(path: string, value: unknown): void {
+/** Atomic text write: temp file in the same directory, then rename. */
+export function writeFileAtomic(path: string, text: string): void {
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2), "utf8");
+  writeFileSync(tmp, text, "utf8");
   renameSync(tmp, path);
+}
+
+/** Atomic JSON write with the same publication contract as text. */
+export function writeJsonAtomic(path: string, value: unknown): void {
+  writeFileAtomic(path, JSON.stringify(value, null, 2));
 }
 
 export function readJson<T>(path: string): T | null {
@@ -180,49 +185,65 @@ export function loadJournal(path: string): JournalLoad {
 /** Logical ownership outlives the short, crash-released kernel transaction. */
 const ownedLocks = new Map<string, string>();
 const pendingReleases = new Map<string, string>();
+const lockTransactions = new Map<string, Promise<void>>();
 
-export function acquireLock(runDir: string, resourceOwner?: string) {
-  const path = join(runDir, "lock");
-  const pending = pendingReleases.get(path);
-  if (pending) {
-    if (!releaseToken(path, pending)) return { ok: false as const, ownerPid: process.pid, reason: "previous owned release still cannot be persisted" };
-    pendingReleases.delete(path);
-    if (ownedLocks.get(path) === pending) ownedLocks.delete(path);
-  }
-  const token = randomBytes(16).toString("hex");
-  let result;
-  try {
-    result = runLockTransaction(runDir, "acquire", token, resourceOwner);
-  } catch (error) {
-    // A helper may die after publishing but before returning its acknowledgement.
-    // Remove only this attempt's token, never an unrelated or legacy owner.
-    if (!releaseToken(path, token)) pendingReleases.set(path, token);
-    throw error;
-  }
-  if (result.ok) ownedLocks.set(result.path, token);
+/** Keep token bookkeeping and all its helper transactions in one per-path turn. */
+function serializeLock<T>(path: string, transaction: () => Promise<T>): Promise<T> {
+  const result = (lockTransactions.get(path) ?? Promise.resolve()).then(transaction);
+  const settled = result.then(() => {}, () => {});
+  lockTransactions.set(path, settled);
+  void settled.then(() => {
+    if (lockTransactions.get(path) === settled) lockTransactions.delete(path);
+  });
   return result;
 }
 
-function releaseToken(path: string, token: string): boolean {
+export async function acquireLock(runDir: string, resourceOwner?: string): Promise<RunLockResult> {
+  const path = join(runDir, "lock");
+  return serializeLock(path, async () => {
+    const pending = pendingReleases.get(path);
+    if (pending) {
+      if (!await releaseToken(path, pending)) return { ok: false, ownerPid: process.pid, reason: "previous owned release still cannot be persisted" };
+      pendingReleases.delete(path);
+      if (ownedLocks.get(path) === pending) ownedLocks.delete(path);
+    }
+    const token = randomBytes(16).toString("hex");
+    let result;
+    try {
+      result = await runLockTransaction(runDir, "acquire", token, resourceOwner);
+    } catch (error) {
+      // A helper may die after publishing but before returning its acknowledgement.
+      // Remove only this attempt's token, never an unrelated or legacy owner.
+      if (!await releaseToken(path, token)) pendingReleases.set(path, token);
+      throw error;
+    }
+    if (result.ok) ownedLocks.set(result.path, token);
+    return result;
+  });
+}
+
+async function releaseToken(path: string, token: string): Promise<boolean> {
   // Token-checked release is idempotent, even if the acknowledgement is lost.
   for (let attempt = 0; attempt < 2; attempt++) {
-    try { if (runLockTransaction(dirname(path), "release", token).ok) return true; } catch { /* Retry a killed helper once. */ }
+    try { if ((await runLockTransaction(dirname(path), "release", token)).ok) return true; } catch { /* Retry a killed helper once. */ }
   }
   return false;
 }
 
-export function releaseLock(path: string): boolean {
-  const token = ownedLocks.get(path);
-  if (!token) return true;
-  if (!releaseToken(path, token)) {
-    // A storage outage must not replace the workflow's result with a teardown
-    // exception. Retain the token and retry on the next same-process acquisition.
-    pendingReleases.set(path, token);
-    return false;
-  }
-  ownedLocks.delete(path);
-  pendingReleases.delete(path);
-  return true;
+export async function releaseLock(path: string): Promise<boolean> {
+  return serializeLock(path, async () => {
+    const token = ownedLocks.get(path);
+    if (!token) return true;
+    if (!await releaseToken(path, token)) {
+      // A storage outage must not replace the workflow's result with a teardown
+      // exception. Retain the token and retry on the next same-process acquisition.
+      pendingReleases.set(path, token);
+      return false;
+    }
+    ownedLocks.delete(path);
+    pendingReleases.delete(path);
+    return true;
+  });
 }
 
 export function snapshotPath(runDir: string): string {

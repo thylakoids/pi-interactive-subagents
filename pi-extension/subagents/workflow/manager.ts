@@ -38,6 +38,7 @@ import {
   scriptPath,
   saveSnapshot,
   sha256,
+  writeFileAtomic,
   writeJsonAtomic,
 } from "./journal.ts";
 import { defaultConcurrency, runScript } from "./runner.ts";
@@ -95,7 +96,6 @@ interface ScriptScope {
 
 interface CachedCall {
   value?: unknown;
-  isNull?: boolean;
   entry: WorkflowJournalEntry;
 }
 
@@ -120,6 +120,11 @@ interface LiveCall {
   /** Borrowed from a predecessor run: shown, never charged to this budget. */
   replayed?: boolean;
   previousUsage?: WorkflowUsage;
+  /** Runtime resources belong to the call, including a spawn still opening. */
+  handle?: WorkflowSubagentHandle;
+  abandonment?: AbortController;
+  releaseSlot?: () => void;
+  resolveOutcome?: (outcome: WorkflowAgentOutcome) => void;
 }
 
 export class WorkflowLimitError extends Error {}
@@ -171,15 +176,8 @@ export class WorkflowRun {
   private readonly abortController = new AbortController();
   private readonly cache: Map<string, CachedCall>;
   private readonly live = new Map<string, LiveCall>();
-  private readonly running = new Map<string, WorkflowSubagentHandle>();
-  /**
-   * Releases a call's scheduling slot the moment the call is decided as
-   * abandoned (skipped) while its launch task waits on the agent. The slot is a
-   * runtime resource: a watcher that never settles must not hold it until the
-   * call ceiling. A skip that lands before the spawn returns is covered too, but
-   * the pending spawn is cancelled as well, and any late handle is stopped.
-   */
-  private readonly abandonment = new Map<string, AbortController>();
+  /** Immutable index of cached occurrence namespaces; lookups never scan keys. */
+  private readonly cacheNamespaces: Set<string>;
   /**
    * True when the seeded cache is this run's own journal (a resume): those
    * tokens were charged to this run's budget. A same-name/same-args start
@@ -190,19 +188,11 @@ export class WorkflowRun {
   /** Call keys whose borrowed answer is already journaled in this run. */
   private readonly replayedLogged = new Set<string>();
   /**
-   * Releases a scheduling slot early. A call holds its slot while its launch
-   * task runs, but a call settled before that task returns (skipped, or the run
-   * aborted) must not keep the queue waiting on a launcher that is still
-   * opening a pane: the slot is a runtime resource, not the launcher's.
-   */
-  private readonly slotReleases = new Map<string, () => void>();
-  /**
    * Names this run has handed out but the service has not seen yet: the service
    * only learns a name once its pane launch resolves, so without a local claim
    * a fan-out of same-label calls reads one taken-set and picks one name.
    */
   private readonly reservedNames = new Set<string>();
-  private readonly waiters = new Map<string, Array<(outcome: WorkflowAgentOutcome) => void>>();
   private readonly queue: Array<() => void> = [];
   /**
    * How many times each content key has been issued. Two calls with the same
@@ -253,6 +243,7 @@ export class WorkflowRun {
     this.source = params.source;
     this.lockPath = params.lockPath;
     this.cache = params.cache;
+    this.cacheNamespaces = new Set([...params.cache.keys()].map(key => key.split("-", 1)[0]));
     this.cachedUsageIsSpent = params.cachedUsageIsSpent === true;
     this.executionStartedWall = Date.now();
 
@@ -454,7 +445,7 @@ export class WorkflowRun {
       ...(parsed.opts.isolation ? { isolation: parsed.opts.isolation } : {}),
     };
     let base = makeCallKey(identity);
-    const hasNamespace = (prefix: string) => [...this.cache.keys()].some(key => key === prefix || key.startsWith(prefix + "-"));
+    const hasNamespace = (prefix: string) => this.cacheNamespaces.has(prefix);
     // Old journals keyed a call by its cosmetic label. When the current key has
     // no namespace, look under the legacy algorithm before treating this as new
     // work, trying the shapes an older run could have written: its own label,
@@ -561,13 +552,9 @@ export class WorkflowRun {
     this.assertBudget();
     this.persistSnapshot(true);
 
-    const promise = new Promise<WorkflowAgentOutcome>((resolve) => {
-      const list = this.waiters.get(key) ?? [];
-      list.push(resolve);
-      this.waiters.set(key, list);
-    });
+    const promise = new Promise<WorkflowAgentOutcome>((resolve) => { liveCall.resolveOutcome = resolve; });
 
-    this.enqueue(key, async () => {
+    this.enqueue(liveCall, async () => {
       let outcome: WorkflowAgentOutcome;
       try {
         outcome = await this.launchWithRetries(liveCall, parsed);
@@ -581,9 +568,7 @@ export class WorkflowRun {
           outcome = { ok: false, status: 'aborted', value: null, error: error.message };
         } else outcome = this.settleLaunchFailure(liveCall, error);
       }
-      const waiters = this.waiters.get(key) ?? [];
-      this.waiters.delete(key);
-      for (const resolve of waiters) resolve(outcome);
+      this.resolveCall(liveCall, outcome);
     });
 
     const outcome = await promise;
@@ -666,19 +651,25 @@ export class WorkflowRun {
 
   // ── agent scheduling ────────────────────────────────────────────────────
 
-  private enqueue(callKey: string, task: () => Promise<void>): void {
+  private resolveCall(call: LiveCall, outcome: WorkflowAgentOutcome): void {
+    const resolve = call.resolveOutcome;
+    call.resolveOutcome = undefined;
+    resolve?.(outcome);
+  }
+
+  private enqueue(call: LiveCall, task: () => Promise<void>): void {
     let started = false;
     let released = false;
     // Idempotent for both the normal end of the task and an early release.
     const release = () => {
       if (!started || released) return;
       released = true;
-      this.slotReleases.delete(callKey);
+      call.releaseSlot = undefined;
       this.activeAgents--;
       const next = this.queue.shift();
       if (next) next();
     };
-    this.slotReleases.set(callKey, release);
+    call.releaseSlot = release;
     const start = () => {
       started = true;
       this.activeAgents++;
@@ -741,27 +732,21 @@ export class WorkflowRun {
    */
   private teardown(reason: string): void {
     this.abortController.abort(new Error(reason));
-    // Cancel launches that are still opening panes: their children must never
-    // start, and their slots must come back without waiting for the launcher.
-    for (const controller of this.abandonment.values()) controller.abort();
-    for (const handle of this.running.values()) this.manager.service.stop(handle.name);
-    // Drain rather than clear: a queued task that never starts would leave its
-    // caller waiting forever.
+    // Drain rather than clear: queued calls still need their launch task settled.
     const queue = this.queue.splice(0);
     for (const start of queue) start();
+    const outcome: WorkflowAgentOutcome = { ok: false, status: "aborted", value: null, error: reason };
     for (const live of this.live.values()) {
+      live.abandonment?.abort();
+      if (live.handle) this.manager.service.stop(live.handle.name);
       if (!isCallSettled(live.status)) {
-        try { this.recordOutcome(live, { ok: false, status: "aborted", value: null, error: reason }); }
+        try { this.recordOutcome(live, outcome); }
         catch { live.status = 'aborted'; live.error = reason; live.finishedAt = this.now(); }
       }
+      this.resolveCall(live, outcome);
+      // Pending spawns cannot hold the queue; the task's finally is idempotent.
+      live.releaseSlot?.();
     }
-    for (const [key, waiters] of this.waiters) {
-      this.waiters.delete(key);
-      for (const resolve of waiters) resolve({ ok: false, status: "aborted", value: null, error: reason });
-    }
-    // Release whatever the launch tasks were still holding. Their own
-    // finally-handlers no-op afterwards, so nothing is double-counted.
-    for (const release of [...this.slotReleases.values()]) release();
   }
 
   private async launchAgent(liveCall: LiveCall, parsed: ParsedAgentArgs): Promise<WorkflowAgentOutcome> {
@@ -803,7 +788,7 @@ export class WorkflowRun {
     // launching cancels the launch and releases its slot immediately. A service
     // that ignores cancellation still has its late handle stopped on return.
     const abandonment = new AbortController();
-    this.abandonment.set(liveCall.callKey, abandonment);
+    liveCall.abandonment = abandonment;
 
     try {
       mkdirSync(callDir, { recursive: true });
@@ -874,7 +859,7 @@ export class WorkflowRun {
           ...(liveCall.error ? { error: liveCall.error } : {}),
         };
       }
-      this.running.set(liveCall.callKey, handle);
+      liveCall.handle = handle;
 
       const ended = await withRunAbort(
         completion,
@@ -938,42 +923,25 @@ export class WorkflowRun {
       // error text). Decide it before reading the sidecar: a stale structured
       // result or a half-finished summary must never turn a dead agent into a
       // successful answer.
+      let value: unknown = null;
+      let error: string | undefined;
       if (result.exitCode !== 0) {
-        return this.recordOutcome(liveCall, {
-          ok: false,
-          status: "failed",
-          value: null,
-          error: result.error ?? `agent exited with code ${result.exitCode}`,
-          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
-          completion: result,
-        });
+        error = result.error ?? `agent exited with code ${result.exitCode}`;
+      } else {
+        const structured = parsed.opts.schema ? readStructuredResult(resultFile) : undefined;
+        value = parsed.opts.schema ? structured?.value ?? null : result.summary;
+        error = structured?.error;
+        if (!error && parsed.opts.schema && !Value.Check(workflowResultSchema(parsed.opts.schema), value)) {
+          error = 'structured output does not match the schema';
+        }
       }
-      const structured = parsed.opts.schema ? readStructuredResult(resultFile) : undefined;
-      if (parsed.opts.schema && structured?.error) {
-        return this.recordOutcome(liveCall, {
-          ok: false,
-          status: "failed",
-          value: null,
-          error: structured.error,
-          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
-          completion: result,
-        });
-      }
-
-      const value = parsed.opts.schema ? structured?.value ?? null : result.summary;
-      if (parsed.opts.schema && !Value.Check(workflowResultSchema(parsed.opts.schema), value)) {
-        return this.recordOutcome(liveCall, {
-          ok: false, status: 'failed', value: null, error: 'structured output does not match the schema',
-          session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
-          completion: result,
-        });
-      }
+      const ok = result.exitCode === 0 && !error;
       return this.recordOutcome(liveCall, {
-        ok: true,
-        status: "completed",
-        value,
+        ok,
+        status: ok ? "completed" : "failed",
+        value: ok ? value : null,
+        error,
         session: { sessionId: result.sessionId, usage: result.usage, model: result.usage?.model ?? parsed.opts.model },
-        completion: result,
       });
     } catch (error: any) {
       return this.recordOutcome(liveCall, {
@@ -983,8 +951,8 @@ export class WorkflowRun {
         error: error?.message ?? String(error),
       });
     } finally {
-      this.abandonment.delete(liveCall.callKey);
-      this.running.delete(liveCall.callKey);
+      liveCall.abandonment = undefined;
+      liveCall.handle = undefined;
     }
   }
 
@@ -1020,7 +988,6 @@ export class WorkflowRun {
       value: unknown;
       error?: string;
       session?: { sessionId?: string; usage?: WorkflowUsage; model?: string };
-      completion?: { elapsedMs?: number };
     },
   ): WorkflowAgentOutcome {
     // A call the user skipped (or the run aborted) already settled: the agent
@@ -1113,7 +1080,7 @@ export class WorkflowRun {
       },
     });
 
-    if (result.ok && (this.waiters.size > 0 || this.activeChildren > 0) && !this.signal.aborted) {
+    if (result.ok && ([...this.live.values()].some(call => call.resolveOutcome) || this.activeChildren > 0) && !this.signal.aborted) {
       this.failRun('Workflow returned with unawaited agent() or workflow() calls; await all child work before returning.');
     }
 
@@ -1151,7 +1118,7 @@ export class WorkflowRun {
       this.persistSnapshot(true);
     }
 
-    this.finish();
+    await this.finish();
     return this.view();
   }
 
@@ -1199,30 +1166,26 @@ export class WorkflowRun {
     live.status = "skipped";
     live.finishedAt = entry.finishedAt;
     live.error = "skipped by user";
-    const handle = this.running.get(callKey);
-    if (handle) this.manager.service.stop(handle.name);
-    // Stop the launch task from waiting on a watcher that may never settle: the
-    // call is decided, and its slot has to go back to the queue now.
-    this.abandonment.get(callKey)?.abort();
-    // The spawn may still be opening its pane; the queue must not wait for it.
-    this.slotReleases.get(callKey)?.();
-    const waiters = this.waiters.get(callKey);
-    this.waiters.delete(callKey);
-    if (waiters) for (const resolve of waiters) resolve({ ok: false, status: "skipped", value: null, error: "skipped by user" });
+    if (live.handle) this.manager.service.stop(live.handle.name);
+    // Stop pending spawns/watchers and release the slot before their task ends.
+    live.abandonment?.abort();
+    live.releaseSlot?.();
+    this.resolveCall(live, { ok: false, status: "skipped", value: null, error: "skipped by user" });
     this.snapshot.spentTokens = this.budgetView().spent;
     this.snapshot.agentAttempts = this.launchedAgents;
     this.persistSnapshot(true);
     return true;
   }
 
-  private finish(): void {
+  private async finish(): Promise<void> {
     if (this.finished) return;
     this.finished = true;
     // Replay values and prompts are durable in the journal. Historical UI
     // views need only call metadata; Resume reloads its own cache from disk.
     this.cache.clear();
+    this.cacheNamespaces.clear();
     for (const call of this.live.values()) call.prompt = "";
-    if (this.lockPath && !releaseLock(this.lockPath)) this.note("could not persist lock release; retained ownership for a later retry");
+    if (this.lockPath && !await releaseLock(this.lockPath)) this.note("could not persist lock release; retained ownership for a later retry");
     this.manager.onSettled?.(this.view());
   }
 
@@ -1284,9 +1247,7 @@ export class WorkflowRun {
     };
   }
 
-  private viewFor(callKey: string): WorkflowAgentResultMeta | undefined {
-    const live = this.live.get(callKey);
-    if (!live) return undefined;
+  private viewFor(live: LiveCall): WorkflowAgentResultMeta {
     const status = live.status === "running" ? this.manager.service.status(live.name ?? "") : undefined;
     return {
       callKey: live.callKey,
@@ -1309,7 +1270,7 @@ export class WorkflowRun {
   }
 
   view(): WorkflowRunView {
-    const calls = [...this.live.keys()].map((key) => this.viewFor(key)!).filter(Boolean);
+    const calls = [...this.live.values()].map(call => this.viewFor(call));
     const total = calls.length;
     const stats = summarizeCalls(calls);
     return {
@@ -1399,13 +1360,13 @@ export class WorkflowManager {
     // A brand-new run id owns its directory, so this always succeeds; the lock
     // still matters because it is what blocks a second process from resuming
     // the run while this one is live.
-    const lock = acquireLock(run.runDir, this.options.service.ownership?.current());
+    const lock = await acquireLock(run.runDir, this.options.service.ownership?.current());
     if (!lock.ok) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);
     run.setLockPath(lock.path);
     try {
       writeFileSync(scriptPath(run.runDir), params.source, "utf8");
     } catch (error) {
-      releaseLock(lock.path);
+      await releaseLock(lock.path);
       throw error;
     }
     this.runs.set(runId, run);
@@ -1430,7 +1391,7 @@ export class WorkflowManager {
     const scriptFile = scriptPath(runDir);
     const edited = overrides?.source?.trim() ? overrides.source : undefined;
 
-    const lock = acquireLock(runDir, this.options.service.ownership?.current());
+    const lock = await acquireLock(runDir, this.options.service.ownership?.current());
     if (!lock.ok) {
       throw new WorkflowScriptError(
         `Run ${runId} is locked by process ${lock.ownerPid || "unknown"}${lock.reason ? ` (${lock.reason})` : ""}. ` +
@@ -1456,14 +1417,9 @@ export class WorkflowManager {
       }
       const source = edited ?? readFileSync(scriptFile, "utf8");
       const parsed = parseScript(source, runId);
-      if (edited) writeFileSync(scriptFile, source, "utf8");
       const journal = loadJournal(journalPath(runDir));
       skippedLines = journal.skippedLines;
-      const cache = new Map<string, CachedCall>();
-      for (const [key, entry] of journal.entries) {
-        if (entry.status !== "completed") continue;
-        cache.set(key, { value: entry.value, isNull: entry.valueIsNull, entry });
-      }
+      const cache = completedCache(journal.entries);
       const args = overrides && "args" in overrides ? overrides.args : snapshot.args;
       run = new WorkflowRun(this.options, {
         runId,
@@ -1485,8 +1441,9 @@ export class WorkflowManager {
         priorSpent: Math.max(snapshot.spentTokens ?? 0, journal.records.reduce((total, entry) => total + (entry.replayed ? 0 : entry.attemptTokens ?? entry.usage?.totalTokens ?? 0), 0)),
         priorAttempts: Math.max(snapshot.agentAttempts ?? 0, journal.records.filter(entry => !entry.replayed).length),
       });
+      if (edited) writeFileAtomic(scriptFile, source);
     } catch (error) {
-      releaseLock(lock.path);
+      await releaseLock(lock.path);
       throw error;
     }
     if (skippedLines > 0) {
@@ -1532,11 +1489,7 @@ export class WorkflowManager {
       if (!snapshot || snapshot.meta.name !== workflowName) continue;
       if (JSON.stringify(snapshot.args ?? null) !== wanted) continue;
       const { entries } = loadJournal(journalPath(runDir));
-      const cache = new Map<string, CachedCall>();
-      for (const [key, entry] of entries) {
-        if (entry.status !== "completed") continue;
-        cache.set(key, { value: entry.value, isNull: entry.valueIsNull, entry });
-      }
+      const cache = completedCache(entries);
       if (cache.size === 0) continue;
       candidates.push({ runId, createdAt: snapshot.createdAt ?? snapshot.startedAt ?? 0, cache });
     }
@@ -1603,6 +1556,14 @@ export class WorkflowManager {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+function completedCache(entries: Map<string, WorkflowJournalEntry>): Map<string, CachedCall> {
+  const cache = new Map<string, CachedCall>();
+  for (const [key, entry] of entries) {
+    if (entry.status === "completed") cache.set(key, { value: entry.value, entry });
+  }
+  return cache;
+}
 
 interface ParsedAgentArgs {
   prompt: string;

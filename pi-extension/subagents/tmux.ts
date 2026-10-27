@@ -158,6 +158,16 @@ function runTmux(args: string[], allowFailure = false): string {
   }
 }
 
+async function runTmuxAsync(args: string[], allowFailure = false): Promise<string> {
+  requireTmux();
+  try {
+    return (await execFileAsync("tmux", args, { encoding: "utf8" })).stdout;
+  } catch (error) {
+    if (allowFailure) return "";
+    throw error;
+  }
+}
+
 /** True when tmux lost the pane/window a placement read its snapshot from. */
 function isStaleTargetError(error: unknown): boolean {
   const e = error as { stderr?: string | Buffer; message?: string };
@@ -231,16 +241,19 @@ function parsePaneMarks(lines: string[]): PaneInfo[] {
   return panes;
 }
 
+function paneWindowArgs(pane: string): string[] {
+  return [
+    "display-message", "-p", "-t", pane, "W|#{window_id}", ";",
+    "list-panes", "-t", pane, "-F", "P|#{pane_id}|#{@pi_subagent}",
+  ];
+}
+
 /** The pane's window and its panes, or nothing when the pane is gone. */
 function readPaneWindow(pane: string): { window: string; panes: PaneInfo[] } | undefined {
-  const raw = runTmux(
-    [
-      "display-message", "-p", "-t", pane, "W|#{window_id}",
-      ";",
-      "list-panes", "-t", pane, "-F", "P|#{pane_id}|#{@pi_subagent}",
-    ],
-    true,
-  );
+  return parsePaneWindow(runTmux(paneWindowArgs(pane), true));
+}
+
+function parsePaneWindow(raw: string): { window: string; panes: PaneInfo[] } | undefined {
   const lines = raw.split("\n").filter((line) => line.length > 0);
   const head = lines.find((line) => line.startsWith("W|"));
   if (!head) return undefined;
@@ -514,84 +527,112 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   return stdout;
 }
 
-/** Close only this pane and its delegated descendants, including overflow windows. */
-export function closeSurfaceTree(root: string): void {
-  requireTmux();
-  const rows = runTmux(["list-panes", "-a", "-F", "#{pane_id}|#{@pi_subagent_parent}"], true)
-    .trim().split("\n").map(line => line.split("|"));
-  const owned = new Set([root]);
-  const order = [root];
+/** One snapshot supplies pane ancestry and live process roots. */
+const CLOSE_FORMAT = "#{pane_id}|#{@pi_subagent_parent}|#{pane_pid}|#{pane_dead}";
+const PS_ARGS = ["-axo", "pid=,ppid=,args="];
+
+function childrenByParent<T>(rows: T[], parent: (row: T) => string | number): Map<string | number, T[]> {
+  const children = new Map<string | number, T[]>();
+  for (const row of rows) {
+    const key = parent(row);
+    const siblings = children.get(key);
+    if (siblings) siblings.push(row); else children.set(key, [row]);
+  }
+  return children;
+}
+
+function descendants<T extends string | number>(roots: T[], children: (id: T) => T[]): T[] {
+  const order = [...new Set(roots)];
+  const seen = new Set(order);
   for (let i = 0; i < order.length; i++) {
-    for (const [pane, parent] of rows) {
-      if (parent === order[i] && pane && !owned.has(pane)) { owned.add(pane); order.push(pane); }
+    for (const child of children(order[i])) {
+      if (!seen.has(child)) { seen.add(child); order.push(child); }
     }
   }
-  // Detached bash tools (and timeout's separate process group) do not receive
-  // the pane's SIGHUP. Stop their actual descendants before losing the ancestry.
-  const roots = runTmux(["list-panes", "-a", "-F", "#{pane_id}|#{pane_pid}|#{pane_dead}"], true)
-    .trim().split("\n").map(line => line.split("|"))
-    .filter(([pane, , dead]) => owned.has(pane) && dead !== "1")
-    .map(([, pid]) => Number(pid)).filter(pid => pid > 0);
-  const processes = execFileSync("ps", ["-axo", "pid=,ppid=,args="], { encoding: "utf8" })
-    .trim().split("\n").map(line => {
-      const [, pid, parent, command] = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)!;
-      return { pid: Number(pid), parent: Number(parent), command };
-    });
-  const descendants = [...roots];
-  const found = new Set(roots);
-  for (let i = 0; i < descendants.length; i++) {
-    for (const child of processes) {
-      if (child.parent === descendants[i] && !found.has(child.pid)) {
-        found.add(child.pid); descendants.push(child.pid);
-      }
-    }
+  return order;
+}
+
+function surfaceTreePanes(root: string, snapshot: string, processSnapshot: string): string[] {
+  const panes = snapshot.trim().split("\n").filter(Boolean).map(line => {
+    const [id, parent, pid, dead] = line.split("|");
+    return { id, parent, pid: Number(pid), dead: dead === "1" };
+  });
+  const paneChildren = childrenByParent(panes, pane => pane.parent);
+  const order = descendants([root], id => paneChildren.get(id)?.map(pane => pane.id) ?? []);
+  const owned = new Set(order);
+  const roots = panes.filter(pane => owned.has(pane.id) && !pane.dead && pane.pid > 0).map(pane => pane.pid);
+  const processes = new Map<number, { pid: number; parent: number; command: string }>();
+  for (const line of processSnapshot.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (match) processes.set(Number(match[1]), { pid: Number(match[1]), parent: Number(match[2]), command: match[3] });
   }
-  const guardian = fileURLToPath(new URL("./surface-guardian.ts", import.meta.url));
-  for (const pid of descendants.slice(roots.length).reverse()) {
-    // Guardians must survive to consume EOF and remove their own scratch.
-    if (processes.find(child => child.pid === pid)!.command.startsWith(`${process.execPath} ${guardian} `)) continue;
+  const processChildren = childrenByParent([...processes.values()], child => child.parent);
+  const pids = descendants(roots, pid => processChildren.get(pid)?.map(child => child.pid) ?? []);
+  const rootPids = new Set(roots);
+  const guardian = `${process.execPath} ${fileURLToPath(new URL("./surface-guardian.ts", import.meta.url))} `;
+  // Detached tools do not receive pane SIGHUP. Kill deepest descendants first,
+  // leaving guardians alive to consume EOF and remove their own scratch.
+  for (const pid of pids.reverse()) {
+    if (rootPids.has(pid) || processes.get(pid)?.command.startsWith(guardian)) continue;
     try { process.kill(pid, "SIGKILL"); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   }
-  for (const pane of order.reverse()) closeSurface(pane);
+  return order.reverse();
 }
 
-/**
- * Close a pane.
- */
-export function closeSurface(surface: string): void {
-  requireTmux();
+/** Close only this pane and its delegated descendants, including overflow windows. */
+export function closeSurfaceTree(root: string): void {
+  const snapshot = runTmux(["list-panes", "-a", "-F", CLOSE_FORMAT], true);
+  const processes = execFileSync("ps", PS_ARGS, { encoding: "utf8" });
+  for (const pane of surfaceTreePanes(root, snapshot, processes)) closeSurface(pane);
+}
+
+/** Async counterpart for callers that can yield while tmux and ps run. */
+export async function closeSurfaceTreeAsync(root: string): Promise<void> {
+  const snapshot = await runTmuxAsync(["list-panes", "-a", "-F", CLOSE_FORMAT], true);
+  const processes = (await execFileAsync("ps", PS_ARGS, { encoding: "utf8" })).stdout;
+  for (const pane of surfaceTreePanes(root, snapshot, processes)) {
+    // Re-read ownership after each await: users can split or move panes while
+    // cleanup runs, and a stale snapshot must not rearrange their new panes.
+    const live = parsePaneWindow(await runTmuxAsync(paneWindowArgs(pane), true));
+    const remembered = surfaceWindows.get(pane);
+    const panes = !live && remembered
+      ? parsePaneMarks((await runTmuxAsync(["list-panes", "-t", remembered.window, "-F", "P|#{pane_id}|#{@pi_subagent}"], true)).split("\n"))
+      : undefined;
+    const command = surfaceCloseCommand(pane, live, panes);
+    if (command.length) await runTmuxAsync(command, true);
+  }
+}
+
+/** Build the same ownership-aware kill/layout command for single panes and trees. */
+function surfaceCloseCommand(
+  surface: string,
+  live?: { window: string; panes: PaneInfo[] },
+  windowPanes?: PaneInfo[],
+): string[] {
   const remembered = surfaceWindows.get(surface);
   surfaceWindows.delete(surface);
-
-  const live = readPaneWindow(surface);
   const window = live?.window ?? remembered?.window;
-  if (!window) {
-    runTmux(["kill-pane", "-t", surface], true);
-    return;
-  }
-
-  // Never lay out a window we do not own. The pane's mark is this tree's id;
-  // if the pane is gone, the tree recorded when we placed it is still valid.
-  const tree = live?.panes.find((pane) => pane.id === surface)?.tree || remembered?.tree;
-  const panes = live?.panes ?? readWindowPanes(window);
+  if (!window) return ["kill-pane", "-t", surface];
+  const tree = live?.panes.find(pane => pane.id === surface)?.tree || remembered?.tree;
+  const panes = live?.panes ?? windowPanes;
   const layout = tree && panes ? ownedLayout(panes, tree) : undefined;
+  if (!live) return layout ? ["select-layout", "-t", window, layout] : [];
+  // A failed kill aborts the rest of tmux's command list; a vanished pane must
+  // never cause an unrelated window to be rearranged.
+  return live.panes.length > 1 && layout
+    ? ["kill-pane", "-t", surface, ";", "select-layout", "-t", window, layout]
+    : ["kill-pane", "-t", surface];
+}
 
-  if (!live) {
-    // The pane is gone; re-even its window only if it is still ours.
-    if (layout) runTmux(["select-layout", "-t", window, layout], true);
-    return;
-  }
-  // A tmux command that fails aborts the rest of the command list, so the kill
-  // and the re-layout are bundled only when the read above proved the pane is
-  // still there to kill.
-  if (live.panes.length === 1 || !layout) {
-    // The window closes with its last pane; a foreign window is left alone.
-    runTmux(["kill-pane", "-t", surface], true);
-    return;
-  }
-  runTmux(["kill-pane", "-t", surface, ";", "select-layout", "-t", window, layout], true);
+/** Close a pane and repair only a window this tree owns. */
+export function closeSurface(surface: string): void {
+  const live = readPaneWindow(surface);
+  const remembered = surfaceWindows.get(surface);
+  const panes = !live && remembered ? readWindowPanes(remembered.window) : undefined;
+  const command = surfaceCloseCommand(surface, live, panes);
+  if (command.length) runTmux(command, true);
 }
 
 // ── Exit polling ──
@@ -635,7 +676,31 @@ function readExitSidecar(sessionFile: string): PollResult | null {
   } catch { return null; }
 }
 
+function readCompletionFile(file: string | undefined, cli?: boolean): PollResult | null {
+  if (!file) return null;
+  if (existsSync(file)) return { reason: "sentinel", exitCode: 0 };
+  const diagnostic = `${file}.hook-error`;
+  if (cli && existsSync(diagnostic)) {
+    try {
+      const data = JSON.parse(readFileSync(diagnostic, "utf8"));
+      return { reason: "error", exitCode: 1, errorMessage: data.errorMessage };
+    } catch (error: any) {
+      return { reason: "error", exitCode: 1, errorMessage: `Cannot read CLI hook diagnostic: ${error.message}` };
+    }
+  }
+  return null;
+}
+
 export const __pollForExitTest__ = { interpretExitSidecar };
+
+// Concurrent native pollers share one in-flight server snapshot. No cached
+// result survives the query, so a later poll always observes manual pane closes.
+let paneLiveness: Promise<Set<string>> | undefined;
+function livePanes(): Promise<Set<string>> {
+  return paneLiveness ??= runTmuxAsync(["list-panes", "-a", "-F", "#{pane_id}|#{pane_dead}"])
+    .then(raw => new Set(raw.trim().split("\n").filter(row => row.endsWith("|0")).map(row => row.slice(0, -2))))
+    .finally(() => { paneLiveness = undefined; });
+}
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -666,36 +731,24 @@ export async function pollForExit(
       if (exit) return exit;
     }
 
-    // Check the native CLI hook result (or shell-exit result).
-    if (options.sentinelFile && existsSync(options.sentinelFile)) {
-      return { reason: "sentinel", exitCode: 0 };
-    }
+    const completion = readCompletionFile(options.sentinelFile, options.cli);
+    if (completion) return completion;
 
-    if (options.cli && options.sentinelFile) {
-      const diagnostic = `${options.sentinelFile}.hook-error`;
-      if (existsSync(diagnostic)) {
-        try {
-          const data = JSON.parse(readFileSync(diagnostic, "utf8"));
-          return { reason: "error", exitCode: 1, errorMessage: data.errorMessage };
-        } catch (error: any) {
-          return { reason: "error", exitCode: 1, errorMessage: `Cannot read CLI hook diagnostic: ${error.message}` };
-        }
-      }
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
+    // Native CLI completion comes from hooks/files; only Pi needs terminal
+    // capture for its startup/crash sentinel fallback.
     try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match && !options.cli) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      if (options.cli) {
+        if (!(await livePanes()).has(surface)) throw new Error("Native pane exited");
+      } else {
+        const match = (await readScreenAsync(surface, 5)).match(/__SUBAGENT_DONE_(\d+)__/);
+        if (match) return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
       // Native pane exits are definitive: no surrounding shell survives it.
       if (options.cli) {
-        if (options.sentinelFile && existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
+        const completion = readCompletionFile(options.sentinelFile, true);
+        if (completion) return completion;
         return { reason: "error", exitCode: 1, errorMessage: "Native CLI pane closed before reporting completion." };
       }
       // Surface may have been destroyed — check if .exit file appeared in the meantime

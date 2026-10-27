@@ -63,7 +63,7 @@ export interface SubagentPluginSurface {
   runningSubagents: Map<string, RunningSubagent>;
   /** Shared with manual launches, including names whose panes are still opening. */
   reservedNames?: Set<string>;
-  closeSurface?: (surface: string) => void;
+  closeSurface?: (surface: string) => void | Promise<void>;
   registerName(artifactDir: string, name: string, value: { sessionFile: string; sessionId?: string }): void;
   readNameRegistry(artifactDir: string): Record<string, { sessionFile: string; sessionId?: string }>;
   getArtifactDir(sessionDir: string, sessionId: string): string;
@@ -193,7 +193,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       } catch (error) {
         if (ownedRunning) {
           ownedRunning.abortController?.abort();
-          try { close(ownedRunning.surface); } catch { /* only the failed launch's owned surface */ }
+          try { await close(ownedRunning.surface); } catch { /* only the failed launch's owned surface */ }
           cleanupVerifyScratch(ownedRunning.verifyScratchDir);
           if (surface.runningSubagents.get(ownedRunning.id) === ownedRunning) {
             surface.runningSubagents.delete(ownedRunning.id);
@@ -211,7 +211,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       return surface.steer(resolved.running, message);
     },
 
-    stop(name: string) {
+    async stop(name: string) {
       // Closing the pane ends the child process; the watcher then observes the
       // exit on its own, so the run's outcome stays accurate instead of being
       // reported as an abort of the watcher.
@@ -220,7 +220,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
       try { writeFileSync(`${resolved.running.sessionFile}.workflow-aborted`, "aborted"); } catch {}
       try { unlinkSync(`${resolved.running.sessionFile}.ask`); } catch {}
       try {
-        close(resolved.running.surface);
+        await close(resolved.running.surface);
       } catch {
         // Pane already gone.
       }

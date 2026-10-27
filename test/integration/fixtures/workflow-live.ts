@@ -199,7 +199,7 @@ export default function liveFixture(pi: any) {
         const lockModule = new URL('../../../pi-extension/subagents/workflow/journal.ts', import.meta.url).href;
         const crashedOwner = spawnSync(process.execPath, ['--input-type=module', '-e', `
           const {acquireLock} = await import(${JSON.stringify(lockModule)});
-          if (!acquireLock(${JSON.stringify(aborted.runDir)}).ok) throw new Error('live crash probe could not own the run');
+          if (!(await acquireLock(${JSON.stringify(aborted.runDir)})).ok) throw new Error('live crash probe could not own the run');
           process.kill(process.pid, 'SIGKILL');
         `], {encoding:'utf8', timeout:10000});
         assert.equal(crashedOwner.signal, 'SIGKILL', crashedOwner.stderr);

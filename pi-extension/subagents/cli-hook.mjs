@@ -1,7 +1,7 @@
 /** Hook shared by Codex notify, Claude Stop/StopFailure, and the launch shell.
  * No dependencies, no global config edits, and no transcript directory scans.
  */
-import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, statSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { getLeafId } from './session.ts';
@@ -78,59 +78,89 @@ function acknowledgeInputs(resultFile, completed, inputs) {
     pending.splice(index, 1);
   }
 }
-function readClaudeTranscript(path) {
-  const lines = readFileSync(path, 'utf8').split('\n');
-  const tail = lines.pop();
-  const entries = lines.filter(Boolean).map(line => JSON.parse(line));
-  // A hook can observe an unfinished trailing record; complete records stay strict.
-  if (tail) {
-    try { entries.push(JSON.parse(tail)); } catch {}
-  }
-  return entries;
-}
-function claudeTranscriptInputs(event) {
-  if (!event.transcript_path || !existsSync(event.transcript_path)) return [];
-  const entries = readClaudeTranscript(event.transcript_path);
-  // Inputs after the final assistant entry may still be waiting for a turn.
-  const lastAssistant = entries.findLastIndex(entry => entry.type === 'assistant');
-  return entries.slice(0, lastAssistant + 1).filter(entry => !entry.isSidechain).flatMap(entry => {
-    // Claude may absorb live input into the current turn as a queued_command
-    // attachment, rather than creating a standalone user message.
-    if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command' &&
-        entry.attachment.origin?.kind === 'human' && entry.attachment.commandMode === 'prompt') {
-      return typeof entry.attachment.prompt === 'string' && entry.uuid
-        ? [{ id: entry.uuid, text: entry.attachment.prompt }] : [];
+const claudeText = content => typeof content === 'string' ? content : Array.isArray(content)
+  ? content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '';
+// One reader per hook: unchanged polls reuse both parsing and turn selection.
+// The returned snapshot also survives waiting for the run lock, where a later
+// turn may already have appended records to the same transcript.
+function claudeTranscriptReader(event) {
+  let version, snapshot;
+  const empty = { inputs: [], summary: '', flushed: false };
+  return () => {
+    if (!event.transcript_path) return empty;
+    let stat;
+    try { stat = statSync(event.transcript_path, { bigint: true }); }
+    catch (error) { if (error.code === 'ENOENT') return empty; throw error; }
+    const nextVersion = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    if (nextVersion === version) return snapshot;
+    const lines = readFileSync(event.transcript_path, 'utf8').split('\n');
+    const tail = lines.pop();
+    const entries = lines.filter(Boolean).map(line => JSON.parse(line));
+    // Only the unfinished trailing record is allowed to be malformed.
+    if (tail) { try { entries.push(JSON.parse(tail)); } catch {} }
+    const history = entries.filter(entry => !entry.isSidechain);
+    const start = event.prompt_id ? history.findIndex(entry =>
+      entry.type === 'user' && !entry.isMeta && entry.promptId === event.prompt_id) : -1;
+    let end = history.length;
+    if (start >= 0) {
+      const next = history.findIndex((entry, i) => i > start && entry.type === 'user' &&
+        !entry.isMeta && entry.promptId && entry.promptId !== event.prompt_id);
+      if (next >= 0) end = next;
     }
-    if (entry.type !== 'user' || entry.isMeta) return [];
-    const content = entry.message?.content;
-    const text = typeof content === 'string' ? content : Array.isArray(content)
-      ? content.filter(block => block.type === 'text').map(block => block.text).join('\n') : '';
-    return text && entry.uuid ? [{ id: entry.uuid, text, promptId: entry.promptId }] : [];
-  });
+    // Legacy transcripts may omit promptId entirely. Never borrow a different
+    // explicitly identified turn when this hook's input has not flushed yet.
+    const missingTurn = event.prompt_id && start < 0 && history.some(entry =>
+      entry.type === 'user' && !entry.isMeta && entry.promptId);
+    const inTurn = (entry, i) => i >= Math.max(0, start) && i < end && entry.type === 'assistant';
+    // Stop has answer text, not an assistant ID. Equal replies within one
+    // prompt span are ambiguous: use the earliest match so an older Stop cannot
+    // acknowledge a later queued_command. That input needs distinct turn evidence.
+    let assistant = missingTurn ? -1 : event.last_assistant_message
+      ? history.findIndex((entry, i) => inTurn(entry, i) &&
+          claudeText(entry.message?.content) === event.last_assistant_message)
+      : history.findLastIndex(inTurn);
+    const flushed = assistant >= 0 && (!event.prompt_id || start >= 0);
+    if (assistant < 0 && !missingTurn) assistant = history.findLastIndex(inTurn);
+    let summary = claudeText(history[assistant]?.message?.content);
+    // An older Stop may omit its payload text; skip empty tool-use records.
+    if (!event.last_assistant_message && !summary) {
+      for (let i = assistant - 1; i >= Math.max(0, start); i--) {
+        if (history[i].type === 'assistant' && (summary = claudeText(history[i].message?.content))) break;
+      }
+    }
+    const inputs = history.slice(0, assistant < 0 ? 0 : assistant).flatMap(entry => {
+      // Live input can be absorbed into a turn as a human queued_command.
+      if (entry.type === 'attachment' && entry.attachment?.type === 'queued_command' &&
+          entry.attachment.origin?.kind === 'human' && entry.attachment.commandMode === 'prompt') {
+        return typeof entry.attachment.prompt === 'string' && entry.uuid
+          ? [{ id: entry.uuid, text: entry.attachment.prompt }] : [];
+      }
+      if (entry.type !== 'user' || entry.isMeta) return [];
+      const text = claudeText(entry.message?.content);
+      return text && entry.uuid ? [{ id: entry.uuid, text, promptId: entry.promptId }] : [];
+    });
+    snapshot = { inputs, summary, flushed };
+    version = nextVersion;
+    return snapshot;
+  };
 }
-// Claude writes its transcript asynchronously. Wait outside the run lock so
-// the parent can still submit or cancel while the final record is flushed.
+// Wait outside the run lock so the parent can still submit or cancel.
 async function waitForClaudeTranscript(event) {
-  if (event.hook_event_name !== 'Stop' || !event.transcript_path || !event.last_assistant_message) return;
+  if (event.hook_event_name !== 'Stop') return;
+  const read = claudeTranscriptReader(event);
+  if (!event.transcript_path || !event.last_assistant_message) return read();
   const deadline = Date.now() + 5000;
   for (;;) {
-    if (existsSync(event.transcript_path)) {
-      const entries = readClaudeTranscript(event.transcript_path);
-      const last = entries.findLastIndex(entry => entry.type === 'assistant' && !entry.isSidechain);
-      const text = entries[last]?.message?.content?.filter(block => block.type === 'text').map(block => block.text).join('\n');
-      // Equal answers from an earlier turn must not satisfy a new Stop.
-      const hasInput = !event.prompt_id || entries.slice(0, last).some(entry =>
-        entry.type === 'user' && !entry.isSidechain && entry.promptId === event.prompt_id);
-      if (hasInput && text === event.last_assistant_message) return;
-    }
+    const snapshot = read();
+    if (snapshot.flushed) return snapshot;
     if (Date.now() >= deadline) throw new Error('Claude transcript did not flush the completed turn within 5s.');
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 }
-export function handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
-  return withCliRunLock(resultFile, () => handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event));
+export function handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event, snapshot) {
+  return withCliRunLock(resultFile, () => handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event, snapshot));
 }
-function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event) {
+function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event, snapshot) {
   const sidecar = `${sessionFile}.cli.json`;
   const session = JSON.parse(readFileSync(sidecar, 'utf8'));
   if (existsSync(resultFile)) return; // A completed run cannot be overwritten by shell exit.
@@ -159,7 +189,7 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     if (event.session_id !== session.nativeId) return;
     // Resume history must not count as processing a prompt submitted in this run.
     if (!existsSync(`${resultFile}.claude-seen.json`)) {
-      atomicJson(`${resultFile}.claude-seen.json`, claudeTranscriptInputs(event).map(input => input.id));
+      atomicJson(`${resultFile}.claude-seen.json`, claudeTranscriptReader(event)().inputs.map(input => input.id));
     }
     return;
   }
@@ -183,28 +213,18 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     atomicJson(sidecar, session);
   }
   const failed = event.hook_event_name === 'StopFailure';
-  let summary = (kind === 'codex' ? event['last-assistant-message'] : event.last_assistant_message) || '';
-  // Older Claude versions omit last_assistant_message in Stop payloads.
-  if (!failed && !summary && kind === 'claude' && event.transcript_path) {
-    try {
-      const entries = readClaudeTranscript(event.transcript_path);
-      for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (entry.type !== 'assistant' || entry.isSidechain) continue;
-        summary = entry.message?.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') || '';
-        if (summary) break;
-      }
-    } catch {}
-  }
-  if (typeof summary !== 'string') summary = '';
-  if (failed && !summary) summary = `Claude Code error: ${event.error_details || event.error || 'unknown'}`;
-  const result = { summary, exitCode: failed ? 1 : 0, nativeId: session.nativeId };
-  if (event.transcript_path) result.transcriptPath = event.transcript_path;
   const turnId = kind === 'codex' ? event['turn-id'] : event.prompt_id;
   let previous = null;
   try { previous = JSON.parse(readFileSync(`${resultFile}.latest`, 'utf8')); } catch {}
   const completedTurns = previous?.completedTurns || [];
   if (!failed && turnId && completedTurns.includes(turnId)) return;
+  if (kind === 'claude' && !failed) snapshot ??= claudeTranscriptReader(event)();
+  // Older Claude versions omit the answer in Stop; use the same turn snapshot.
+  let summary = (kind === 'codex' ? event['last-assistant-message'] : event.last_assistant_message) || snapshot?.summary || '';
+  if (typeof summary !== 'string') summary = '';
+  if (failed && !summary) summary = `Claude Code error: ${event.error_details || event.error || 'unknown'}`;
+  const result = { summary, exitCode: failed ? 1 : 0, nativeId: session.nativeId };
+  if (event.transcript_path) result.transcriptPath = event.transcript_path;
   const completedInputs = previous?.completedInputs || [];
   if (kind === 'codex' && Array.isArray(event['input-messages'])) {
     // Every submitted Codex prompt has a unique receipt. Match outstanding
@@ -216,20 +236,18 @@ function handleLockedEvent(kind, sessionFile, resultFile, modeOrExitCode, event)
     // actual completed turn, never to a later prompt merely visible on disk.
     const submitted = existsSync(`${resultFile}.submitted.json`)
       ? JSON.parse(readFileSync(`${resultFile}.submitted.json`, 'utf8')) : {};
-    if (event.prompt_id) {
-      acknowledgeInputs(resultFile, completedInputs, [submitted[event.prompt_id]]);
-    }
     let seen = [];
     try { seen = JSON.parse(readFileSync(`${resultFile}.claude-seen.json`, 'utf8')); } catch {}
-    const inputs = [];
-    for (const input of claudeTranscriptInputs(event)) {
-      if (seen.includes(input.id)) continue;
-      seen.push(input.id);
+    const ids = new Set(seen);
+    const inputs = event.prompt_id ? [submitted[event.prompt_id]] : [];
+    for (const input of snapshot.inputs) {
+      if (ids.has(input.id)) continue;
+      ids.add(input.id);
       if (input.promptId && Object.hasOwn(submitted, input.promptId)) continue;
       inputs.push(input.text);
     }
     acknowledgeInputs(resultFile, completedInputs, inputs);
-    atomicJson(`${resultFile}.claude-seen.json`, seen);
+    atomicJson(`${resultFile}.claude-seen.json`, [...ids]);
   }
   if (turnId && !completedTurns.includes(turnId)) completedTurns.push(turnId);
   appendFileSync(sessionFile, JSON.stringify({
@@ -263,8 +281,8 @@ if (isMainModule()) {
   const [kind, sessionFile, resultFile, modeOrExitCode, payload] = process.argv.slice(2);
   try {
     const event = kind === 'exit' ? {} : JSON.parse(kind === 'codex' ? payload : readFileSync(0, 'utf8'));
-    if (kind === 'claude') await waitForClaudeTranscript(event);
-    handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event);
+    const snapshot = kind === 'claude' ? await waitForClaudeTranscript(event) : undefined;
+    handleCliEvent(kind, sessionFile, resultFile, modeOrExitCode, event, snapshot);
   } catch (error) {
     // Hook errors must be observable but must never block the CLI's own loop.
     console.error(`pi subagent hook: ${error.message}`);

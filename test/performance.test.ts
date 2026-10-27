@@ -152,7 +152,9 @@ it('the status widget provider excludes finished workflow histories', async t =>
   } finally { for (const hook of hooks) await hook({ reason: 'quit' }, ctx); gate.resolve(); }
 });
 
-it('typing does not rebuild workflow views and idle/headless sessions start no widget timer', async () => {
+it('typing does not rebuild workflow views and idle/headless sessions start no widget timer', async t => {
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
   const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
   let factory: Function | undefined;
   const api: any = { on(event: string, handler: Function) { hooks.set(event, [...(hooks.get(event) ?? []), handler]); },
@@ -172,10 +174,24 @@ it('typing does not rebuild workflow views and idle/headless sessions start no w
   try {
     __test__.runningSubagents.set('perf', { id: 'perf', name: 'perf', cli: 'codex', startTime: Date.now(), statusState: createStatusState({ source: 'codex', startTimeMs: Date.now() }) } as any);
     __test__.updateWidget();
+    const child = __test__.runningSubagents.get('perf')!;
+    const statusState = child.statusState;
+    let statusReads = 0;
+    Object.defineProperty(child, 'statusState', { get() { statusReads++; return statusState; } });
     const widget = factory!({}, {});
     const before = views;
     for (let i = 0; i < 100; i++) widget.render(100);
     assert.equal(views, before, '100 input/stream redraws must reuse the refresh snapshot');
+    assert.equal(statusReads, 1, 'unchanged redraws must not reclassify or format every child');
+    child.name = 'updated-child';
+    widget.invalidate();
+    assert.match(widget.render(100).join(String.fromCharCode(10)), /updated-child/);
+    assert.equal(statusReads, 2, 'invalidation must reveal changed content');
+    widget.render(60);
+    assert.equal(statusReads, 3, 'resize must rebuild the frame at the new width');
+    clock += 1000;
+    widget.render(60);
+    assert.equal(statusReads, 4, 'elapsed labels must refresh on the next second');
     const summary = workflowSummary({ progress: 0.5, totalCount: 2, activeCount: 1, meta: { name: 'active' }, usage: {},
       get calls() { throw new Error('widget must use the existing progress aggregate'); } } as any, 100).join('\n');
     assert.match(summary, /1\/2 settled/);

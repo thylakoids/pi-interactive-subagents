@@ -135,7 +135,7 @@ const __wfCheckBatch = (count, what) => {
 };
 const parallel = (thunks) => {
   __wfCheckBatch(thunks.length, "parallel()");
-  return Promise.all(thunks.map((runThunk) => __wfSettled(runThunk())));
+  return Promise.all(thunks.map((runThunk) => __wfSettled(Promise.resolve().then(() => runThunk()))));
 };
 const pipeline = (items, ...stages) => {
   __wfCheckBatch(items.length, "pipeline()");

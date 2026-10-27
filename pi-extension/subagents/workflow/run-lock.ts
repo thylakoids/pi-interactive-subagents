@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 // flock protects only this short transaction, not the workflow lifetime. The
 // stable guard inode is never unlinked: unlinking it would create two mutexes.
@@ -173,12 +174,17 @@ with open(guard, 'a+b') as mutex:
 
 export type RunLockResult = { ok: true; path: string; reclaimedResourceOwner?: string | null } | { ok: false; ownerPid: number; reason?: string };
 
-export function runLockTransaction(directory: string, operation: "acquire" | "release", token: string, resourceOwner = ""): RunLockResult {
-  const child = spawnSync("python3", ["-c", RUN_LOCK_HELPER, directory, operation, String(process.pid), token, resourceOwner], {
-    encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
-  });
-  if (child.error || child.status !== 0) {
-    throw new Error(`Workflow lock transaction failed (Python 3 with fcntl is required): ${child.error?.message ?? child.stderr.trim()}`);
+export async function runLockTransaction(directory: string, operation: "acquire" | "release", token: string, resourceOwner = ""): Promise<RunLockResult> {
+  let stdout: string;
+  try {
+    ({ stdout } = await promisify(execFile)("python3", ["-c", RUN_LOCK_HELPER, directory, operation, String(process.pid), token, resourceOwner], {
+      encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
+    }));
+  } catch (error: any) {
+    const detail = error.killed && error.code === null
+      ? "python3 transaction timed out after 10000ms"
+      : typeof error.code === "number" || error.signal ? error.stderr?.trim() ?? "" : error.message;
+    throw new Error(`Workflow lock transaction failed (Python 3 with fcntl is required): ${detail}`);
   }
-  return JSON.parse(child.stdout);
+  return JSON.parse(stdout);
 }

@@ -31,9 +31,9 @@ for (const boundary of ['before-flush', 'after-flush', 'after-publish', 'after-r
     writeFileSync(program, `
       import cp from 'node:child_process';
       import {syncBuiltinESMExports} from 'node:module';
-      const original = cp.spawnSync;
+      const original = cp.execFile;
       let injected = false;
-      cp.spawnSync = (cmd, args, ...rest) => {
+      cp.execFile = (cmd, args, ...rest) => {
         const release = ${JSON.stringify(boundary)} === 'after-release';
         if (cmd === 'python3' && args[3] === (release ? 'release' : 'acquire') && !injected) {
           injected = true;
@@ -45,12 +45,18 @@ for (const boundary of ['before-flush', 'after-flush', 'after-publish', 'after-r
         }
         return original(cmd, args, ...rest);
       };
+      cp.execFile[Symbol.for('nodejs.util.promisify.custom')] = (...args) => new Promise((resolve, reject) => {
+        cp.execFile(...args, (error, stdout, stderr) => {
+          if (error) reject(Object.assign(error, {stdout, stderr}));
+          else resolve({stdout, stderr});
+        });
+      });
       syncBuiltinESMExports();
       const {acquireLock, releaseLock} = await import(${JSON.stringify(moduleUrl)});
       try {
-        const result = acquireLock(${JSON.stringify(dir)});
+        const result = await acquireLock(${JSON.stringify(dir)});
         if (!result.ok) throw new Error('unexpected lock refusal');
-        releaseLock(result.path);
+        await releaseLock(result.path);
         process.send({ok:true});
       } catch(error) { process.send({error:error.message}); }
     `);
@@ -70,7 +76,7 @@ for (const boundary of ['before-flush', 'after-flush', 'after-publish', 'after-r
     const guardInode = statSync(join(dir, 'lock.guard')).ino;
     assert.match(readlinkSync(join(dir, 'lock.reclaim')), /kernel-guard/);
     assert.throws(() => mkdirSync(join(dir, 'lock.reclaim')), /EEXIST/, 'old-version recovery must also see a competing transaction');
-    const contender = acquireLock(dir);
+    const contender = await acquireLock(dir);
     assert.equal(contender.ok, false, 'even an unpublished/removed record cannot bypass an active kernel transaction');
     if (!contender.ok) assert.match(contender.reason!, /transaction is active/);
     if (boundary === 'before-flush' || boundary === 'after-flush') {
@@ -81,14 +87,17 @@ for (const boundary of ['before-flush', 'after-flush', 'after-publish', 'after-r
     const [result] = await message as any[];
     await closed;
     if (boundary === 'after-release') assert.equal(result.ok, true, stderr);
-    else assert.match(result.error, /lock transaction failed/);
+    else {
+      assert.match(result.error, /lock transaction failed/);
+      assert.ok(!result.error.includes('import fcntl'), 'signal failures must not include the helper source');
+    }
     assert.equal(existsSync(join(dir, 'lock')), false, 'lost acknowledgements must not strand live-parent ownership');
     assert.equal(readdirSync(dir).some(name => name.startsWith('.lock-owner-')), false);
-    const recovered = acquireLock(dir);
+    const recovered = await acquireLock(dir);
     assert.ok(recovered.ok, 'the crashed transaction and its gate must recover without manual deletion');
     assert.ok(existsSync(join(dir, 'lock.guard')), 'the kernel guard must never be unlinked');
     assert.equal(statSync(join(dir, 'lock.guard')).ino, guardInode, 'all transactions must keep using the same kernel mutex inode');
-    releaseLock(recovered.path);
+    await releaseLock(recovered.path);
   });
 }
 
@@ -96,7 +105,7 @@ it('a stopped live owner is never stolen, and SIGKILL then permits automatic rec
   const dir = directory(t);
   const child = spawn(process.execPath, ['--input-type=module','-e', `
     const {acquireLock} = await import(${JSON.stringify(moduleUrl)});
-    process.send(acquireLock(${JSON.stringify(dir)}));
+    process.send(await acquireLock(${JSON.stringify(dir)}));
     setInterval(() => {},1000);
   `], {stdio:['ignore','ignore','pipe','ipc']});
   const closed = once(child, 'close');
@@ -105,15 +114,15 @@ it('a stopped live owner is never stolen, and SIGKILL then permits automatic rec
   assert.ok(owner.ok);
   child.kill('SIGSTOP');
   utimesSync(join(dir,'lock'),new Date(0),new Date(0));
-  const contender = acquireLock(dir);
+  const contender = await acquireLock(dir);
   assert.equal(contender.ok, false, 'mtime is not evidence of process death');
   if (!contender.ok) assert.equal(contender.ownerPid,child.pid);
   child.kill('SIGKILL');
   await closed;
-  const recovered = acquireLock(dir);
+  const recovered = await acquireLock(dir);
   assert.ok(recovered.ok);
   assert.notEqual(JSON.parse(readFileSync(recovered.path,'utf8')).pid,child.pid);
-  releaseLock(recovered.path);
+  await releaseLock(recovered.path);
 });
 
 it('a killed transaction holder leaves only automatically recoverable artifacts', {timeout:15000}, async t => {
@@ -126,55 +135,101 @@ it('a killed transaction holder leaves only automatically recoverable artifacts'
   const closed = once(child,'close');
   t.after(async () => { child.kill('SIGKILL'); await closed; });
   await until(() => existsSync(ready));
-  assert.equal(acquireLock(dir).ok,false);
+  assert.equal((await acquireLock(dir)).ok,false);
   child.kill('SIGKILL');
   await closed;
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.ok(result.ok);
   assert.equal(readdirSync(dir).some(name => name.startsWith('.lock-owner-')),false);
-  releaseLock(result.path);
+  await releaseLock(result.path);
 });
+
+for (const fault of ['timeout', 'output-limit']) {
+  it('async lock helper preserves bounded execution and failure reporting: ' + fault, t => {
+    const dir = directory(t);
+    const program = join(dir, 'bounded-helper.mjs');
+    writeFileSync(program, `
+      import cp from 'node:child_process';
+      import assert from 'node:assert/strict';
+      import {syncBuiltinESMExports} from 'node:module';
+      const original = cp.execFile;
+      const custom = Symbol.for('nodejs.util.promisify.custom');
+      const execute = original[custom];
+      let injected = false;
+      cp.execFile = (...args) => original(...args);
+      cp.execFile[custom] = (command, args, options) => {
+        assert.equal(options.timeout, 10000);
+        assert.equal(options.maxBuffer, 64 * 1024);
+        if (!injected) {
+          injected = true;
+          args = [...args];
+          if (${JSON.stringify(fault)} === 'timeout') {
+            args[1] = 'import time; time.sleep(2)\\n' + args[1];
+            options = {...options, timeout:100};
+          } else {
+            args[1] = "print('x' * 70000)\\n" + args[1];
+          }
+        }
+        return execute(command, args, options);
+      };
+      syncBuiltinESMExports();
+      const {acquireLock, releaseLock} = await import(${JSON.stringify(moduleUrl)});
+      await assert.rejects(acquireLock(${JSON.stringify(dir)}), error => {
+        assert.match(error.message, /^Workflow lock transaction failed \\(Python 3 with fcntl is required\\):/);
+        assert.match(error.message, ${fault === 'timeout' ? '/timed out/' : '/maxBuffer/'});
+        assert.ok(!error.message.includes('import fcntl'), 'diagnostics must not include the helper source');
+        return true;
+      });
+      const recovered = await acquireLock(${JSON.stringify(dir)});
+      assert.ok(recovered.ok, JSON.stringify(recovered));
+      assert.equal(await releaseLock(recovered.path), true);
+    `);
+    const child = spawnSync(process.execPath, [program], {encoding:'utf8', timeout:5000});
+    assert.equal(child.status, 0, child.stderr || child.error?.message);
+    assert.equal(existsSync(join(dir, 'lock')), false);
+  });
+}
 
 it('an unavailable lock backend fails closed instead of publishing an unsafe fallback', t => {
   const dir = directory(t);
-  const program = `const {acquireLock} = await import(${JSON.stringify(moduleUrl)}); acquireLock(${JSON.stringify(dir)});`;
+  const program = `const {acquireLock} = await import(${JSON.stringify(moduleUrl)}); await acquireLock(${JSON.stringify(dir)});`;
   const child = spawnSync(process.execPath,['--input-type=module','-e',program],{env:{...process.env,PATH:dir},encoding:'utf8'});
   assert.notEqual(child.status,0);
   assert.match(child.stderr,/Python 3 with fcntl is required/);
   assert.equal(existsSync(join(dir,'lock')),false);
 });
 
-it('a foreign-host record cannot be reclaimed using a local dead PID', t => {
+it('a foreign-host record cannot be reclaimed using a local dead PID', async t => {
   const dir = directory(t);
   const dead = spawnSync(process.execPath,['-e','']);
   assert.equal(dead.status,0);
   const data = JSON.stringify({pid:dead.pid,token:'remote',host:'different-host.invalid'});
   writeFileSync(join(dir,'lock'),data);
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.equal(result.ok,false);
   if (!result.ok) assert.match(result.reason!,/another host/);
   assert.equal(readFileSync(join(dir,'lock'),'utf8'),data);
 });
 
-it('release IO failure preserves the token and recovers after storage repair', {skip:process.getuid?.() === 0}, t => {
+it('release IO failure preserves the token and recovers after storage repair', {skip:process.getuid?.() === 0}, async t => {
   const dir = directory(t);
-  const owned = acquireLock(dir);
+  const owned = await acquireLock(dir);
   assert.ok(owned.ok);
   chmodSync(dir,0o500);
   try {
-    assert.equal(releaseLock(owned.path),false);
+    assert.equal(await releaseLock(owned.path),false);
     assert.ok(existsSync(owned.path));
   } finally { chmodSync(dir,0o700); }
-  const next = acquireLock(dir);
+  const next = await acquireLock(dir);
   assert.ok(next.ok,'same-process retry must release the known completed owner after IO repair');
-  releaseLock(next.path);
+  await releaseLock(next.path);
 });
 
 it('kernel identity proves a reused PID is not the original owner', {timeout:15000}, async t => {
   const dir = directory(t);
   const child = spawn(process.execPath,['--input-type=module','-e',`
     const {acquireLock} = await import(${JSON.stringify(moduleUrl)});
-    process.send(acquireLock(${JSON.stringify(dir)}));
+    process.send(await acquireLock(${JSON.stringify(dir)}));
     setInterval(() => {},1000);
   `],{stdio:['ignore','ignore','pipe','ipc']});
   const closed = once(child,'close');
@@ -189,31 +244,31 @@ it('kernel identity proves a reused PID is not the original owner', {timeout:150
   // Preserve the dead owner's real kernel birth identity but simulate its PID
   // being assigned to this still-live, different process instance.
   writeFileSync(owned.path,JSON.stringify({...previous,pid:process.pid}));
-  const recovered = acquireLock(dir);
+  const recovered = await acquireLock(dir);
   assert.ok(recovered.ok,'a live reused PID must not strand a provably dead incarnation');
   const current = JSON.parse(readFileSync(recovered.path,'utf8'));
   assert.notEqual(current.identity.start,previous.identity.start);
-  releaseLock(recovered.path);
+  await releaseLock(recovered.path);
 });
 
-it('a different PID namespace is not inferred dead even when its PID is absent locally', t => {
+it('a different PID namespace is not inferred dead even when its PID is absent locally', async t => {
   const dir = directory(t);
-  const owned = acquireLock(dir);
+  const owned = await acquireLock(dir);
   assert.ok(owned.ok);
   const original = JSON.parse(readFileSync(owned.path,'utf8'));
   assert.ok(original.identity);
-  assert.equal(releaseLock(owned.path),true);
+  assert.equal(await releaseLock(owned.path),true);
   const dead = spawnSync(process.execPath,['-e','']);
   assert.equal(dead.status,0);
   writeFileSync(owned.path,JSON.stringify({...original,pid:dead.pid,identity:{...original.identity,namespace:'another-pid-namespace'}}));
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.equal(result.ok,false,'a local ESRCH says nothing about a process in another PID namespace');
   if (!result.ok) assert.match(result.reason!,/another PID namespace/);
 });
 
-it('identity inspection failure does not steal a known owner', t => {
+it('identity inspection failure does not steal a known owner', async t => {
   const dir = directory(t);
-  const owned = acquireLock(dir);
+  const owned = await acquireLock(dir);
   assert.ok(owned.ok);
   const before = readFileSync(owned.path,'utf8');
   const code = RUN_LOCK_HELPER.replace("if sys.platform == 'linux':", "if True: return None\n        if sys.platform == 'linux':");
@@ -221,7 +276,7 @@ it('identity inspection failure does not steal a known owner', t => {
   assert.notEqual(child.status,0);
   assert.match(child.stderr,/cannot inspect.*identity/);
   assert.equal(readFileSync(owned.path,'utf8'),before);
-  releaseLock(owned.path);
+  await releaseLock(owned.path);
 });
 
 it('an unavailable birth-identity backend never publishes a PID-only lock', t => {
@@ -233,13 +288,13 @@ it('an unavailable birth-identity backend never publishes a PID-only lock', t =>
   assert.equal(existsSync(join(dir,'lock')),false);
 });
 
-it('an identity-less legacy record cannot be reaped using namespace-blind PID liveness', t => {
+it('an identity-less legacy record cannot be reaped using namespace-blind PID liveness', async t => {
   const dir = directory(t);
   const dead = spawnSync(process.execPath,['-e','']);
   assert.equal(dead.status,0);
   const data = JSON.stringify({pid:dead.pid,token:'legacy'});
   writeFileSync(join(dir,'lock'),data);
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.equal(result.ok,false,'a locally absent PID cannot prove an unknown-scope legacy owner died');
   if (!result.ok) assert.match(result.reason!,/legacy.*identity.*manual inspection/);
   assert.equal(readFileSync(join(dir,'lock'),'utf8'),data);

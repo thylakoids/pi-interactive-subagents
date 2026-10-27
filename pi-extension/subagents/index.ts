@@ -23,7 +23,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
-  closeSurfaceTree,
+  closeSurfaceTreeAsync,
   shellEscape,
   currentTree,
   startSurfaceProcess,
@@ -833,13 +833,11 @@ function captureSessionDefaults(pi: ExtensionAPI, model?: { provider?: string; i
   }
 }
 
-/** Interval timer for widget re-renders. */
+/** One clock for status transitions and widget refreshes. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
 let workflowViews: () => WorkflowRunView[] = () => [];
 let workflowShortcut = "Ctrl+Alt+W";
 
-/** Interval timer for status transition checks. */
-let statusInterval: ReturnType<typeof setInterval> | null = null;
 
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -948,25 +946,28 @@ function updateWidget() {
   const views = latestCtx?.hasUI ? workflowViews() : [];
   if (!latestCtx?.hasUI || (runningSubagents.size === 0 && !views.some(view => view.status === "running"))) {
     if (latestCtx?.hasUI) latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
+    if (widgetInterval && runningSubagents.size === 0) {
       clearInterval(widgetInterval);
       widgetInterval = null;
     }
     return false;
   }
 
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, views);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+  latestCtx.ui.setWidget("subagent-status", () => {
+    let cachedWidth = -1, cachedSecond = -1;
+    let lines: string[] = [];
+    return {
+      invalidate() { cachedWidth = -1; },
+      render(width: number) {
+        const second = Math.floor(Date.now() / 1000);
+        if (width !== cachedWidth || second !== cachedSecond) {
+          lines = renderSubagentWidgetLines([...runningSubagents.values()], width, views);
+          cachedWidth = width; cachedSecond = second;
+        }
+        return lines;
+      },
+    };
+  }, { placement: "aboveEditor" });
   return true;
 }
 
@@ -1292,54 +1293,28 @@ async function handleSubagentSteer(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
-
-  statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
-      if (statusInterval) {
-        clearInterval(statusInterval);
-        statusInterval = null;
-      }
-      return;
+function refreshStatus(pi: ExtensionAPI) {
+  if (!statusConfig.enabled) return;
+  const transitionLines: string[] = [];
+  const now = Date.now();
+  for (const running of runningSubagents.values()) {
+    const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
+    running.statusState = nextState;
+    // Interactive children update the widget without waking the parent.
+    if (transition && !running.interactive) {
+      transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
     }
+  }
+  if (!transitionLines.length) return;
+  const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+  pi.sendMessage({ customType: "subagent_status",
+    content: formatStatusAggregate(transitionLines, statusConfig.lineLimit), display: true,
+    details: { lines: capped.visibleLines, overflow: capped.overflow },
+  }, { triggerTurn: true, deliverAs: "steer" });
+}
 
-    const transitionLines: string[] = [];
-    const now = Date.now();
-    let shouldRefreshWidget = false;
-
-    for (const running of runningSubagents.values()) {
-      const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
-      if (nextState.currentKind !== running.statusState.currentKind) {
-        shouldRefreshWidget = true;
-      }
-      running.statusState = nextState;
-
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
-        transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
-      }
-    }
-
-    if (shouldRefreshWidget) updateWidget();
-
-    if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-      pi.sendMessage(
-        {
-          customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
-          display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
-    }
-  }, 1000);
-
+function startStatusRefresh(_pi: ExtensionAPI) {
+  if (statusConfig.enabled && runningSubagents.size) startRefreshClock();
 }
 
 // Resuming a finished session is always autonomous: the relaunched agent runs
@@ -1392,12 +1367,15 @@ export const __test__ = {
   slugifyName,
 };
 
-function startWidgetRefresh() {
-  if (widgetInterval) return;
-  if (!updateWidget()) return;
-  widgetInterval = setInterval(() => {
+function startRefreshClock() {
+  widgetInterval ??= setInterval(() => {
+    if (latestPi) refreshStatus(latestPi);
     updateWidget();
   }, 1000);
+}
+
+function startWidgetRefresh() {
+  if (!widgetInterval && updateWidget()) startRefreshClock();
 }
 
 /**
@@ -1995,14 +1973,26 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
-  } finally { cleanupRunningSubagent(running); }
+  } finally { await cleanupRunningSubagent(running); }
 }
 
-function cleanupRunningSubagent(running: RunningSubagent): void {
-  if (!runningSubagents.delete(running.id)) return;
-  try { closeSurfaceTree(running.surface); } catch {}
+const closingSurfaces = new Map<string, Promise<void>>();
+
+function closeOwnedSurface(surface: string): Promise<void> {
+  let closing = closingSurfaces.get(surface);
+  if (!closing) {
+    closing = closeSurfaceTreeAsync(surface).catch(() => {}).finally(() => closingSurfaces.delete(surface));
+    closingSurfaces.set(surface, closing);
+  }
+  return closing;
+}
+
+async function cleanupRunningSubagent(running: RunningSubagent): Promise<void> {
+  if (runningSubagents.get(running.id) !== running) return;
+  await closeOwnedSurface(running.surface);
   if (!running.cli) rmSync(piInbox(running.sessionFile, running.id), { recursive: true, force: true });
   cleanupVerifyScratch(running.verifyScratchDir);
+  runningSubagents.delete(running.id);
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -2026,10 +2016,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-    }
-    if (statusInterval) {
-      clearInterval(statusInterval);
-      statusInterval = null;
     }
   });
 
@@ -2714,7 +2700,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       resolveRunning: resolveRunningByName,
       runningSubagents,
       reservedNames,
-      closeSurface: closeSurfaceTree,
+      closeSurface: closeOwnedSurface,
       registerName,
       readNameRegistry,
       getArtifactDir,
@@ -2761,12 +2747,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Workflow shutdown runs first so its calls are durably aborted before the
   // shared registry disappears. Then close any remaining manual children.
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     moduleAbort.abort();
-    for (const agent of runningSubagents.values()) {
+    const cleanups = [...runningSubagents.values()].map(agent => {
       agent.abortController?.abort();
-      cleanupRunningSubagent(agent);
-    }
+      return cleanupRunningSubagent(agent);
+    });
+    await Promise.all([...cleanups, ...closingSurfaces.values()]);
     disposeSurfaceOwner();
   });
 

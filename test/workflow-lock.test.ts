@@ -19,7 +19,7 @@ it('exactly one process reclaims a dead run owner under synchronized contention'
   const dir = directory(t);
   const dead = spawnSync(process.execPath, ['--input-type=module', '-e', `
     const {acquireLock} = await import(${JSON.stringify(journalModule)});
-    if (!acquireLock(${JSON.stringify(dir)}).ok) throw new Error('seed owner refused');
+    if (!(await acquireLock(${JSON.stringify(dir)})).ok) throw new Error('seed owner refused');
   `], {encoding:'utf8'});
   assert.equal(dead.status, 0, dead.stderr);
   assert.equal(JSON.parse(readFileSync(join(dir,'lock'),'utf8')).pid,dead.pid);
@@ -35,8 +35,8 @@ it('exactly one process reclaims a dead run owner under synchronized contention'
     for (let index = 0; index < 6; index++) {
       const child = spawn(process.execPath, ['--input-type=module', '-e', `
         const { acquireLock } = await import(${JSON.stringify(journalModule)});
-        process.on('message', () => {
-          const result = acquireLock(${JSON.stringify(dir)});
+        process.on('message', async () => {
+          const result = await acquireLock(${JSON.stringify(dir)});
           process.send({kind:'result', result});
         });
         process.send({kind:'ready'});
@@ -60,34 +60,73 @@ it('exactly one process reclaims a dead run owner under synchronized contention'
   assert.equal(JSON.parse(readFileSync(join(dir, 'lock'), 'utf8')).pid, winners[0].pid);
 });
 
-it('release cannot delete a replacement owner token', t => {
+it('same-process acquire and release transactions follow invocation order', async t => {
   const dir = directory(t);
-  const lock = acquireLock(dir);
+  const path = join(dir, 'lock');
+  const [first, released, second, releasedAgain] = await Promise.all([
+    acquireLock(dir, 'first-owner'),
+    releaseLock(path),
+    acquireLock(dir, 'second-owner'),
+    releaseLock(path),
+  ]);
+  assert.ok(first.ok, JSON.stringify(first));
+  assert.equal(released, true);
+  assert.ok(second.ok, JSON.stringify(second));
+  assert.equal(releasedAgain, true);
+  assert.equal(existsSync(path), false, 'queued release must see the token from the preceding acquisition');
+});
+
+it('same-process contenders retain the winning token for release', async t => {
+  const dir = directory(t);
+  const results = await Promise.all(Array.from({length:6}, () => acquireLock(dir)));
+  assert.equal(results.filter(result => result.ok).length, 1);
+  const winner = results.find(result => result.ok)!;
+  assert.ok(winner.ok);
+  assert.equal(await releaseLock(winner.path), true);
+  assert.equal(existsSync(winner.path), false, 'refused attempts must not replace the owned token');
+});
+
+it('a rejected transaction does not poison the per-path queue or lose pending cleanup', async t => {
+  const dir = join(directory(t), 'not-created-yet');
+  const failed = acquireLock(dir);
+  const release = releaseLock(join(dir, 'lock'));
+  await assert.rejects(failed, /Workflow lock transaction failed/);
+  assert.equal(await release, true);
+  mkdirSync(dir);
+  const recovered = await acquireLock(dir);
+  assert.ok(recovered.ok, JSON.stringify(recovered));
+  assert.equal(await releaseLock(recovered.path), true);
+  assert.equal(existsSync(recovered.path), false);
+});
+
+it('release cannot delete a replacement owner token', async t => {
+  const dir = directory(t);
+  const lock = await acquireLock(dir);
   assert.ok(lock.ok);
   writeFileSync(lock.path, JSON.stringify({ pid: process.pid, token: 'replacement-owner' }));
-  releaseLock(lock.path);
+  await releaseLock(lock.path);
   assert.ok(existsSync(lock.path), 'an obsolete cleanup must not remove another owner');
 });
 
-it('abandoned recovery guards fail closed without modifying the run lock', t => {
+it('abandoned recovery guards fail closed without modifying the run lock', async t => {
   const dir = directory(t);
   const path = join(dir, 'lock');
   writeFileSync(path, '{}');
   utimesSync(path, new Date(0), new Date(0));
   mkdirSync(path + '.reclaim');
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.equal(result.ok, false);
   if (!result.ok) assert.match(result.reason!, /manual inspection/);
   assert.equal(readFileSync(path, 'utf8'), '{}');
 });
 
-it('unknown lock owners are never stolen based only on age', t => {
+it('unknown lock owners are never stolen based only on age', async t => {
   const dir = directory(t);
   const path = join(dir, 'lock');
   writeFileSync(path, '{');
-  assert.equal(acquireLock(dir).ok, false);
+  assert.equal((await acquireLock(dir)).ok, false);
   utimesSync(path, new Date(0), new Date(0));
-  const result = acquireLock(dir);
+  const result = await acquireLock(dir);
   assert.equal(result.ok, false, 'a paused live writer can still own an old, not-yet-readable lock');
   if (!result.ok) assert.match(result.reason!, /manual inspection/);
   assert.equal(readFileSync(path, 'utf8'), '{');
@@ -109,9 +148,9 @@ it('resume reads snapshot and script only after acquiring ownership', t => {
     try {
       const run = await f.manager.start({source:script("return {seen:'stale-script'};"),args:{version:'stale'}});
       await run.execute();
-      const spawn = cp.spawnSync;
+      const spawn = cp.execFile;
       let injected = false;
-      cp.spawnSync = (command, args, ...rest) => {
+      cp.execFile = (command, args, ...rest) => {
         if (command === 'python3' && args[3] === 'acquire' && !injected) {
           injected = true;
           const path = join(run.runDir, 'snapshot.json');
@@ -122,6 +161,12 @@ it('resume reads snapshot and script only after acquiring ownership', t => {
         }
         return spawn(command, args, ...rest);
       };
+      cp.execFile[Symbol.for('nodejs.util.promisify.custom')] = (...args) => new Promise((resolve, reject) => {
+        cp.execFile(...args, (error, stdout, stderr) => {
+          if (error) reject(Object.assign(error, {stdout, stderr}));
+          else resolve({stdout, stderr});
+        });
+      });
       syncBuiltinESMExports();
       const view = await (await f.reload().resume(run.runId)).execute();
       assert.ok(injected);
@@ -165,7 +210,7 @@ for (const fault of ['script-write', 'lock-refused', 'lock-write']) {
       import { fixture, script } from ${JSON.stringify(helper)};
       const cleanups = [];
       const f = fixture({after(fn){cleanups.push(fn);}}, () => ({text:'unused'}), {baseDir:${JSON.stringify(dir)}});
-      const originalWrite = fs.writeFileSync, originalSpawn = cp.spawnSync;
+      const originalWrite = fs.writeFileSync, originalSpawn = cp.execFile;
       let runDir;
       fs.writeFileSync = (path, ...rest) => {
         if (${JSON.stringify(fault)} === 'script-write' && typeof path === 'string' && path.endsWith('/script.js')) {
@@ -174,7 +219,7 @@ for (const fault of ['script-write', 'lock-refused', 'lock-write']) {
         }
         return originalWrite(path, ...rest);
       };
-      cp.spawnSync = (command, args, ...rest) => {
+      cp.execFile = (command, args, ...rest) => {
         if (command === 'python3' && args[3] === 'acquire') {
           runDir = args[2];
           if (${JSON.stringify(fault)} === 'lock-refused') originalWrite(join(runDir,'lock'), JSON.stringify({pid:process.pid,token:'foreign-live-owner'}));
@@ -182,6 +227,12 @@ for (const fault of ['script-write', 'lock-refused', 'lock-write']) {
         }
         return originalSpawn(command, args, ...rest);
       };
+      cp.execFile[Symbol.for('nodejs.util.promisify.custom')] = (...args) => new Promise((resolve, reject) => {
+        cp.execFile(...args, (error, stdout, stderr) => {
+          if (error) reject(Object.assign(error, {stdout, stderr}));
+          else resolve({stdout, stderr});
+        });
+      });
       syncBuiltinESMExports();
       try {
         await assert.rejects(f.manager.start({source:script('return 1;'),args:{}}), /injected (script|lock) write failure|execution lock/);

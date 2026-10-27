@@ -16,7 +16,7 @@ it('resume reaps a verified dead owner before allowing replacement work', async 
   const module = new URL('../pi-extension/subagents/workflow/journal.ts', import.meta.url).href;
   const child = spawn(process.execPath, ['--input-type=module', '-e', `
     import {acquireLock} from ${JSON.stringify(module)};
-    process.send(acquireLock(${JSON.stringify(run.runDir)}, 'old-owner'));
+    process.send(await acquireLock(${JSON.stringify(run.runDir)}, 'old-owner'));
     setInterval(()=>{},1000);
   `], { stdio: ['ignore','ignore','pipe','ipc'] });
   const closed = once(child, 'close');
