@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Real tmux/OS checks for the async cleanup and native liveness paths. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

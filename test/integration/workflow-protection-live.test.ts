@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 import { integrationRuntime } from './runtime.ts';
 /** Opt-in, billed live-model coverage of launch cancellation and read-only steps. */
 import { it } from 'node:test';

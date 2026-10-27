@@ -11,8 +11,8 @@
  * Run: PI_NATIVE_CLI_LIVE=1 node --test test/integration/native-cli-live.test.ts
  */
 import { it } from 'node:test';
+import { isolatedTmux } from '../helpers/tmux.ts';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -22,10 +22,8 @@ import { shellEscape } from '../../pi-extension/subagents/tmux.ts';
 
 const live = process.env.PI_NATIVE_CLI_LIVE === '1';
 const kinds = (process.env.PI_NATIVE_CLI_KINDS ?? 'claude,codex').split(',');
-// New child panes inherit the tmux server's environment, not the Pi process's.
-const testMux = (socket: string, home: string) => (...args: string[]) => execFileSync('tmux', ['-S', socket, ...args], {
-  env: { ...process.env, CODEX_HOME: home }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-}).trim();
+// Child panes receive the private server's environment, including CODEX_HOME.
+const testMux = (socket: string, home: string) => isolatedTmux(socket, { CODEX_HOME: home });
 
 it('isolated Codex home reaches newly created tmux child panes without a model', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'codex-tmux-home-'));

@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /**
  * Integration tests for the full subagent lifecycle.
  *

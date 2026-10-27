@@ -1,7 +1,7 @@
 /** Real interactive shells; the server and history files belong only to this test. */
 import { it } from 'node:test';
+import { isolatedTmux } from '../helpers/tmux.ts';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,9 +16,9 @@ async function waitForFile(path: string) {
 for (const shell of process.platform === 'darwin' ? ['bash', 'zsh'] : ['bash']) {
   it('script launches execute without polluting opt-in ' + shell + ' history', {timeout:15000}, async t => {
     const dir = mkdtempSync(join(tmpdir(), 'pi-shell-history-'));
-    const socket = `pi-history-${process.pid}-${shell}`;
+    const socket = join(dir, 'tmux.sock');
     const previous = process.env.TMUX;
-    const tmux = (...args: string[]) => execFileSync('tmux', ['-L', socket, ...args], {encoding:'utf8'}).trim();
+    const tmux = isolatedTmux(socket);
     t.after(() => {
       try { tmux('kill-server'); } catch {}
       if (previous === undefined) delete process.env.TMUX;
@@ -27,7 +27,7 @@ for (const shell of process.platform === 'darwin' ? ['bash', 'zsh'] : ['bash']) 
     });
     const history = join(dir, 'history');
     const command = `env HISTFILE=${shellEscape(history)} HISTSIZE=1000 /bin/${shell} ${shell === 'bash' ? '--noprofile --norc -i' : '-f'}`;
-    const pane = tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'history', '-x', '100', '-y', '30', '-P', '-F', '#{pane_id}', command);
+    const pane = tmux('new-session', '-d', '-s', 'history', '-x', '100', '-y', '30', '-P', '-F', '#{pane_id}', command);
     process.env.TMUX = tmux('display-message', '-p', '-t', pane, '#{socket_path},#{pid},0');
     const ready = join(dir, 'ready');
     sendCommand(pane, (shell === 'bash' ? `HISTFILE=${shellEscape(history)}; HISTSIZE=1000; HISTFILESIZE=1000; HISTCONTROL=ignorespace; set -o history; history -c;` : 'SAVEHIST=1000; setopt HIST_IGNORE_SPACE INC_APPEND_HISTORY;')

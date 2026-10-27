@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Actual parent SIGKILL, OS pipe EOF and independent tmux resource ownership. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

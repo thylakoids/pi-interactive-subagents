@@ -161,7 +161,8 @@ exit "$status"
 WRAPPER
   chmod 0755 "$wrapper"
   log "tmux: starting the suite in owned session $session"
-  tmux new-session -d -s "$session" -x 160 -y 48 \
+  unset TMUX TMUX_PANE TMUX_SOCKET PI_SUBAGENT_TREE
+  tmux -f /dev/null new-session -d -s "$session" -x 160 -y 48 \
     env PI_LINUX_COMMAND="$COMMAND" PI_LINUX_SUITE_LOG="$SUITE_LOG" PI_LINUX_SENTINEL="$sentinel" "$wrapper"
   tail -n +1 -f "$SUITE_LOG" &
   live_tail=$!

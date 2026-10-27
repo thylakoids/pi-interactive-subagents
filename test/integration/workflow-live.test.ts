@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 import { integrationRuntime } from './runtime.ts';
 /** Opt-in, billed live-model coverage. No service or model substitutions. */
 import { it } from 'node:test';

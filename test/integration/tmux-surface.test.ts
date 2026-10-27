@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /**
  * Integration tests for the tmux surface layer.
  *
@@ -5,8 +6,8 @@
  * sending commands, reading screen output, and closing panes.
  * No LLM calls — fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run directly (the test owns its tmux server):
+ *   node --test test/integration/tmux-surface.test.ts
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";

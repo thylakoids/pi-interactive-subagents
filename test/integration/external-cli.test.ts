@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Tool integration tests using real tmux and stand-in native TUIs; not real CLI end-to-end coverage. */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";

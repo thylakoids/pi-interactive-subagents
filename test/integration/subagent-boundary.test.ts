@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** No model/network stand-ins for Pi itself: run the installed official TUI. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

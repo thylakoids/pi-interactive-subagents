@@ -25,7 +25,6 @@ import { tmpdir } from "node:os";
 import { integrationModel } from "./model.ts";
 import { integrationRuntime } from "./runtime.ts";
 import {
-  isMuxAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -80,7 +79,7 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
  * Returns ["tmux"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  try { execFileSync("tmux", ["-V"], { stdio: "ignore" }); return ["tmux"]; } catch { return []; }
 }
 
 export function focusSurface(surface: string): void {

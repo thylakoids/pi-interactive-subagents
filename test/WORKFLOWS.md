@@ -9,6 +9,9 @@ Run from the repository root:
   regression must fail an assertion, not just crash on an import or syntax error.
 
 No provider calls are needed for these commands. The terminal test needs Pi and tmux.
+Each test file owns a private tmux server with an empty configuration and clean tmux
+identity variables, including when invoked directly. The caller need not be inside
+tmux. Ordinary exit or interruption closes only the test server.
 
 ## What the tests actually prove
 

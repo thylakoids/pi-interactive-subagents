@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Billed Pi inbox probe: real TUI, foreground tool, multiline steering and queued continuation. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

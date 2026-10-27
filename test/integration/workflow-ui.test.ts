@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 import { integrationRuntime } from './runtime.ts';
 /** Real terminal navigation and original-session Focus, without model calls. */
 import { describe, it } from "node:test";

@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Real tmux cancellation ancestry, without model requests. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';

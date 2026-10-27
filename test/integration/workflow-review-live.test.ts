@@ -1,3 +1,4 @@
+import './tmux-isolation.ts';
 /** Opt-in billed provider E2E. Run only with PI_WORKFLOW_REVIEW_LIVE=1 and PI_TEST_MODEL. */
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
