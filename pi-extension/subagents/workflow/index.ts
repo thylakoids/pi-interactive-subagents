@@ -154,7 +154,7 @@ export function registerWorkflowExtension(pi: ExtensionAPI, options: WorkflowExt
   ): Promise<WorkflowRunView> => {
     const { manager: activeManager } = ensure(ctx);
     const availability = service.isAvailable();
-    if (params.action === "start" && !availability.ok) {
+    if (params.action === "start" && availability.ok === false) {
       throw new WorkflowScriptError(`Cannot run a workflow: ${availability.reason}.`);
     }
 

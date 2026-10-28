@@ -2,6 +2,7 @@
 
 Run from the repository root:
 
+- `npm run typecheck`: all production TypeScript against the pinned SDK, with null checking enabled.
 - `npm test`: unit tests and executable workflow contracts.
 - `node --test test/integration/workflow-ui.test.ts`: real Pi/tmux UI, confirmations,
   Skip/Abort/Resume against the real manager, and original-session Focus/reuse.

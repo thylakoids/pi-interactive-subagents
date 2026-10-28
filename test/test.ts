@@ -2132,6 +2132,23 @@ describe("subagent status renderer", () => {
     };
   }
 
+  it("supports SDK invalidation for result, status and question message components", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messages = [
+      { name: "subagent_result", details: { name: "worker", exitCode: 0, elapsed: 1000 } },
+      { name: "subagent_status", details: { lines: ["worker running"], overflow: 0 } },
+      { name: "subagent_question", details: { name: "worker", question: "Which input?" } },
+    ];
+    for (const { name, details } of messages) {
+      const renderer = registeredMessageRenderers.find(entry => entry.name === name)!.renderer;
+      const component = renderer({ customType: name, content: "Ready", details }, { expanded: true }, createTheme());
+      const before = component.render(80);
+      component.invalidate();
+      assert.deepEqual(component.render(80), before, name + " must preserve its output after invalidation");
+    }
+  });
+
   it("renders capped lines and overflow within wide and narrow widths", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);

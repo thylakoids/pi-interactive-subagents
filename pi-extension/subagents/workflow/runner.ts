@@ -356,7 +356,7 @@ export async function runScript(options: StartScriptOptions): Promise<ScriptResu
       .filter((item): item is { type: "text"; text: string } => item.type === "text")
       .map((item) => item.text);
 
-    if (result.ok) {
+    if (result.ok === true) {
       return { ok: true, value: result.value, output, fingerprint, issuedCalls };
     }
     return {

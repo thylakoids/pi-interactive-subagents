@@ -18,7 +18,7 @@
  * Fail closed: when no backend has been verified on the running platform, the
  * tool refuses to run anything. There is deliberately no unsandboxed fallback.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
@@ -95,6 +95,10 @@ export type VerifyResult = {
   /** Established by the guard below; false means the command never ran. */
   executed: boolean;
 };
+
+type VerifyToolDetails =
+  | ({ ok: false } & Pick<VerifyResult, "executed" | "backend" | "error">)
+  | ({ ok: true } & Pick<VerifyResult, "exitCode" | "timedOut" | "cancelled" | "truncated" | "outputBytes" | "backend">);
 
 export function clampTimeout(value: unknown, fallback = DEFAULT_VERIFY_TIMEOUT_MS): number {
   const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -365,7 +369,7 @@ export async function runVerifyCommand(input: {
     env: input.env,
     existsSync: input.existsSync,
   });
-  if (!resolution.ok) return fail(resolution.reason);
+  if (resolution.ok === false) return fail(resolution.reason);
   const backend = resolution.backend;
 
   const realpath = input.realpathSync ?? realpathSync;
@@ -614,7 +618,7 @@ export default function readonlyVerifyExtension(pi: ExtensionAPI): void {
       command: Type.String({ description: "Shell command to run, e.g. node --test test/foo.test.ts" }),
       timeout_ms: Type.Optional(Type.Number({ description: "Timeout in milliseconds (clamped to 1s..10min)" })),
     }),
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal): Promise<AgentToolResult<VerifyToolDetails>> {
       const result = await runVerifyCommand({
         command: params.command,
         scratchDir: scratch,

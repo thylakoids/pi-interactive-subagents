@@ -328,7 +328,7 @@ export function createSubagentActivityRecorder(params: {
     clearPendingFlush();
   }
 
-  function flushNow(): void {
+  const flushNow = (): void => {
     if (disabled) return;
     try {
       writeSubagentActivityFile(activityFile, activity);
@@ -338,7 +338,7 @@ export function createSubagentActivityRecorder(params: {
       failureCount += 1;
       if (failureCount >= MAX_WRITE_FAILURES) disable();
     }
-  }
+  };
 
   function scheduleFlush(): void {
     if (disabled || pendingFlush) return;

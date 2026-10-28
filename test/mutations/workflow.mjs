@@ -165,7 +165,7 @@ const mutants = [
     'writeFileSync(scriptPath(run.runDir), params.source, "utf8");\n    } catch (error) {',
     'partial initialization.*script-write', 'test/workflow-lock.test.ts'],
   ['start ignores execution lock refusal', 'pi-extension/subagents/workflow/manager.ts',
-    'if (!lock.ok) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);',
+    'if (lock.ok === false) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);',
     'if (false) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);',
     'partial initialization.*lock-refused', 'test/workflow-lock.test.ts'],
   ['obsolete lock cleanup deletes a replacement owner', 'pi-extension/subagents/workflow/run-lock.ts',

@@ -11,7 +11,7 @@ import { join as joinPath, dirname } from "node:path";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { getSessionId } from "./session.ts";
+import { getSessionId, type NameRegistry, type NameRegistryEntry } from "./session.ts";
 import { classifyStatus, formatStatusDetail } from "./status.ts";
 import { cleanupVerifyScratch } from "./workflow/readonly.ts";
 import { isMuxAvailable, muxSetupHint, closeSurfaceTree, reapSurfaceOwner } from "./tmux.ts";
@@ -39,7 +39,7 @@ export const STRUCTURED_OUTPUT_EXTENSION = joinPath(SUBAGENTS_DIR, "workflow", "
 export interface SubagentPluginSurface {
   launch(
     params: { agent: string; task: string; name: string; model?: string; cwd?: string },
-    ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+    ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
     options?: {
       extraExtensions?: string[];
       extraEnv?: Record<string, string>;
@@ -64,8 +64,8 @@ export interface SubagentPluginSurface {
   /** Shared with manual launches, including names whose panes are still opening. */
   reservedNames?: Set<string>;
   closeSurface?: (surface: string) => void | Promise<void>;
-  registerName(artifactDir: string, name: string, value: { sessionFile: string; sessionId?: string }): void;
-  readNameRegistry(artifactDir: string): Record<string, { sessionFile: string; sessionId?: string }>;
+  registerName(artifactDir: string, name: string, value: NameRegistryEntry): void;
+  readNameRegistry(artifactDir: string): NameRegistry;
   getArtifactDir(sessionDir: string, sessionId: string): string;
   updateWidget(): void;
   startWidgetRefresh(): void;
@@ -174,7 +174,7 @@ export function createWorkflowSubagentService(surface: SubagentPluginSurface): W
         ownedRunning = running;
         surface.registerName(surface.getArtifactDir(snapshot.sessionDir, snapshot.sessionId), running.name, {
           sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile) ?? undefined,
+          sessionId: getSessionId(running.sessionFile),
         });
         surface.startWidgetRefresh();
 

@@ -913,7 +913,7 @@ export class WorkflowRun {
 
       // The completion never rejects by now: its rejection became this value at
       // the point the handle arrived, so it is reported like any other failure.
-      if (!ended.value.ok) {
+      if (ended.value.ok === false) {
         this.manager.service.stop(handle.name);
         throw ended.value.error;
       }
@@ -982,11 +982,7 @@ export class WorkflowRun {
 
   private recordOutcome(
     liveCall: LiveCall,
-    params: {
-      ok: boolean;
-      status: WorkflowJournalEntry["status"];
-      value: unknown;
-      error?: string;
+    params: WorkflowAgentOutcome & {
       session?: { sessionId?: string; usage?: WorkflowUsage; model?: string };
     },
   ): WorkflowAgentOutcome {
@@ -1361,7 +1357,7 @@ export class WorkflowManager {
     // still matters because it is what blocks a second process from resuming
     // the run while this one is live.
     const lock = await acquireLock(run.runDir, this.options.service.ownership?.current());
-    if (!lock.ok) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);
+    if (lock.ok === false) throw new WorkflowScriptError(`Run ${runId} could not acquire its execution lock.`);
     run.setLockPath(lock.path);
     try {
       writeFileSync(scriptPath(run.runDir), params.source, "utf8");
@@ -1392,7 +1388,7 @@ export class WorkflowManager {
     const edited = overrides?.source?.trim() ? overrides.source : undefined;
 
     const lock = await acquireLock(runDir, this.options.service.ownership?.current());
-    if (!lock.ok) {
+    if (lock.ok === false) {
       throw new WorkflowScriptError(
         `Run ${runId} is locked by process ${lock.ownerPid || "unknown"}${lock.reason ? ` (${lock.reason})` : ""}. ` +
           "Abort it first, or resume after it settles. A lock with verifiable identity left by a dead process is reclaimed automatically.",
