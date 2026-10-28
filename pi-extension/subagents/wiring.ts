@@ -16,7 +16,7 @@ import { classifyStatus, formatStatusDetail } from "./status.ts";
 import { cleanupVerifyScratch } from "./workflow/readonly.ts";
 import { isMuxAvailable, muxSetupHint, closeSurfaceTree, reapSurfaceOwner } from "./tmux.ts";
 import { surfaceOwnerDirectory } from "./surface-owner.ts";
-import type { RunningSubagent, SubagentResult } from "./index.ts";
+import type { RunningSubagent, SubagentResult, SubagentMessageResult } from "./index.ts";
 import type {
   WorkflowSubagentCompletion,
   WorkflowSubagentHandle,
@@ -58,7 +58,7 @@ export interface SubagentPluginSurface {
     },
   ): Promise<RunningSubagent>;
   watch(running: RunningSubagent, signal: AbortSignal): Promise<SubagentResult>;
-  steer(running: RunningSubagent, message: string): Promise<{ ok: true } | { error: string }>;
+  steer(running: RunningSubagent, message: string): Promise<SubagentMessageResult>;
   resolveRunning(name: string): { running: RunningSubagent } | { error: string };
   runningSubagents: Map<string, RunningSubagent>;
   /** Shared with manual launches, including names whose panes are still opening. */

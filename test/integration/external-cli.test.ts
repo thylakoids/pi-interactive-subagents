@@ -2,6 +2,8 @@ import './tmux-isolation.ts';
 /** Tool integration tests using real tmux and stand-in native TUIs; not real CLI end-to-end coverage. */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
@@ -295,6 +297,43 @@ setInterval(() => {}, 1000);
     const result = messages.find(m => m.message.customType === "subagent_result").message;
     assert.equal(result.details.exitCode, 0);
     assert.match(result.content, /QUEUED RESULT:second task/);
+  });
+  it("reports sent recording failures without losing queued native completion tracking", async t => {
+    for (const kind of ["codex", "claude"]) {
+      messages.length = 0;
+      const name = "recording-failure-" + kind;
+      await tools.get("subagent").execute("recording-failure", { name, agent: "test-" + kind, task: "QUEUED" },
+        new AbortController().signal, undefined, ctx);
+      const running = [...__test__.runningSubagents.values()].find(r => r.name === name)!;
+      await until(() => /READY/.test(readScreen(running.surface)), "queued editor ready");
+      const append = fs.appendFileSync;
+      let response: any;
+      t.mock.method(fs, "appendFileSync", (path: any, ...args: any[]) => {
+        if (path === running.sessionFile) throw Object.assign(new Error("injected recording EIO"), { code: "EIO" });
+        return (append as any)(path, ...args);
+      });
+      syncBuiltinESMExports();
+      try {
+        response = await tools.get("subagent_message").execute("recording-failure-message",
+          { name, message: "recorded-before-send-" + kind }, new AbortController().signal, undefined, ctx);
+      } finally {
+        t.mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+      assert.equal(response.details.delivery, "sent");
+      assert.equal(response.details.retrySafe, false);
+      assert.match(response.content[0].text, /Do not automatically resend/);
+      assert.equal(JSON.parse(readFileSync(running.sentinelFile + ".inputs.json", "utf8")).length, 2);
+      await until(() => /FIRST_DONE/.test(readScreen(running.surface)), "earlier native turn completed");
+      await wait(1100);
+      assert.equal(messages.filter(m => m.message.customType === "subagent_result").length, 0);
+      assert.ok(__test__.runningSubagents.has(running.id), "the recorded follow-up must keep the pane alive");
+      await until(() => messages.some(m => m.message.customType === "subagent_result"), "submitted follow-up completed");
+      const results = messages.filter(m => m.message.customType === "subagent_result");
+      assert.equal(results.length, 1);
+      assert.equal(results[0].message.details.exitCode, 0);
+      assert.match(results[0].message.content, new RegExp("QUEUED RESULT:recorded-before-send-" + kind));
+    }
   });
   for (const history of ["turn-local", "cumulative"]) {
     it(`codex: repeated queued messages complete with ${history} callbacks`, async () => {

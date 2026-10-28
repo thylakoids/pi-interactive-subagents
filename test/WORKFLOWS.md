@@ -39,6 +39,14 @@ and whether an LLM chooses an appropriate workflow require separate provider run
 See [test maintenance](../docs/test-maintenance.md) for fixture consolidation and
 coverage-comparison rules.
 
+`native-message-delivery.test.ts` calls the actual steering, tmux transport and
+native hook functions. Filesystem and command fault injection covers atomic ledger
+reservation, unsent rollback, uncertain input, post-submit recording and lock errors,
+public result propagation and repeated-message acknowledgement. The external-CLI
+integration suite uses an isolated real tmux server and stand-in TUIs to verify that
+a recording failure cannot close a queued native follow-up early. Neither test calls
+a model provider or proves real Claude/Codex receipt.
+
 ## Avoid false confidence
 
 - Parsing a template proves syntax/discovery, not executable behavior.

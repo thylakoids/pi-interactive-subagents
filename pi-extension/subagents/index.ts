@@ -28,6 +28,7 @@ import {
   currentTree,
   startSurfaceProcess,
   pasteMessage,
+  type MessageDelivery,
   focusSurface,
   surfaceExists,
 } from "./tmux.ts";
@@ -36,7 +37,7 @@ import { waitForSurfaceOwner, disposeSurfaceOwner, surfaceOwnerDirectory } from 
 import { randomUUID } from "node:crypto";
 import { createPiInbox, piInbox, queuePiMessage, type PiDelivery } from "./control.ts";
 import { openSubagentPicker } from "./subagent-picker.ts";
-import { withCliRunLockAsync, readCliExitResult } from "./cli-hook.mjs";
+import { withCliRunLockAsync, readCliExitResult, writeCliInputs } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
 import { registerWorkflowExtension } from "./workflow/index.ts";
 import { workflowExecution, CLI_WORKFLOW_EXECUTION_CONTRACT } from "./workflow/execution.ts";
@@ -1225,31 +1226,66 @@ function resolveRunningByName(name: string):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
+/** Native failures expose transport evidence; Pi keeps its existing inbox result. */
+export type SubagentMessageResult = { ok: true } | {
+  error: string;
+  delivery?: MessageDelivery;
+  /** False for ambiguous submissions or input tracking that could not be restored. */
+  retrySafe?: boolean;
+};
+
 /** Pi uses its control inbox; native CLIs retain their explicit paste protocol. */
 async function steerSubagent(
   running: RunningSubagent,
   message: string,
   signal?: AbortSignal,
   deliverAs: PiDelivery = "steer",
-): Promise<{ ok: true } | { error: string }> {
+): Promise<SubagentMessageResult> {
   if (running.cli) {
-    if (deliverAs === "followUp") return { error: "Native CLI backends do not support followUp delivery; send a steer or resume after completion." };
+    let delivery: MessageDelivery = "not_sent";
+    let registered = false;
+    const fail = (reason: string): SubagentMessageResult => {
+      const retrySafe = delivery === "not_sent" && !registered;
+      const advice = delivery === "sent"
+        ? "Submitted to the terminal, but recording or lock cleanup failed. Do not automatically resend; CLI processing is not confirmed."
+        : delivery === "unknown"
+        ? "The message may have reached the terminal. Do not automatically resend; inspect the subagent first."
+        : registered
+        ? "Not sent, but pending-input tracking could not be restored. Do not automatically retry; inspect the subagent first."
+        : "Not sent; this attempt cannot cause duplicate delivery if retried.";
+      return { error: `Failed to message "${running.name}": ${reason} ${advice}`, delivery, retrySafe };
+    };
+    if (deliverAs === "followUp") return fail("Native CLI backends do not support followUp delivery; send a steer or resume after completion.");
     try {
       return await withCliRunLockAsync(running.sentinelFile!, () => {
         if (existsSync(running.sentinelFile!)) {
-          return { error: `Subagent "${running.name}" has just completed; retry subagent_message to resume it.` };
+          return fail(`Subagent "${running.name}" has just completed; retry subagent_message to resume it.`);
         }
-        // The hook cannot finish this run between checking and registering input.
+        const inputs = JSON.parse(readFileSync(`${running.sentinelFile}.inputs.json`, "utf8"));
+        if (!Array.isArray(inputs) || !inputs.every(input => typeof input === "string")) {
+          throw new Error("Invalid native CLI pending-input ledger; expected an array of strings.");
+        }
         const prompt = prepareExternalPrompt(running.cli!, message);
-        pasteMessage(running.surface, prompt);
-        const inputsFile = `${running.sentinelFile}.inputs.json`;
-        const inputs = JSON.parse(readFileSync(inputsFile, "utf8")) as string[];
-        writeFileSync(inputsFile, JSON.stringify([...inputs, prompt]), { mode: 0o600 });
+        // Persist first, under the hook's lock: a submitted prompt must never be
+        // invisible to completion. Atomic replacement preserves the old ledger on EIO.
+        writeCliInputs(running.sentinelFile!, [...inputs, prompt]);
+        registered = true;
+        try {
+          pasteMessage(running.surface, prompt, state => { delivery = state; });
+        } catch (error) {
+          // Only retract a reservation when pane input was never attempted.
+          // Ambiguous input stays pending until a native hook confirms it or the CLI exits.
+          if (delivery === "not_sent") {
+            writeCliInputs(running.sentinelFile!, inputs);
+            registered = false;
+          }
+          throw error;
+        }
         appendUserMessage(running.sessionFile, message);
         return { ok: true as const };
       }, signal);
     } catch (error: any) {
-      return { error: `Failed to message "${running.name}": ${error?.message ?? String(error)}` };
+      return fail(error?.message ?? String(error));
     }
   }
 
@@ -1282,7 +1318,7 @@ async function handleSubagentSteer(
   const steer = await steerSubagent(running, message, params.signal, params.deliverAs);
   if ("error" in steer) {
     return { content: [{ type: "text" as const, text: steer.error }],
-      details: { error: steer.error, id: running.id, name: running.name } };
+      details: { ...steer, id: running.id, name: running.name } };
   }
   running.statusState = forceStatusAfterInterrupt(running.statusState, Date.now());
   updateWidget();

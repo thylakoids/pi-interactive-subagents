@@ -784,14 +784,19 @@ export function startSurfaceProcess(surface: string, scriptPath: string): void {
     `exec bash ${shellEscape(scriptPath)}`], { encoding: "utf8" });
 }
 
-/** Bracketed paste preserves multiline text as one TUI submission. */
-export function pasteMessage(surface: string, message: string): void {
+/** Local transport evidence only; "sent" does not acknowledge CLI processing. */
+export type MessageDelivery = "not_sent" | "unknown" | "sent";
+
+/** Bracketed paste preserves multiline text; report before input and after submission. */
+export function pasteMessage(surface: string, message: string, onDelivery?: (delivery: MessageDelivery) => void): void {
   requireTmux();
   const buffer = `pi-message-${process.pid}-${Math.random().toString(16).slice(2)}`;
   execFileSync("tmux", ["load-buffer", "-b", buffer, "-"], { input: message, encoding: "utf8" });
   try {
+    onDelivery?.("unknown");
     execFileSync("tmux", ["paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", surface]);
     execFileSync("tmux", ["send-keys", "-t", surface, "Enter"]);
+    onDelivery?.("sent");
   } finally {
     try { execFileSync("tmux", ["delete-buffer", "-b", buffer], { stdio: "ignore" }); } catch {}
   }

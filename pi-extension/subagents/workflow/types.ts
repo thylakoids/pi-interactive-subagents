@@ -15,6 +15,8 @@
  *             content hash (`callKey`) so resume can match it after a restart
  *  - agent    one interactive subagent session backing a call
  */
+import type { SubagentMessageResult } from "../index.ts";
+
 
 /** Run status as shown in the widget and returned by the workflow tool. */
 export type WorkflowRunStatus =
@@ -300,7 +302,7 @@ export interface WorkflowSubagentService {
   ownership?: { current(): string; reap(owner: string): void };
   isAvailable(): { ok: true } | { ok: false; reason: string };
   spawn(request: WorkflowSubagentRequest): Promise<WorkflowSubagentHandle>;
-  steer(name: string, message: string): Promise<{ ok: true } | { error: string }>;
+  steer(name: string, message: string): Promise<SubagentMessageResult>;
   /** Stop a running agent by its display name (closes its pane). */
   stop(name: string): void;
   /** Bring the agent's pane into view, running or finished. */

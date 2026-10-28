@@ -1,15 +1,24 @@
 /** Hook shared by Codex notify, Claude Stop/StopFailure, and the launch shell.
  * No dependencies, no global config edits, and no transcript directory scans.
  */
-import { appendFileSync, existsSync, readFileSync, statSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, statSync, renameSync, writeFileSync, mkdirSync, rmdirSync, realpathSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { getLeafId } from './session.ts';
 
 function atomicJson(path, value) {
   const temp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
-  renameSync(temp, path);
+  try {
+    writeFileSync(temp, JSON.stringify(value), { mode: 0o600 });
+    renameSync(temp, path);
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* Preserve the original error. */ }
+    throw error;
+  }
+}
+// Callers hold the run lock; replace the ledger before exposing any pane input.
+export function writeCliInputs(resultFile, inputs) {
+  atomicJson(`${resultFile}.inputs.json`, inputs);
 }
 function tryCliRunLock(resultFile) {
   const lock = `${resultFile}.lock`;

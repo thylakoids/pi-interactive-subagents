@@ -80,6 +80,27 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
   `followUp` is rejected; resume after completion to start another turn.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
+Native CLI messaging failures include `delivery` and `retrySafe` in tool
+`details` (and in workflow service errors):
+
+| `delivery` | Evidence |
+|---|---|
+| `not_sent` | No pane input was attempted. |
+| `unknown` | Pane input was attempted; submission may have succeeded. |
+| `sent` | Both tmux paste and Enter commands succeeded; recording or lock cleanup failed afterward. |
+
+`sent` confirms terminal submission, not CLI receipt or processing. When
+`retrySafe` is false, do not automatically resend: inspect or Focus the child
+first. Even `not_sent` is unsafe to retry automatically if pending-input tracking
+could not be restored. A true value means this attempt cannot cause duplicate
+terminal delivery, not that unchanged arguments or an unavailable backend will succeed.
+
+The existing pending-input ledger is atomically updated under the completion hook's
+lock before terminal input. Confirmed unsent attempts retract that registration;
+uncertain submissions retain it so an earlier turn cannot finish the run prematurely.
+There is no automatic replay or exactly-once guarantee. If the parent crashes between
+registration and submission, conservative pending input can require manual inspection.
+
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
 **Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
