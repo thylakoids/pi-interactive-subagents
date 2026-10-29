@@ -158,6 +158,15 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Latest launch evidence; old registries without this remain readable. */
+  execution?: {
+    id: string;
+    backend: "pi" | "codex" | "claude";
+    startedAt: number;
+    activityFile?: string;
+    finishedAt?: number;
+    stop?: { requestedAt: number; confirmedAt?: number; reason?: string };
+  };
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -191,17 +200,38 @@ export function registerName(
   entry: NameRegistryEntry,
 ): void {
   try {
-    mkdirSync(artifactDir, { recursive: true });
     const registry = readNameRegistry(artifactDir);
+    if (!entry.execution && registry[name]?.sessionFile === entry.sessionFile) {
+      entry = { ...entry, execution: registry[name].execution };
+    }
     registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-    renameSync(tmp, p);
+    writeNameRegistry(artifactDir, registry);
   } catch {
     // Best-effort: a failed registration only means resume-by-name won't find
     // this subagent later; it never breaks the spawn itself.
   }
+}
+
+function writeNameRegistry(artifactDir: string, registry: NameRegistry): void {
+  mkdirSync(artifactDir, { recursive: true });
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${randomUUID()}`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  renameSync(tmp, p);
+}
+
+/** A stop intent must persist successfully, and must target this incarnation. */
+export function updateRegisteredExecution(
+  artifactDir: string, name: string, sessionFile: string, id: string,
+  update: (execution: NonNullable<NameRegistryEntry["execution"]>) => void,
+): void {
+  const registry = readNameRegistry(artifactDir);
+  const entry = registry[name];
+  if (entry?.sessionFile !== sessionFile || entry.execution?.id !== id) {
+    throw new Error(`Saved identity for "${name}" changed or is unavailable; inspect it before retrying.`);
+  }
+  update(entry.execution);
+  writeNameRegistry(artifactDir, registry);
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */

@@ -456,6 +456,71 @@ export function surfaceExists(surface: string): boolean {
   }
 }
 
+/** A pane id alone can be reused by a restarted tmux server. */
+export interface SurfaceOwnership {
+  owner: string;
+  panePid: number;
+  serverPid: number;
+}
+
+export interface OwnedSurfaceObservation {
+  state: "owned" | "absent" | "stale" | "unknown";
+  observedAt: number;
+  reason?: string;
+}
+
+interface OwnedPane extends SurfaceOwnership {
+  id: string;
+  parent: string;
+  dead: boolean;
+}
+
+const OWNERSHIP_FORMAT = "#{pane_id}|#{@pi_subagent_parent}|#{pane_pid}|#{pane_dead}|#{@pi_subagent_owner}|#{pid}";
+
+function parseOwnedPanes(raw: string): OwnedPane[] {
+  const rows = raw.trim().split("\n").filter(Boolean).map(line => {
+    const [id, parent, panePid, dead, owner, serverPid] = line.split("|");
+    if (!/^%\d+$/.test(id) || !/^\d+$/.test(panePid) || !/^\d+$/.test(serverPid) || !["0", "1"].includes(dead)) {
+      throw new Error("Invalid tmux ownership snapshot");
+    }
+    return { id, parent, panePid: Number(panePid), dead: dead === "1", owner, serverPid: Number(serverPid) };
+  });
+  if (!rows.length) throw new Error("Empty tmux ownership snapshot");
+  return rows;
+}
+
+function sameSurface(pane: OwnedPane, ownership: SurfaceOwnership): boolean {
+  return pane.owner === ownership.owner && pane.panePid === ownership.panePid && pane.serverPid === ownership.serverPid;
+}
+
+/** Strict launch-time read; unlike surfaceExists, failure is never absence. */
+export function captureSurfaceOwnership(surface: string): SurfaceOwnership {
+  const pane = parseOwnedPanes(runTmux(["list-panes", "-a", "-F", OWNERSHIP_FORMAT])).find(row => row.id === surface);
+  if (!pane || !/^[A-Za-z0-9_-]+$/.test(pane.owner) || pane.panePid <= 0) throw new Error("The subagent pane has no verifiable ownership identity");
+  return { owner: pane.owner, panePid: pane.panePid, serverPid: pane.serverPid };
+}
+
+function observeOwnedPanes(surface: string, ownership: SurfaceOwnership, panes: OwnedPane[]): OwnedSurfaceObservation {
+  const observedAt = Date.now();
+  if (panes.some(pane => pane.serverPid !== ownership.serverPid)) {
+    return { state: "stale", observedAt, reason: "The tmux server identity changed" };
+  }
+  const pane = panes.find(row => row.id === surface);
+  if (!pane) return { state: "absent", observedAt };
+  return sameSurface(pane, ownership)
+    ? { state: "owned", observedAt }
+    : { state: "stale", observedAt, reason: "The pane no longer has the recorded owner and process identity" };
+}
+
+/** Read-only, one-shot observation. An unavailable server is explicitly unknown. */
+export function inspectOwnedSurface(surface: string, ownership: SurfaceOwnership): OwnedSurfaceObservation {
+  try {
+    return observeOwnedPanes(surface, ownership, parseOwnedPanes(runTmux(["list-panes", "-a", "-F", OWNERSHIP_FORMAT])));
+  } catch {
+    return { state: "unknown", observedAt: Date.now(), reason: "Cannot obtain a valid tmux ownership snapshot" };
+  }
+}
+
 /**
  * Send a long command to a pane by writing it to a script file first.
  * This avoids terminal line-wrapping issues that break commands exceeding the
@@ -602,6 +667,189 @@ export async function closeSurfaceTreeAsync(root: string): Promise<void> {
       : undefined;
     const command = surfaceCloseCommand(pane, live, panes);
     if (command.length) await runTmuxAsync(command, true);
+  }
+}
+
+interface OwnedProcess {
+  pid: number;
+  parent: number;
+  started: string;
+  state: string;
+  command: string;
+  /** Linux provides a boot-relative birth tick, finer than ps's start second. */
+  birthTick?: string;
+}
+
+const OWNED_PS_ARGS = ["-axo", "pid=,ppid=,lstart=,stat=,args="];
+
+function linuxProcessIdentity(pid: number): { parent: number; birthTick: string; state: string } | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    return { parent: Number(fields[1]), birthTick: fields[19], state: fields[0] };
+  } catch { return undefined; }
+}
+
+function parseOwnedProcesses(raw: string): Map<number, OwnedProcess> {
+  const processes = new Map<number, OwnedProcess>();
+  for (const line of raw.trim().split("\n").filter(Boolean)) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (!match) throw new Error("Invalid process identity snapshot");
+    let birthTick: string | undefined;
+    const identity = linuxProcessIdentity(Number(match[1]));
+    if (identity?.parent === Number(match[2])) birthTick = identity.birthTick;
+    processes.set(Number(match[1]), {
+      pid: Number(match[1]), parent: Number(match[2]), started: match[3].replace(/\s+/g, " "), state: match[4], command: match[5],
+      ...(birthTick ? { birthTick } : {}),
+    });
+  }
+  if (!processes.size) throw new Error("Empty process identity snapshot");
+  return processes;
+}
+
+function sameProcess(before: OwnedProcess, after: OwnedProcess, requireBirthTick = false): boolean {
+  if (before.started !== after.started) return false;
+  if (requireBirthTick && (before.parent !== after.parent || before.command !== after.command)) return false;
+  if (before.birthTick && after.birthTick) return before.birthTick === after.birthTick;
+  // Missing fine-grained evidence may prevent signalling, never prove exit.
+  return !requireBirthTick || !before.birthTick;
+}
+
+function executionProcess(entry: OwnedProcess): boolean {
+  const guardian = `${process.execPath} ${fileURLToPath(new URL("./surface-guardian.ts", import.meta.url))} `;
+  return !entry.command.startsWith(guardian) && !entry.state.startsWith("Z");
+}
+
+function signalOwnedProcess(entry: OwnedProcess, signal: NodeJS.Signals): boolean {
+  if (entry.birthTick) {
+    const live = linuxProcessIdentity(entry.pid);
+    if (!live || live.birthTick !== entry.birthTick || live.state === "Z") return false;
+  } else {
+    const raw = execFileSync("ps", ["-p", String(entry.pid), "-o", "pid=,ppid=,lstart=,stat=,args="], {
+      encoding: "utf8", env: { ...process.env, LC_ALL: "C" },
+    });
+    const live = parseOwnedProcesses(raw).get(entry.pid);
+    if (!live || !sameProcess(entry, live, signal === "SIGSTOP") || !executionProcess(live)) return false;
+  }
+  try { process.kill(entry.pid, signal); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; throw error; }
+}
+
+/**
+ * Stop only a captured pane incarnation. Confirmation requires independent,
+ * successful pane and process reads after cleanup; request acceptance alone is
+ * never evidence of termination. Resource guardians retain their EOF cleanup.
+ */
+export async function stopOwnedSurfaceTree(root: string, ownership: SurfaceOwnership): Promise<{ confirmed: boolean; reason: string }> {
+  const resumeOnFailure = new Map<number, OwnedProcess>();
+  let selected: OwnedPane[] = [];
+  let order: string[] = [];
+  let cleanupAuthorized = false;
+  let panesClosed = false;
+  const closeSelectedPanes = async () => {
+    for (const paneId of [...order].reverse()) {
+      const pane = selected.find(row => row.id === paneId)!;
+      const condition = `#{&&:#{==:#{@pi_subagent_owner},${pane.owner}},#{&&:#{==:#{pane_pid},${pane.panePid}},#{==:#{pid},${pane.serverPid}}}}`;
+      const window = parsePaneWindow(await runTmuxAsync(paneWindowArgs(paneId), true));
+      const command = surfaceCloseCommand(paneId, window);
+      if (command.length) await runTmuxAsync(["if-shell", "-F", "-t", paneId, condition, command.join(" ")], true);
+    }
+    panesClosed = true;
+  };
+  try {
+    const panes = parseOwnedPanes(await runTmuxAsync(["list-panes", "-a", "-F", OWNERSHIP_FORMAT]));
+    const observed = observeOwnedPanes(root, ownership, panes);
+    if (observed.state !== "owned") {
+      return { confirmed: false, reason: observed.reason ?? "The pane is absent; descendant termination cannot be reconstructed" };
+    }
+    const children = childrenByParent(panes, pane => pane.parent);
+    order = descendants([root], id => children.get(id)?.map(pane => pane.id) ?? []);
+    selected = panes.filter(pane => order.includes(pane.id));
+    if (selected.some(pane => !/^[A-Za-z0-9_-]+$/.test(pane.owner))) return { confirmed: false, reason: "A descendant pane has no valid ownership identity" };
+    cleanupAuthorized = true;
+    let historicalUnknown = selected.some(pane => pane.dead);
+    const processes = parseOwnedProcesses((await execFileAsync("ps", OWNED_PS_ARGS, { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } })).stdout);
+    const processChildren = childrenByParent([...processes.values()], entry => entry.parent);
+    const roots = selected.filter(pane => !pane.dead).map(pane => pane.panePid);
+    const rootPids = new Set(roots);
+    const pids = descendants(roots, pid => processChildren.get(pid)?.map(entry => entry.pid) ?? []);
+    const captured = new Map(pids.map(pid => [pid, processes.get(pid)]).filter((pair): pair is [number, OwnedProcess] => Boolean(pair[1])));
+    if (roots.some(pid => !processes.has(pid))) historicalUnknown = true;
+
+    let quiescent = false;
+    let supportedLeaders = false;
+    // tmux automatically SIGCONTs a stopped pane leader and its process group.
+    // Freeze its execution children instead. Pi's pane leaders are shell
+    // wrappers waiting for those children; active/direct leaders cannot supply
+    // the same proof, so their cleanup remains explicitly unconfirmed.
+    for (let pass = 0; pass < 8; pass++) {
+      const current = parseOwnedProcesses(execFileSync("ps", OWNED_PS_ARGS, { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } }));
+      const panesNow = parseOwnedPanes(runTmux(["list-panes", "-a", "-F", OWNERSHIP_FORMAT]));
+      if (selected.some(pane => !panesNow.some(live => live.id === pane.id && sameSurface(live, pane)))) {
+        return { confirmed: false, reason: "A pane identity changed while quiescing; cleanup was not confirmed" };
+      }
+      const stillOwned: number[] = [];
+      for (const entry of captured.values()) {
+        const present = current.get(entry.pid);
+        if (present && sameProcess(entry, present)) stillOwned.push(entry.pid);
+        else if (executionProcess(entry) && !resumeOnFailure.has(entry.pid)) historicalUnknown = true;
+      }
+      const childrenNow = childrenByParent([...current.values()], entry => entry.parent);
+      const discovered = descendants(stillOwned, pid => childrenNow.get(pid)?.map(entry => entry.pid) ?? []);
+      for (const pid of discovered) {
+        const entry = current.get(pid);
+        if (entry && !captured.has(pid)) captured.set(pid, entry);
+      }
+      quiescent = true;
+      for (const entry of captured.values()) {
+        const present = current.get(entry.pid);
+        if (rootPids.has(entry.pid) || !present || !sameProcess(entry, present) || !executionProcess(present) || /^[Tt]/.test(present.state)) continue;
+        quiescent = false;
+        if (signalOwnedProcess(present, "SIGSTOP")) resumeOnFailure.set(present.pid, present);
+        else historicalUnknown = true;
+      }
+      supportedLeaders = roots.every(pid => {
+        const leader = current.get(pid);
+        return leader && /^(?:\/\S+\/)?-?(?:ba|da|z|fi|k)?sh(?:\s|$)/.test(leader.command)
+          && leader.state.startsWith("S");
+      });
+      if (quiescent) break;
+    }
+    // Even incomplete evidence still authorizes cleanup of these exact owned
+    // identities. It does not authorize a confirmed-termination claim.
+    const terminationOrder = [...captured.values()];
+    // Remove the waiting shell before its frozen child can exit and wake it.
+    // Nonleaders remain frozen until their own identity-checked termination.
+    terminationOrder.sort((a, b) => Number(rootPids.has(b.pid)) - Number(rootPids.has(a.pid)));
+    for (const entry of terminationOrder) {
+      if (executionProcess(entry)) signalOwnedProcess(entry, "SIGKILL");
+    }
+    await closeSelectedPanes();
+    const afterPanes = parseOwnedPanes(await runTmuxAsync(["list-panes", "-a", "-F", OWNERSHIP_FORMAT]));
+    if (afterPanes.some(pane => pane.serverPid !== ownership.serverPid)) return { confirmed: false, reason: "The tmux server identity changed during cleanup" };
+    const remainingPanes = selected.filter(pane => afterPanes.some(after => after.id === pane.id && sameSurface(after, pane)));
+    const afterProcesses = parseOwnedProcesses((await execFileAsync("ps", OWNED_PS_ARGS, { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } })).stdout);
+    const remainingProcesses = [...captured.values()].filter(entry => {
+      const current = afterProcesses.get(entry.pid);
+      return current && sameProcess(entry, current) && executionProcess(current);
+    });
+    if (historicalUnknown) return { confirmed: false, reason: "Owned surfaces cleaned; historical descendants cannot be verified" };
+    if (!quiescent || !supportedLeaders) return { confirmed: false, reason: "Owned surfaces cleaned; the execution topology could not be fully quiesced" };
+    return remainingPanes.length || remainingProcesses.length
+      ? { confirmed: false, reason: `Cleanup requested; ${remainingPanes.length} owned panes and ${remainingProcesses.length} execution processes still observed` }
+      : { confirmed: true, reason: "Owned pane tree absent and quiesced execution processes terminated" };
+  } catch {
+    return { confirmed: false, reason: "Cleanup could not be independently verified from tmux and process evidence" };
+  } finally {
+    if (cleanupAuthorized && !panesClosed) {
+      try { await closeSelectedPanes(); } catch { /* Original uncertainty remains. */ }
+    }
+    // Restore only work that this request froze; initially stopped work stays
+    // stopped. A reused PID never receives SIGCONT.
+    for (const entry of resumeOnFailure.values()) {
+      try { signalOwnedProcess(entry, "SIGCONT"); } catch { /* Process already exited or identity unavailable. */ }
+    }
   }
 }
 

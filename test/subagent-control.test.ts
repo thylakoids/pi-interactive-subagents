@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closePiInbox, createPiInbox, drainPiInbox, piInbox, queuePiMessage, type PiInput } from '../pi-extension/subagents/control.ts';
+import { closePiInbox, createPiInbox, drainPiInbox, piInbox, queuePiMessage, stopPiInbox, type PiInput } from '../pi-extension/subagents/control.ts';
 import child from '../pi-extension/subagents/subagent-done.ts';
 import { __test__ } from '../pi-extension/subagents/index.ts';
 
@@ -113,4 +113,38 @@ it('reloading a child keeps its launch inbox available; quitting closes it', t =
   assert.deepEqual(inputs,[{message:'after reload',deliverAs:'steer'}]);
   shutdown!({reason:'quit'});
   assert.throws(()=>queuePiMessage(file,'reload',{message:'after quit',deliverAs:'steer'}),/ENOENT/);
+});
+
+it('durable stop blocks queued continuations before provider access and never reopens its launch inbox', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-inbox-stopped-'));
+  const file = join(dir, 'session.jsonl');
+  const keys = ['PI_SUBAGENT_SESSION', 'PI_SUBAGENT_ID'];
+  const saved = keys.map(key => process.env[key]);
+  t.after(() => {
+    keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    rmSync(dir, { recursive: true, force: true });
+  });
+  Object.assign(process.env, { PI_SUBAGENT_SESSION: file, PI_SUBAGENT_ID: 'stopped' });
+  const handlers = new Map<string, Function[]>();
+  child({ on(name: string, fn: Function) { handlers.set(name, [...handlers.get(name) ?? [], fn]); },
+    registerTool() {}, registerShortcut() {},
+  } as any);
+  createPiInbox(file, 'stopped');
+  queuePiMessage(file, 'stopped', { message: 'previously accepted follow-up', deliverAs: 'followUp' });
+  const queued: PiInput[] = [];
+  drainPiInbox(file, 'stopped', input => queued.push(input));
+  assert.equal(queued.length, 1, 'simulate a continuation already inside the SDK queue');
+  stopPiInbox(file, 'stopped');
+  let aborts = 0, shutdowns = 0;
+  const ctx = { abort() { aborts++; }, shutdown() { shutdowns++; } };
+  for (const name of ['before_agent_start', 'agent_start']) handlers.get(name)!.forEach(fn => fn({}, ctx));
+  assert.throws(() => handlers.get('before_provider_request')!.forEach(fn => fn({}, ctx)), /no provider request/);
+  assert.equal(aborts, 3);
+  assert.equal(shutdowns, 0, 'the child parks until its owner captures and closes the process tree');
+  assert.deepEqual(handlers.get('input')![0]({ text: 'late reply' }, ctx), { action: 'handled' });
+  assert.equal(drainPiInbox(file, 'stopped', () => assert.fail('stopped inbox cannot deliver')), 0);
+  assert.throws(() => createPiInbox(file, 'stopped'), /explicitly stopped/);
+  createPiInbox(file, 'new-launch');
+  queuePiMessage(file, 'new-launch', { message: 'deliberate new task', deliverAs: 'steer' });
+  assert.equal(drainPiInbox(file, 'new-launch', () => {}), 1);
 });

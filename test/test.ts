@@ -1657,8 +1657,8 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["deliverAs", "message", "name"],
-      "name addressing and optional delivery mode",
+      ["deliverAs", "message", "name", "resume"],
+      "name addressing, optional delivery mode and deliberate stopped-session resume",
     );
     assert.equal(props.message.type, "string");
     assert.equal(props.name.type, "string");

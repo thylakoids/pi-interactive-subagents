@@ -31,11 +31,15 @@ import {
   type MessageDelivery,
   focusSurface,
   surfaceExists,
+  captureSurfaceOwnership,
+  stopOwnedSurfaceTree,
+  type SurfaceOwnership,
 } from "./tmux.ts";
 import { waitForSurfaceOwner, disposeSurfaceOwner, surfaceOwnerDirectory } from "./surface-owner.ts";
 
 import { randomUUID } from "node:crypto";
-import { createPiInbox, piInbox, queuePiMessage, type PiDelivery } from "./control.ts";
+import { createPiInbox, isPiLaunchStopped, piInbox, queuePiMessage, stopPiInbox, type PiDelivery } from "./control.ts";
+import { inspectNamedSubagent } from "./lifecycle.ts";
 import { openSubagentPicker } from "./subagent-picker.ts";
 import { withCliRunLockAsync, readCliExitResult, writeCliInputs } from "./cli-hook.mjs";
 import { createWorkflowSubagentService, type SubagentPluginSurface } from "./wiring.ts";
@@ -52,6 +56,7 @@ import {
   readNameRegistry,
   readSubagentLoadout,
   registerName,
+  updateRegisteredExecution,
   resolveNameInRegistry,
   seedSubagentSessionFile,
   summarizeSession,
@@ -176,6 +181,8 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_inspect",
+  "subagent_stop",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -589,6 +596,12 @@ export class SubagentLaunchCancelledError extends Error {
  */
 export function throwIfLaunchCancelled(signal?: AbortSignal): void {
   if (signal?.aborted) throw new SubagentLaunchCancelledError();
+  if (parentLaunchStopped()) throw new Error("This subagent was explicitly stopped.");
+}
+
+function parentLaunchStopped(): boolean {
+  return Boolean(process.env.PI_SUBAGENT_SESSION && process.env.PI_SUBAGENT_ID
+    && isPiLaunchStopped(process.env.PI_SUBAGENT_SESSION, process.env.PI_SUBAGENT_ID));
 }
 
 /**
@@ -716,7 +729,7 @@ export interface SubagentResult {
 }
 
 function publishSubagentResult(pi: ExtensionAPI, result: SubagentResult, agent?: string): void {
-  if (!latestCtx) return;
+  if (!latestCtx || parentLaunchStopped() || result.error === "stopped") return;
   updateWidget();
   pi.sendMessage({
     customType: "subagent_result",
@@ -734,7 +747,7 @@ function publishSubagentResult(pi: ExtensionAPI, result: SubagentResult, agent?:
 }
 
 function publishSubagentError(pi: ExtensionAPI, name: string, error: any, task?: string): void {
-  if (!latestCtx) return;
+  if (!latestCtx || parentLaunchStopped()) return;
   updateWidget();
   pi.sendMessage({
     customType: "subagent_result", display: true,
@@ -787,10 +800,37 @@ export interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  artifactDir?: string;
+  surfaceOwnership?: SurfaceOwnership;
+  stopRequested?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+
+function trackRunningSubagent(running: RunningSubagent, artifactDir: string): void {
+  running.artifactDir = artifactDir;
+  // If evidence cannot be captured, stop must report uncertainty, never guess.
+  try { running.surfaceOwnership = captureSurfaceOwnership(running.surface); } catch {}
+  registerName(artifactDir, running.name, {
+    sessionFile: running.sessionFile, sessionId: getSessionId(running.sessionFile),
+    execution: { id: running.id, backend: running.cli ?? "pi", startedAt: running.startTime,
+      ...(running.activityFile ? { activityFile: running.activityFile } : {}) },
+  });
+  runningSubagents.set(running.id, running);
+}
+
+function launchStopped(running: RunningSubagent): boolean {
+  return Boolean(running.stopRequested || isPiLaunchStopped(running.sessionFile, running.id));
+}
+
+function captureRegisteredSessionId(running: RunningSubagent): void {
+  if (!running.artifactDir) return;
+  const entry = resolveNameInRegistry(running.artifactDir, running.name);
+  if (entry?.execution?.id !== running.id || entry.sessionFile !== running.sessionFile || entry.sessionId) return;
+  const sessionId = getSessionId(running.sessionFile);
+  if (sessionId) registerName(running.artifactDir, running.name, { ...entry, sessionId });
+}
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -1131,6 +1171,9 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
+  // Standalone Pi writes its header at startup. Capture it during ordinary
+  // lifecycle supervision, so a later read-only inspect need not repair state.
+  captureRegisteredSessionId(running);
   // CLI-backed runs (claude/codex) have no pi activity snapshot to read.
   if (running.cli) return;
 
@@ -1241,6 +1284,7 @@ async function steerSubagent(
   signal?: AbortSignal,
   deliverAs: PiDelivery = "steer",
 ): Promise<SubagentMessageResult> {
+  if (launchStopped(running)) return { error: "This launch was explicitly stopped. Use subagent_message with resume: true only after confirmed termination." };
   if (running.cli) {
     let delivery: MessageDelivery = "not_sent";
     let registered = false;
@@ -1310,6 +1354,10 @@ async function handleSubagentSteer(
     return { content: [{ type: "text" as const, text: resolved.error }], details: { error: resolved.error } };
   }
   const running = resolved.running;
+  if (launchStopped(running)) {
+    const error = "This launch was explicitly stopped; messages cannot restart it. Inspect termination before deliberately resuming.";
+    return { content: [{ type: "text" as const, text: error }], details: { error } };
+  }
   if (existsSync(`${running.sessionFile}.workflow-aborted`)) {
     const error = "This workflow step was aborted. Resume the workflow or explicitly Focus the session before continuing it.";
     return { content: [{ type: "text" as const, text: error }], details: { error } };
@@ -1388,6 +1436,9 @@ export const __test__ = {
   watchSubagent,
   steerSubagent,
   handleSubagentSteer,
+  stopNamedSubagent,
+  trackRunningSubagent,
+  cleanupRunningSubagent,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   assertCliSessionModeSupported,
@@ -1436,6 +1487,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     const current = [...runningSubagents.values()].find(r =>
       r.name === name || (savedSession && resolve(r.sessionFile) === resolve(savedSession)));
     if (current) {
+      if (launchStopped(current)) throw new Error("The stopped launch is still closing; confirmed termination is required before Focus.");
       if (!surfaceExists(current.surface)) throw new Error("The previous session is still closing. Try again shortly.");
       focusSurface(current.surface);
       return { ok: true };
@@ -1443,9 +1495,14 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
     if (!latestCtx) throw new Error("No active parent session.");
     const artifactDir = getArtifactDir(latestCtx.sessionManager.getSessionDir(), latestCtx.sessionManager.getSessionId());
     const entry = resolveNameInRegistry(artifactDir, name);
+    if (entry?.execution?.stop && !entry.execution.stop.confirmedAt) {
+      throw new Error("Termination of the previous launch is unconfirmed; Focus cannot safely resume it.");
+    }
     sessionPath = savedSession ?? entry?.sessionFile;
     if (!sessionPath || !existsSync(sessionPath)) throw new Error("The original session file is unavailable.");
+    if (entry?.sessionId && getSessionId(sessionPath) !== entry.sessionId) throw new Error("The saved session identity changed.");
     sessionPath = resolve(sessionPath);
+    rmSync(`${sessionPath}.ask`, { force: true });
     try { unlinkSync(`${sessionPath}.workflow-aborted`); } catch {}
     if (openingSessions.has(sessionPath)) throw new Error("This session is already opening.");
     openingSessions.add(sessionPath);
@@ -1500,7 +1557,7 @@ async function focusSubagentSession(name: string, savedSession?: string): Promis
       launchScriptFile: scriptPath, activityFile, interactive: true, verifyScratchDir,
       statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
     };
-    runningSubagents.set(id, running);
+    trackRunningSubagent(running, artifactDir);
     const controller = new AbortController();
     running.abortController = controller;
     void watchSubagent(running, controller.signal).finally(() => updateWidget());
@@ -1834,7 +1891,7 @@ async function launchSubagent(
       }),
     };
 
-    runningSubagents.set(id, running);
+    trackRunningSubagent(running, artifactDir);
     return running;
   } catch (error) {
     cleanupVerifyScratch(verifyScratchDir);
@@ -1877,7 +1934,7 @@ function launchExternalSubagent(params: {
     interactive: params.interactive,
     statusState: createStatusState({ source: params.session.kind, startTimeMs: params.startTime }),
   };
-  runningSubagents.set(running.id, running);
+  trackRunningSubagent(running, params.artifactDir);
   return running;
 }
 
@@ -1889,6 +1946,7 @@ function launchExternalSubagent(params: {
  * delivery so it fires once per question (a subagent may ask again later).
  */
 function deliverPendingQuestion(running: RunningSubagent): void {
+  if (launchStopped(running) || parentLaunchStopped()) return;
   const askFile = `${running.sessionFile}.ask`;
   let payload: any = null;
   try {
@@ -1898,6 +1956,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     // A partial write is retried on the next watcher tick.
   }
   if (!payload?.question || !latestPi || existsSync(`${running.sessionFile}.workflow-aborted`)) return;
+  if (payload.launchId && payload.launchId !== running.id) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -1945,6 +2004,9 @@ async function watchSubagent(
         deliverPendingQuestion(running);
       },
     });
+
+    if (launchStopped(running)) return { name, task, summary: "Subagent explicitly stopped.", exitCode: 1,
+      elapsed: Math.floor((Date.now() - startTime) / 1000), error: "stopped", sessionFile };
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1997,7 +2059,7 @@ async function watchSubagent(
         summary: "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: launchStopped(running) ? "stopped" : "cancelled",
         sessionFile,
       };
     }
@@ -2012,23 +2074,99 @@ async function watchSubagent(
   } finally { await cleanupRunningSubagent(running); }
 }
 
-const closingSurfaces = new Map<string, Promise<void>>();
+type CloseEvidence = { confirmed: boolean; reason: string; controlCleaned?: boolean };
+const closingSurfaces = new Map<string, Promise<CloseEvidence>>();
 
-function closeOwnedSurface(surface: string): Promise<void> {
-  let closing = closingSurfaces.get(surface);
+function closeOwnedSurface(running: RunningSubagent): Promise<CloseEvidence> {
+  const surface = running.surface;
+  const key = `${running.id}:${surface}`;
+  let closing = closingSurfaces.get(key);
   if (!closing) {
-    closing = closeSurfaceTreeAsync(surface).catch(() => {}).finally(() => closingSurfaces.delete(surface));
-    closingSurfaces.set(surface, closing);
+    closing = (running.surfaceOwnership
+      ? stopOwnedSurfaceTree(surface, running.surfaceOwnership)
+      : running.stopRequested
+        ? Promise.resolve({ confirmed: false, reason: "No owned surface identity was captured; no process was targeted." })
+        : closeSurfaceTreeAsync(surface).then(() => ({ confirmed: false, reason: "Legacy cleanup has no termination proof." })))
+      .catch(error => ({ confirmed: false, reason: error?.message ?? String(error) }))
+      .finally(() => closingSurfaces.delete(key));
+    closingSurfaces.set(key, closing);
   }
   return closing;
 }
 
-async function cleanupRunningSubagent(running: RunningSubagent): Promise<void> {
-  if (runningSubagents.get(running.id) !== running) return;
-  await closeOwnedSurface(running.surface);
-  if (!running.cli) rmSync(piInbox(running.sessionFile, running.id), { recursive: true, force: true });
+async function cleanupRunningSubagent(running: RunningSubagent): Promise<CloseEvidence> {
+  if (runningSubagents.get(running.id) !== running) return { confirmed: false, reason: "Launch is no longer owned by this runtime." };
+  const evidence = await closeOwnedSurface(running);
+  let controlError: unknown;
+  try { if (!running.cli) rmSync(piInbox(running.sessionFile, running.id), { recursive: true, force: true }); } catch (error) { controlError = error; }
+  try { if (running.stopRequested) rmSync(`${running.sessionFile}.ask`, { force: true }); } catch (error) { controlError ??= error; }
   cleanupVerifyScratch(running.verifyScratchDir);
-  runningSubagents.delete(running.id);
+  if (running.verifyScratchDir && existsSync(running.verifyScratchDir)) controlError ??= new Error("Scratch cleanup is incomplete.");
+  if (evidence.confirmed || !running.stopRequested) runningSubagents.delete(running.id);
+  if (running.artifactDir) {
+    captureRegisteredSessionId(running);
+    try {
+      updateRegisteredExecution(running.artifactDir, running.name, running.sessionFile, running.id, execution => {
+        if (execution.stop) {
+          if (evidence.confirmed) execution.stop.confirmedAt = Date.now();
+          execution.stop.reason = evidence.reason;
+        } else if (evidence.confirmed && !moduleAbort.signal.aborted) execution.finishedAt = Date.now();
+      });
+    } catch { /* A stale watcher must not overwrite a later launch. */ }
+  }
+  return { ...evidence, controlCleaned: !controlError,
+    reason: controlError ? `${evidence.reason}; control cleanup failed: ${String(controlError)}` : evidence.reason };
+}
+
+async function stopNamedSubagent(artifactDir: string, name: string, expectedId?: string) {
+  const entry = resolveNameInRegistry(artifactDir, name);
+  const execution = entry?.execution;
+  const response = (reason: string, confirmed = false, requested = false) => ({
+    ...inspectNamedSubagent(artifactDir, name, [...runningSubagents.values()].find(r => r.name === name)),
+    requested, confirmed, reason,
+  });
+  if (!entry || !execution) return response("No launch identity is recorded; no process was targeted.");
+  const saved = inspectNamedSubagent(artifactDir, name);
+  if (typeof execution.id !== "string" || saved.id !== execution.id || saved.backend !== execution.backend) {
+    return response("Saved execution evidence is malformed; no process was targeted.");
+  }
+  if (expectedId && execution.id !== expectedId) return response("Launch identity changed; no process was targeted.");
+  if (!entry.sessionId || getSessionId(entry.sessionFile) !== entry.sessionId) {
+    return response("Session identity is missing or changed; no process was targeted.");
+  }
+  if (execution.backend !== "pi") return response("Explicit stop is unsupported for native CLI backends; termination was not requested.");
+  if (openingSessions.has(resolve(entry.sessionFile))) return response("This session is opening; no stop was requested. Inspect after launch.");
+  if (execution.stop?.confirmedAt) return response("Already stopped with confirmed termination.", true, true);
+  const running = [...runningSubagents.values()].find(r => r.name === name);
+  if (running && (running.id !== execution.id || running.sessionFile !== entry.sessionFile || (running.cli ?? "pi") !== execution.backend)) {
+    return response("Live and saved launch identities disagree; no process was targeted.");
+  }
+  updateRegisteredExecution(artifactDir, name, entry.sessionFile, execution.id, current => {
+    current.stop ??= { requestedAt: Date.now() };
+    if (!running && current.finishedAt) {
+      current.stop.confirmedAt = Date.now();
+      current.stop.reason = "The owned launch had already finished and been cleaned up.";
+    }
+  });
+  // Persist before closing: delayed replies and already queued inputs must not
+  // turn a cancellation into another task, even when terminal cleanup fails.
+  if (running) running.stopRequested = true;
+  let controlError: unknown;
+  try { stopPiInbox(entry.sessionFile, execution.id); } catch (error) { controlError = error; }
+  try { rmSync(`${entry.sessionFile}.ask`, { force: true }); } catch (error) { controlError ??= error; }
+  if (!running) {
+    const confirmed = Boolean(execution.finishedAt);
+    return { ...response(controlError ? (confirmed
+        ? "Previously finished launch termination is confirmed, but control cleanup failed."
+        : "Stop intent saved, but control cleanup failed; termination is unconfirmed.")
+      : confirmed ? "Stopped a previously finished launch; session preserved."
+      : "Stop intent saved, but this runtime does not own the persisted launch. Termination is unconfirmed; no process was targeted.", confirmed, true), controlCleaned: !controlError };
+  }
+  running.abortController?.abort();
+  const evidence = await cleanupRunningSubagent(running);
+  updateWidget();
+  return { ...response(controlError ? `${evidence.reason}; control cleanup failed: ${String(controlError)}` : evidence.reason, evidence.confirmed, true),
+    controlCleaned: !controlError && evidence.controlCleaned !== false };
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
@@ -2068,14 +2206,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
+        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. Use subagent_inspect once only to reconcile uncertain delivery or a saved reference; normal results arrive automatically. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
+        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. Use subagent_inspect once only to reconcile uncertain delivery or a saved reference; normal results arrive automatically. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
@@ -2203,9 +2341,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (launchStopped(running)) return;
             publishSubagentResult(pi, result, running.agent);
           })
-          .catch((err) => publishSubagentError(pi, running.name, err, running.task));
+          .catch((err) => { if (!launchStopped(running)) publishSubagentError(pi, running.name, err, running.task); });
 
         // Return immediately
         return {
@@ -2348,6 +2487,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  pi.registerTool({
+    name: "subagent_inspect",
+    label: "Inspect Subagent",
+    description: "Read one snapshot by exact persistent name without launching, steering or resuming. " +
+      "Use once to reconcile uncertain delivery or saved references. Normal progress/results arrive automatically; do not poll. " +
+      "Historical activity is not proof of a live process; unknown and stale evidence are explicit.",
+    parameters: Type.Object({ name: Type.String({ description: "Exact persistent subagent name in this parent session." }) }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+      const name = params.name.trim();
+      const snapshot = inspectNamedSubagent(artifactDir, name, [...runningSubagents.values()].find(r => r.name === name));
+      return { content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }], details: snapshot };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_stop",
+    label: "Stop Subagent",
+    description: "Explicitly stop an owned Pi child by persistent name, preserving its session. " +
+      "Returns requested separately from confirmed termination; stale identities never target another process. " +
+      "Native CLI stop is unsupported. Later messages cannot restart stopped work; deliberate resume requires subagent_message({name, message, resume:true}) after confirmed termination.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Exact persistent subagent name in this parent session." }),
+      id: Type.Optional(Type.String({ description: "Expected launch id from inspect; reject if the name now refers to another launch." })),
+    }),
+    async execute(_id, params, signal, _update, ctx) {
+      throwIfLaunchCancelled(signal);
+      const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+      const result = await stopNamedSubagent(artifactDir, params.name.trim(), params.id);
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
+    },
+  });
+
   // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
@@ -2357,6 +2529,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
         "For Pi children, deliverAs is steer (default, during current work) or followUp (after current work). Native CLI backends reject followUp. " +
+        "Explicitly stopped launches refuse ordinary messages; resume:true deliberately resumes only after confirmed termination. " +
         "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
@@ -2378,6 +2551,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         deliverAs: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], {
           description: "Pi only: steer supplements current work; followUp queues a new turn after it. Default: steer.",
         })),
+        resume: Type.Optional(Type.Boolean({ description: "Explicitly resume an intentionally stopped session after confirmed termination. Omit for ordinary steering/finished-session resume." })),
       }),
 
       renderCall(args, theme) {
@@ -2467,12 +2641,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        if (entry.execution?.stop) {
+          const error = !params.resume
+            ? "This subagent was explicitly stopped. A late reply cannot resume it. Use resume: true for a deliberate new task."
+            : !entry.execution.stop.confirmedAt
+              ? "Termination of the stopped launch is unconfirmed; resuming could create two writers. No process was launched."
+              : null;
+          if (error) return { content: [{ type: "text" as const, text: error }], details: { error } };
+        }
+
         const sessionPath = entry.sessionFile;
         if (!sessionPath || !existsSync(sessionPath)) {
           const err =
             `Subagent "${requestedName}" is registered but its session file is gone ` +
             `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (entry.sessionId && getSessionId(sessionPath) !== entry.sessionId) {
+          const error = "The saved session identity changed; no process was launched.";
+          return { content: [{ type: "text" as const, text: error }], details: { error } };
         }
 
         if (existsSync(`${sessionPath}.workflow-aborted`)) {
@@ -2488,6 +2676,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             return handleSubagentSteer({ name: r.name, message: params.message, signal, deliverAs: params.deliverAs });
           }
         }
+
+        // Old questions are session-scoped files. A new launch must not deliver
+        // a saved question from the stopped incarnation, including legacy data.
+        rmSync(`${sessionPath}.ask`, { force: true });
 
         const external = readExternalSession(sessionPath);
         if (external) {
@@ -2526,8 +2718,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startWidgetRefresh();
           startStatusRefresh(pi);
           watchSubagent(running, watcherAbort.signal)
-            .then(result => publishSubagentResult(pi, result))
-            .catch(error => publishSubagentError(pi, name, error));
+            .then(result => { if (!launchStopped(running)) publishSubagentResult(pi, result); })
+            .catch(error => { if (!launchStopped(running)) publishSubagentError(pi, name, error); });
           return { content: [{ type: "text" as const, text: `Session "${name}" resumed.` }],
             details: { id, name, sessionFile: sessionPath, sessionId: getSessionId(sessionPath),
               launchScriptFile: running.launchScriptFile, status: "started" } };
@@ -2554,9 +2746,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         throwIfLaunchCancelled(signal);
-        const surface = createSurface(name);
+        const openingPath = resolve(sessionPath);
+        if (openingSessions.has(openingPath)) {
+          const error = `Session "${name}" is already opening; inspect after it starts.`;
+          return { content: [{ type: "text" as const, text: error }], details: { error } };
+        }
+        openingSessions.add(openingPath);
+        let surface: string;
         let verifyScratchDir: string | undefined;
         try {
+          surface = createSurface(name);
           await waitForSurfaceOwner();
           await waitForShellReady(getShellReadyDelayMs(), signal);
 
@@ -2657,7 +2856,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               startTimeMs: startTime,
             }),
           };
-          runningSubagents.set(id, running);
+          trackRunningSubagent(running, parentArtifactDir);
           startWidgetRefresh();
           startStatusRefresh(pi);
 
@@ -2667,11 +2866,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
           watchSubagent(running, watcherAbort.signal)
             .then((result) => {
+              if (launchStopped(running)) return;
               publishSubagentResult(pi,
                 { ...result, sessionFile: sessionPath, sessionId: resumedSessionId },
                 loadout.agent ?? undefined);
             })
-            .catch((err) => publishSubagentError(pi, name, err));
+            .catch((err) => { if (!launchStopped(running)) publishSubagentError(pi, name, err); });
 
           return {
             content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -2687,9 +2887,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } catch (error) {
           cleanupVerifyScratch(verifyScratchDir);
           rmSync(piInbox(sessionPath, id), { recursive: true, force: true });
-          try { closeSurface(surface); } catch {}
+          if (surface!) { try { closeSurface(surface); } catch {} }
           runningSubagents.delete(id);
           throw error;
+        } finally {
+          openingSessions.delete(openingPath);
         }
       },
     });
@@ -2738,7 +2940,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       resolveRunning: resolveRunningByName,
       runningSubagents,
       reservedNames,
-      closeSurface: closeOwnedSurface,
+      closeSurface: async surface => {
+        const running = [...runningSubagents.values()].find(r => r.surface === surface);
+        if (running) await closeOwnedSurface(running);
+      },
       registerName,
       readNameRegistry,
       getArtifactDir,
