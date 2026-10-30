@@ -127,12 +127,12 @@ it('a real detached fork after a process snapshot is reconciled before confirmed
   const wrapper = join(dir, 'ps');
   const countFile = join(dir, 'snapshots');
   writeFileSync(wrapper, `#!${process.execPath}
-    const {execFileSync}=require('node:child_process'),fs=require('node:fs');
-    const args=process.argv.slice(2),result=execFileSync(${JSON.stringify(realPs)},args);
+    const {spawnSync}=require('node:child_process'),fs=require('node:fs');
+    const args=process.argv.slice(2),result=spawnSync(${JSON.stringify(realPs)},args);
     if(args[0]==='-axo'){
       const file=${JSON.stringify(countFile)},n=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8'))+1:1;fs.writeFileSync(file,String(n));
       if(n===2){process.kill(${target},'SIGUSR1');const end=Date.now()+3000;while(!fs.existsSync(${JSON.stringify(forked)})&&Date.now()<end)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);if(!fs.existsSync(${JSON.stringify(forked)}))process.exit(74);}
-    }process.stdout.write(result);`, { mode: 0o700 });
+    }process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status ?? 1;`, { mode: 0o700 });
   const saved = process.env.PATH;
   process.env.PATH = dirname(wrapper) + delimiter + saved;
   let result;
@@ -143,6 +143,121 @@ it('a real detached fork after a process snapshot is reconciled before confirmed
   writeFileSync(release, 'release');
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(existsSync(escaped), false, 'the newly discovered detached process cannot escape a confirmed stop');
+});
+
+it('strict stop reconciles padded macOS process titles across global and single-PID evidence', {
+  skip: process.platform !== 'darwin', timeout: 15000,
+}, async t => {
+  const { dir, name, parent, sibling, child } = fixture(t);
+  const actorFile = join(dir, 'actor-pid'), toolFile = join(dir, 'tool-pid');
+  const release = join(dir, 'release'), escaped = join(dir, 'escaped');
+  const script = join(dir, 'process-title.mjs');
+  const tool = `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(toolFile)},String(process.pid));setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)}))fs.writeFileSync(${JSON.stringify(escaped)},'escaped')},10)`;
+  writeFileSync(script, `import {spawn} from 'node:child_process';import {writeFileSync} from 'node:fs';
+    process.title='pi';
+    spawn(process.execPath,['-e',${JSON.stringify(tool)}],{detached:true,stdio:'ignore'});
+    writeFileSync(${JSON.stringify(actorFile)},String(process.pid));setInterval(()=>{},1000);`);
+  tmux('respawn-pane', '-k', '-t', child, `${shellEscape(process.execPath)} ${shellEscape(script)}; sleep 86400`);
+  await until(() => existsSync(actorFile) && existsSync(toolFile));
+  const actorPid = readFileSync(actorFile, 'utf8').trim(), toolPid = readFileSync(toolFile, 'utf8').trim();
+  const realPs = execFileSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).trim();
+  t.after(() => {
+    // The title actor is attached to our pane and exits with it. A detached
+    // tool needs its own cleanup if an assertion fails before strict stop.
+    try {
+      const command = execFileSync(realPs, ['-p', toolPid, '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      if (command.includes(dir)) process.kill(Number(toolPid), 'SIGKILL');
+    } catch (error) {
+      if ((error as any).status !== 1 && (error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    }
+  });
+  const options = { encoding: 'utf8' as const, env: { ...process.env, LC_ALL: 'C' } };
+  const columns = 'pid=,ppid=,lstart=,stat=,args=';
+  const global = execFileSync(realPs, ['-axo', columns], options);
+  const single = execFileSync(realPs, ['-p', actorPid, '-o', columns], options);
+  const row = global.split('\n').find(line => new RegExp('^\\s*' + actorPid + '\\s').test(line));
+  assert.ok(row, 'the real titled process must be present in the global snapshot');
+  const command = (line: string) => /^\s*\d+\s+\d+\s+\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+\s+\S+\s+(.*)$/.exec(line)![1];
+  const globalCommand = command(row), singleCommand = command(single.trim());
+  assert.match(globalCommand, /^pi\b/, 'the actor must use the actual Pi process title');
+  assert.match(globalCommand, /[ \t]+$/, 'macOS preserves process-title padding on a middle snapshot row');
+  assert.notEqual(globalCommand, singleCommand, 'whole-output trimming changes the same process command representation');
+  assert.equal(globalCommand.trimEnd(), singleCommand, 'the discrepancy consists only of trailing presentation padding');
+
+  const result = await stopOwnedSurfaceTree(child, captureSurfaceOwnership(child));
+  assert.equal(result.confirmed, true, result.reason);
+  for (const pid of [actorPid, toolPid]) {
+    try { assert.match(execFileSync(realPs, ['-o', 'stat=', '-p', pid], { encoding: 'utf8' }).trim(), /^Z/); }
+    catch (error) { if ((error as any).status !== 1) throw error; }
+  }
+  writeFileSync(release, 'release');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(existsSync(escaped), false, 'the titled process and its detached tool cannot continue after confirmed stop');
+  assert.deepEqual(tmux('list-panes', '-s', '-t', name, '-F', '#{pane_id}').split('\n'), [parent, sibling]);
+});
+
+it('a real process disappearing before its macOS identity query does not interrupt the remaining stop', {
+  skip: process.platform !== 'darwin', timeout: 15000,
+}, async t => {
+  const { dir, name, parent, sibling, child } = fixture(t);
+  const victimFile = join(dir, 'victim-pid'), toolFile = join(dir, 'tool-pid');
+  const release = join(dir, 'release'), escaped = join(dir, 'escaped'), disappeared = join(dir, 'disappeared');
+  const script = join(dir, 'disappearing.mjs');
+  const victim = `require('node:fs').writeFileSync(${JSON.stringify(victimFile)},String(process.pid));setInterval(()=>{},1000)`;
+  const tool = `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(toolFile)},String(process.pid));setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)}))fs.writeFileSync(${JSON.stringify(escaped)},'escaped')},10)`;
+  writeFileSync(script, `import {spawn} from 'node:child_process';
+    spawn(process.execPath,['-e',${JSON.stringify(victim)}],{detached:true,stdio:'ignore'});
+    spawn(process.execPath,['-e',${JSON.stringify(tool)}],{detached:true,stdio:'ignore'});
+    setInterval(()=>{},1000);`);
+  tmux('respawn-pane', '-k', '-t', child, `${shellEscape(process.execPath)} ${shellEscape(script)}; sleep 86400`);
+  await until(() => existsSync(victimFile) && existsSync(toolFile));
+  const target = Number(readFileSync(victimFile, 'utf8'));
+  const toolPid = readFileSync(toolFile, 'utf8').trim();
+  const ownership = captureSurfaceOwnership(child);
+  const realPs = execFileSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).trim();
+  t.after(() => {
+    for (const pid of [String(target), toolPid]) {
+      try {
+        const command = execFileSync(realPs, ['-p', pid, '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        if (command.includes(dir)) process.kill(Number(pid), 'SIGKILL');
+      } catch (error) {
+        if ((error as any).status !== 1 && (error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    }
+  });
+  const wrapper = join(dir, 'ps');
+  // Forward actual ps output/status. Only the timing changes: terminate our
+  // frozen victim immediately before the production per-PID identity read.
+  writeFileSync(wrapper, `#!${process.execPath}
+    const {spawnSync}=require('node:child_process'),fs=require('node:fs'),args=process.argv.slice(2);
+    if(args[0]==='-p'&&args[1]===${JSON.stringify(String(target))}&&!fs.existsSync(${JSON.stringify(disappeared)})){
+      const state=spawnSync(${JSON.stringify(realPs)},['-o','stat=','-p',args[1]],{encoding:'utf8'});
+      if(/^[Tt]/.test(state.stdout.trim())){
+        process.kill(${target},'SIGKILL');
+        const deadline=Date.now()+3000;
+        while(Date.now()<deadline){
+          const gone=spawnSync(${JSON.stringify(realPs)},['-p',args[1],'-o','pid='],{encoding:'utf8'});
+          if(gone.status===1&&!gone.stdout.trim()&&!gone.stderr.trim()){fs.writeFileSync(${JSON.stringify(disappeared)},String(${target}));break;}
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);
+        }
+        if(!fs.existsSync(${JSON.stringify(disappeared)}))process.exit(74);
+      }
+    }
+    const result=spawnSync(${JSON.stringify(realPs)},args);
+    process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status ?? 1;`, { mode: 0o700 });
+  const saved = process.env.PATH;
+  process.env.PATH = dirname(wrapper) + delimiter + saved;
+  let result;
+  try { result = await stopOwnedSurfaceTree(child, ownership); }
+  finally { process.env.PATH = saved; }
+  assert.equal(readFileSync(disappeared, 'utf8'), String(target), 'the actual captured process must disappear before its identity query');
+  assert.equal(result.confirmed, true, result.reason);
+  try { assert.match(execFileSync(realPs, ['-o', 'stat=', '-p', toolPid], { encoding: 'utf8' }).trim(), /^Z/); }
+  catch (error) { if ((error as any).status !== 1) throw error; }
+  writeFileSync(release, 'release');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(existsSync(escaped), false, 'remaining detached work must still terminate');
+  assert.deepEqual(tmux('list-panes', '-s', '-t', name, '-F', '#{pane_id}').split('\n'), [parent, sibling]);
 });
 
 it('a process-query failure after freezing restores surviving detached work instead of leaving it stopped', { timeout: 15000 }, async t => {
@@ -163,7 +278,8 @@ it('a process-query failure after freezing restores surviving detached work inst
   writeFileSync(wrapper, `#!${process.execPath}
     const fs=require('node:fs'),args=process.argv.slice(2);if(args[0]==='-axo'){
       const file=${JSON.stringify(countFile)},n=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8'))+1:1;fs.writeFileSync(file,String(n));if(n===3)process.exit(73);
-    }process.stdout.write(require('node:child_process').execFileSync(${JSON.stringify(realPs)},args));`, { mode: 0o700 });
+    }const result=require('node:child_process').spawnSync(${JSON.stringify(realPs)},args);
+    process.stdout.write(result.stdout);process.stderr.write(result.stderr);process.exitCode=result.status ?? 1;`, { mode: 0o700 });
   const saved = process.env.PATH;
   process.env.PATH = dirname(wrapper) + delimiter + saved;
   let result;

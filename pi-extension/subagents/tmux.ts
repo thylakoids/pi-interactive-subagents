@@ -699,8 +699,10 @@ function parseOwnedProcesses(raw: string): Map<number, OwnedProcess> {
     let birthTick: string | undefined;
     const identity = linuxProcessIdentity(Number(match[1]));
     if (identity?.parent === Number(match[2])) birthTick = identity.birthTick;
+    // Rewritten process titles can be space-padded. Normalize every row like
+    // the final/only row already normalized by raw.trim(), keeping identity reads comparable.
     processes.set(Number(match[1]), {
-      pid: Number(match[1]), parent: Number(match[2]), started: match[3].replace(/\s+/g, " "), state: match[4], command: match[5],
+      pid: Number(match[1]), parent: Number(match[2]), started: match[3].replace(/\s+/g, " "), state: match[4], command: match[5].trimEnd(),
       ...(birthTick ? { birthTick } : {}),
     });
   }
@@ -709,8 +711,8 @@ function parseOwnedProcesses(raw: string): Map<number, OwnedProcess> {
 }
 
 function sameProcess(before: OwnedProcess, after: OwnedProcess, requireBirthTick = false): boolean {
-  if (before.started !== after.started) return false;
-  if (requireBirthTick && (before.parent !== after.parent || before.command !== after.command)) return false;
+  if (before.started !== after.started || before.command !== after.command) return false;
+  if (requireBirthTick && before.parent !== after.parent) return false;
   if (before.birthTick && after.birthTick) return before.birthTick === after.birthTick;
   // Missing fine-grained evidence may prevent signalling, never prove exit.
   return !requireBirthTick || !before.birthTick;
@@ -726,9 +728,18 @@ function signalOwnedProcess(entry: OwnedProcess, signal: NodeJS.Signals): boolea
     const live = linuxProcessIdentity(entry.pid);
     if (!live || live.birthTick !== entry.birthTick || live.state === "Z") return false;
   } else {
-    const raw = execFileSync("ps", ["-p", String(entry.pid), "-o", "pid=,ppid=,lstart=,stat=,args="], {
-      encoding: "utf8", env: { ...process.env, LC_ALL: "C" },
-    });
+    let raw: string;
+    try {
+      raw = execFileSync("ps", ["-p", String(entry.pid), "-o", "pid=,ppid=,lstart=,stat=,args="], {
+        encoding: "utf8", env: { ...process.env, LC_ALL: "C" },
+      });
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string };
+      // macOS ps exits 1 without output when the captured process has already
+      // exited. This is ordinary disappearance, not a failed identity read.
+      if (failure.status === 1 && failure.stdout?.trim() === "" && failure.stderr?.trim() === "") return false;
+      throw error;
+    }
     const live = parseOwnedProcesses(raw).get(entry.pid);
     if (!live || !sameProcess(entry, live, signal === "SIGSTOP") || !executionProcess(live)) return false;
   }

@@ -14,8 +14,26 @@ async function until(check: () => boolean, label: string, timeout = 180_000) {
   while (!check() && Date.now() < deadline) await delay(100);
   assert.ok(check(), 'Timed out: ' + label);
 }
-const rows = (file: string) => readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+function rows(file: string): any[] {
+  let contents: string;
+  try { contents = readFileSync(file, 'utf8'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  return contents.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
 const users = (file: string) => rows(file).filter(row => row.message?.role === 'user');
+function assertCompletedEvidence(snapshot: any) {
+  assert.ok(Number.isFinite(snapshot.evidenceAt), 'completion inspection must retain its evidence time');
+  if (snapshot.state === 'finished') {
+    assert.equal(snapshot.stale, false);
+    return;
+  }
+  // A normally exiting child can retire before strict descendant capture.
+  // Acceptance permits historical evidence, never a fabricated termination proof.
+  assert.equal(snapshot.state, 'unknown');
+  assert.equal(snapshot.stale, true);
+  assert.equal(snapshot.historicalPhase, 'done');
+  assert.match(snapshot.reason, /historical launch.*liveness is unknown/);
+}
 const tmux = (...args: string[]) => execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const alive = (pid: number) => {
   assert.ok(Number.isInteger(pid) && pid > 0);
@@ -107,8 +125,8 @@ export default function liveLifecycle(pi: any) {
     assert.deepEqual(panes(), beforePanes, 'late reply must not open a pane');
     assert.deepEqual(users(file), beforeUsers, 'late reply must not enter stopped history');
   };
-  const automaticResult = (ctx: any, name: string) => rows(ctx.sessionManager.getSessionFile()).some(row =>
-    row.type === 'custom_message' && row.customType === 'subagent_result' && row.details?.name === name);
+  const automaticResults = (ctx: any, name: string, task: string) => ctx.sessionManager.getEntries().filter((row: any) =>
+    row.type === 'custom_message' && row.customType === 'subagent_result' && row.details?.name === name && row.details?.task === task);
 
   pi.registerCommand('live-inspect-stop', { description: 'Run real named-child lifecycle probes', handler: async (_args: string, ctx: any) => {
     try {
@@ -133,24 +151,27 @@ export default function liveLifecycle(pi: any) {
       await stop(ctx, running.name, running.id);
       assert.throws(() => queuePiMessage(running.sessionFile, running.id, { message: 'late queued input', deliverAs: 'steer' }));
       await rejectLate(ctx, running.name, running.sessionFile);
+      assert.equal(automaticResults(ctx, running.name, running.task).length, 0, 'stopped original launch cannot deliver a late result');
       assert.equal(surfaceExists(parent), true);
       assert.equal(alive(parentPid), true);
       assert.equal(surfaceExists(sibling.surface), true);
       assert.equal(alive(siblingPid), true);
 
-      const resumed = await invoke(ctx, 'subagent_message', { name: running.name, resume: true,
-        message: 'The previous blocking command was intentionally stopped; do not restart it. ' + bashTask('printf RESUMED_RUNNING > running-resumed') });
+      const resumeRunningTask = 'The previous blocking command was intentionally stopped; do not restart it. ' + bashTask('printf RESUMED_RUNNING > running-resumed');
+      const resumed = await invoke(ctx, 'subagent_message', { name: running.name, resume: true, message: resumeRunningTask });
       assert.equal(resumed.details.status, 'started', JSON.stringify(resumed));
       assert.notEqual(resumed.details.id, running.id);
       assert.equal(resumed.details.sessionFile, running.sessionFile);
+      assert.equal(resumed.details.sessionId, runningSnapshot.sessionId);
       await until(() => existsSync(join(dir, 'running-resumed')) && !child(running.name), 'deliberate resume completes in the same history');
-      await until(() => automaticResult(ctx, running.name), 'ordinary automatic result delivery survives explicit resume');
+      await until(() => automaticResults(ctx, running.name, resumeRunningTask).length === 1, 'exactly one result from the deliberate resumed task arrives');
+      assert.equal(automaticResults(ctx, running.name, running.task).length, 0, 'old launch stays suppressed after deliberate resume');
       const finished = await inspect(ctx, running.name);
-      assert.equal(finished.state, 'finished');
+      assertCompletedEvidence(finished);
 
       const waiting = await start(ctx, 'live-waiting', 'Your FIRST actual tool call must be ask_question with question "LIFECYCLE_WAIT: What is my next task?". Plain text does not invoke tools. Then stop and wait for your parent. Do not use any other tool, write a file, invent an answer or continue until a parent reply arrives.');
       await until(() => rows(waiting.sessionFile).some(row => row.message?.role === 'toolResult' && row.message.toolName === 'ask_question'), 'real model asks its parent');
-      await until(() => rows(ctx.sessionManager.getSessionFile()).some(row => row.type === 'custom_message' && row.customType === 'subagent_question' && row.details?.name === waiting.name), 'automatic question delivery remains intact');
+      await until(() => ctx.sessionManager.getEntries().some((row: any) => row.type === 'custom_message' && row.customType === 'subagent_question' && row.details?.name === waiting.name), 'automatic question delivery remains intact');
       await until(() => {
         const result = waiting.activityFile && existsSync(waiting.activityFile) ? JSON.parse(readFileSync(waiting.activityFile, 'utf8')) : null;
         return result?.phase === 'waiting';
@@ -166,15 +187,16 @@ export default function liveLifecycle(pi: any) {
       await stop(ctx, waiting.name, waiting.id);
       assert.throws(() => queuePiMessage(waiting.sessionFile, waiting.id, { message: 'delayed answer', deliverAs: 'steer' }));
       await rejectLate(ctx, waiting.name, waiting.sessionFile);
+      assert.equal(automaticResults(ctx, waiting.name, waiting.task).length, 0, 'stopped question launch cannot deliver a late result');
       assert.equal(surfaceExists(parent), true);
       assert.equal(alive(parentPid), true);
       assert.equal(surfaceExists(sibling.surface), true);
       assert.equal(alive(siblingPid), true, 'stopping either child preserves unrelated work');
       writeFileSync(join(dir, 'sibling-release'), 'release');
       await until(() => existsSync(join(dir, 'sibling-done')) && !child(sibling.name), 'sibling finishes normally');
-      await until(() => automaticResult(ctx, sibling.name), 'unrelated child result arrives automatically');
+      await until(() => automaticResults(ctx, sibling.name, sibling.task).length === 1, 'unrelated child result arrives automatically once');
       const siblingSnapshot = await inspect(ctx, sibling.name);
-      assert.equal(siblingSnapshot.state, 'finished');
+      assertCompletedEvidence(siblingSnapshot);
       save('first-report', { ok: true, parentSession: ctx.sessionManager.getSessionFile(),
         children: [runningSnapshot, waitingSnapshot, siblingSnapshot], finished, runningProcesses, waitingProcesses,
         checks: ['running-inspect', 'stale-id-refused', 'running-stop', 'double-stop', 'late-input-refused', 'deliberate-resume',
@@ -191,8 +213,10 @@ export default function liveLifecycle(pi: any) {
       const snapshots = [];
       for (const item of first.children) {
         const snapshot = await inspect(ctx, item.name);
-        assert.equal(snapshot.state, item.name === 'live-waiting' ? 'stopped' : 'finished');
-        assert.equal(snapshot.stale, false);
+        if (item.name === 'live-waiting') {
+          assert.equal(snapshot.state, 'stopped');
+          assert.equal(snapshot.stale, false);
+        } else assertCompletedEvidence(snapshot);
         assert.equal(snapshot.sessionFile, item.sessionFile);
         snapshots.push(snapshot);
       }
@@ -202,15 +226,16 @@ export default function liveLifecycle(pi: any) {
       const waiting = snapshots.find(item => item.name === 'live-waiting')!;
       await stop(ctx, waiting.name, waiting.id);
       await rejectLate(ctx, waiting.name, waiting.sessionFile);
-      const resumed = await invoke(ctx, 'subagent_message', { name: waiting.name, resume: true,
-        message: 'This is the deliberate next task after the stop. Ignore the old unanswered question; do not create forbidden-late-reply. ' + bashTask('printf RESUMED_WAITING > waiting-resumed') });
+      const resumeWaitingTask = 'This is the deliberate next task after the stop. Ignore the old unanswered question; do not create forbidden-late-reply. ' + bashTask('printf RESUMED_WAITING > waiting-resumed');
+      const resumed = await invoke(ctx, 'subagent_message', { name: waiting.name, resume: true, message: resumeWaitingTask });
       assert.equal(resumed.details.status, 'started', JSON.stringify(resumed));
       assert.notEqual(resumed.details.id, waiting.id);
       assert.equal(resumed.details.sessionFile, waiting.sessionFile);
+      assert.equal(resumed.details.sessionId, waiting.sessionId);
       await until(() => existsSync(join(dir, 'waiting-resumed')) && !child(waiting.name), 'deliberately resumed waiter completes');
-      await until(() => automaticResult(ctx, waiting.name), 'restarted parent receives resumed result');
+      await until(() => automaticResults(ctx, waiting.name, resumeWaitingTask).length === 1, 'restarted parent receives exactly one result from the resumed task');
       const final = await inspect(ctx, waiting.name);
-      assert.equal(final.state, 'finished');
+      assertCompletedEvidence(final);
       assert.equal(surfaceExists(process.env.TMUX_PANE!), true);
       save('restart-report', { ok: true, snapshots, final, checks: ['persisted-inspect-readonly', 'persisted-double-stop', 'persisted-late-reply-refused', 'deliberate-waiter-resume'] });
     } catch (error: any) { save('restart-report', { ok: false, error: error?.stack ?? String(error) }); }
