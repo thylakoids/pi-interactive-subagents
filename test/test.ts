@@ -985,13 +985,26 @@ describe("subagent discovery", () => {
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
-    assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
-    }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+    assert.equal(worker.tools, undefined, "worker inherits Pi's configured tools and extensions");
+    assert.equal(testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true }), null);
+    withTempDir((d) => {
+      for (const excludedTools of [undefined, ["workflow"]]) {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, {
+          agent: "worker", toolAllowlist: null, spawnable: worker.subagentAgents,
+          model: null, thinking: null, identity: null, systemPromptMode: null,
+          autoExit: true, cwd: null, agentDir: null, excludedTools,
+        }, { artifactDir: d, name: "worker" });
+        assert.ok(!parts.includes("--no-extensions"));
+        const additions = parts[parts.indexOf("--tools") + 1].split(",");
+        for (const tool of ["codemode", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_stop"]) {
+          assert.ok(additions.includes(`+${tool}`), tool);
+        }
+        assert.ok(parts.some(part => part.endsWith("subagents/index.ts'")), "explicitly load delegation even if parent used -e");
+        assert.equal(parts.includes("--exclude-tools"), !!excludedTools);
+        if (excludedTools) assert.equal(parts[parts.indexOf("--exclude-tools") + 1], "'workflow'");
+      }
+    });
   });
 
   it("scout and researcher are not granted spawning tools", () => {
@@ -999,6 +1012,8 @@ describe("subagent discovery", () => {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
+      assert.ok(defs.tools, `${name} retains an explicit tool restriction`);
+      assert.ok(testApi.buildSubagentToolAllowlist(defs.tools));
     }
   });
 
@@ -1052,6 +1067,11 @@ describe("subagent discovery", () => {
     );
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null, "absent restriction stays unrestricted");
     assert.equal(testApi.buildSubagentToolAllowlist(""), null, "empty restriction stays unrestricted");
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }), null);
+    assert.equal(testApi.buildSubagentToolAllowlist("", { grantSpawning: true }), null);
+    const restricted = testApi.buildSubagentToolAllowlist("read", { grantSpawning: true })!.split(",");
+    for (const tool of ["read", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_stop"]) assert.ok(restricted.includes(tool));
+    assert.ok(!restricted.includes("bash"));
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1101,11 +1121,11 @@ describe("subagent discovery", () => {
           const label = `mode=${mode ?? "unset"}, identity=${identity ?? "absent"}`;
           if (identity) {
             assert.equal(identityParts[0], mode === "replace" ? "--system-prompt" : "--append-system-prompt", label);
-            assert.deepEqual(identityParts.slice(2), ["--tools", "+codemode", "-e", "builtin:codemode"], label);
+            assert.deepEqual(identityParts.slice(2), ["--tools", "+codemode,+ask_question", "-e", "builtin:codemode"], label);
             const promptPath = identityParts[1].slice(1, -1);
             assert.equal(readFileSync(promptPath, "utf8"), identity, `persisted identity: ${label}`);
           } else {
-            assert.deepEqual(identityParts, ["--tools", "+codemode", "-e", "builtin:codemode"], `no prompt flag without identity: ${label}`);
+            assert.deepEqual(identityParts, ["--tools", "+codemode,+ask_question", "-e", "builtin:codemode"], `no prompt flag without identity: ${label}`);
           }
         }
       }
@@ -1149,7 +1169,7 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, ["--tools", "+codemode", "-e", "builtin:codemode"]);
+      assert.deepEqual(parts, ["--tools", "+codemode,+ask_question", "-e", "builtin:codemode"]);
     });
   });
 

@@ -58,7 +58,7 @@ export default function liveFixture(pi: any) {
           assert.ok(call.sessionFile && existsSync(call.sessionFile), 'Real child session must exist');
           const loadout = readSubagentLoadout(call.sessionFile!)!;
           assert.ok(loadout, 'Real workflow loadout must be persisted');
-          assert.ok(loadout.toolAllowlist!.split(',').includes('ask_question'));
+          assert.ok(loadout.toolAllowlist === null || loadout.toolAllowlist.split(',').includes('ask_question'));
           if (loadout.readOnly) {
             assert.equal(loadout.spawnable, null);
             for (const writer of ['write', 'edit', 'bash', 'subagent']) assert.ok(!loadout.toolAllowlist!.split(',').includes(writer));
@@ -67,8 +67,9 @@ export default function liveFixture(pi: any) {
           assert.equal(loadout.autoExit, true);
           assert.match(loadout.identity!, /Workflow execution contract/);
           assert.equal(loadout.model, process.env.PI_TEST_MODEL, 'Unpinned worker inherits the parent model');
-          const tools = loadout.toolAllowlist!.split(',');
-          for (const denied of ['workflow']) assert.ok(!tools.includes(denied), denied + ' must be unavailable');
+          const tools = loadout.toolAllowlist?.split(',') ?? [];
+          assert.ok(loadout.excludedTools?.includes('workflow'), 'nested workflows remain excluded from inherited tools');
+          assert.ok(!tools.includes('workflow'));
           const rows = readFileSync(call.sessionFile!, 'utf8').trim().split('\n').map(line => JSON.parse(line));
           const responses = rows.filter(row => row.type === 'message' && row.message?.role === 'assistant');
           assert.ok(responses.some(row => row.message.usage?.input > 0 || row.message.usage?.output > 0), 'Must contain billed provider response, not a scripted reply');

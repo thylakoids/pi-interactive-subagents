@@ -84,7 +84,7 @@ export function workflowExecution(
   tools.push('ask_question');
   if (spawnable) tools.push(...SPAWNING_TOOLS);
   return {
-    toolAllowlist: [...new Set(tools)].join(','),
+    toolAllowlist: definition?.tools?.trim() ? [...new Set(tools)].join(',') : null,
     identity: [definition?.body, WORKFLOW_EXECUTION_CONTRACT].filter(Boolean).join('\n\n'),
     systemPromptMode: definition?.systemPromptMode ?? 'append',
     spawnable,

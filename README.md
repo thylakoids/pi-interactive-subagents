@@ -166,9 +166,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | ----- | ----- | ----- | ---- |
 | **scout** | *(inherits session)* | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | *(inherits session)* | `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | *(inherits session)* | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `source_check`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **worker** | *(inherits session)* | Configured Pi tools, extensions, skills and MCP + spawning | General-purpose independent Pi; may spawn `scout` and `researcher` |
 
-All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). Worker uses normal Pi resource discovery and its own configured MCP connections, including Computer Use when enabled and available. It has a separate conversation; it does not copy the parent's live connections or extensions loaded only through CLI arguments. Scout and researcher keep explicit tool restrictions.
 
 Workflows default to the same `worker` definition. The runtime enforces single-step
 execution: no conversation fork, automatic termination after completion, and direct
@@ -275,8 +275,8 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Optional override; omit to inherit the main session's current model (Pi agents). A call's explicit `model` takes precedence |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_inspect`, `subagent_stop`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child. Omit this field to inherit normal Pi tools, extensions and MCP |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_inspect`, `subagent_stop`, `subagents_list`) and restricts spawn targets to the list without restricting inherited Pi tools/extensions. Explicitly restricted agents without it are not granted spawning tools |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
@@ -404,7 +404,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Pi subagents enable the built-in `codemode` tool by default and use the configured `codemode.mode`. Agents with a non-empty `tools:` list or a spawning grant use `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only codemode and the extensions backing the allowed tools are loaded explicitly. The allowlist includes the frontmatter tools, subagent control tools, and spawning tools when granted. Codemode can call those allowed tools, and read-only restrictions still apply. Agents omitting both `tools:` and `subagent_agents` inherit pi’s default toolset and global extensions. Resume preserves this choice via the loadout snapshot. CLI-backed agents use the native CLI’s tool configuration.
+Pi subagents enable the built-in `codemode` tool by default and use the configured `codemode.mode`. A non-empty `tools:` list uses `--no-extensions` and `--tools <allowlist>`; only codemode and the extensions backing the allowed tools are loaded explicitly. Without a tool list, agents inherit normal Pi tools, extension discovery, skills and configured MCP servers, independently of their spawning grant. The launcher adds Codemode, child question controls and granted delegation tools to that configured selection. Workflow workers use the same inheritance unless tools are explicitly restricted or `readOnly` is requested; nested `workflow` calls remain excluded. Resume preserves inherited versus restricted mode through the loadout snapshot. Previously saved restricted sessions retain their original restrictions; start a new worker to adopt the broader profile. CLI-backed agents use the native CLI’s tool configuration.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

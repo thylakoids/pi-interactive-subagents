@@ -67,18 +67,21 @@ it('legacy alias still enforces worker authorization', async t => {
 
 it('workflow policy restores questions and declared delegation without granting undeclared agents', () => {
   const worker = __test__.loadAgentDefaults('worker')!;
-  const policy = workflowExecution({ ...worker, tools: worker.tools + ',workflow,*' });
+  const inherited = workflowExecution(worker);
+  assert.equal(inherited.toolAllowlist, null, 'ordinary workflow workers inherit Pi capabilities');
+  assert.deepEqual(inherited.spawnable, ['scout', 'researcher']);
+  const policy = workflowExecution({ ...worker, tools: 'read,bash,workflow,*' });
   for (const restored of ['subagent', 'subagents_list', 'subagent_message', 'ask_question']) {
-    assert.ok(policy.toolAllowlist.split(',').includes(restored), restored);
+    assert.ok(policy.toolAllowlist!.split(',').includes(restored), restored);
   }
-  for (const blocked of ['workflow', '*']) assert.ok(!policy.toolAllowlist.split(',').includes(blocked));
+  for (const blocked of ['workflow', '*']) assert.ok(!policy.toolAllowlist!.split(',').includes(blocked));
   assert.deepEqual(policy.spawnable, ['scout', 'researcher']);
   assert.ok(policy.identity.endsWith(WORKFLOW_EXECUTION_CONTRACT));
   assert.equal(policy.interactive, false);
   assert.equal(policy.autoExit, true);
   assert.equal(policy.sessionMode, 'lineage-only');
   const unprivileged = workflowExecution({ tools: 'read,subagent,subagent_message,subagents_list' });
-  assert.deepEqual(unprivileged.toolAllowlist.split(','), ['read', 'ask_question']);
+  assert.deepEqual(unprivileged.toolAllowlist!.split(','), ['read', 'ask_question']);
   assert.equal(unprivileged.spawnable, null);
 });
 

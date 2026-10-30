@@ -1060,9 +1060,9 @@ function buildSubagentToolAllowlist(
 
   const grantSpawning = opts?.grantSpawning ?? false;
 
-  // No explicit tool restriction and no spawning grant → don't pass --tools at
-  // all (the child keeps its default toolset).
-  if (requested.length === 0 && !grantSpawning) return null;
+  // Tool inheritance and delegation grants are independent. Omitted tools
+  // keep normal Pi discovery even when the agent may spawn named children.
+  if (requested.length === 0) return null;
 
   const allow = new Set(requested);
   if (grantSpawning) {
@@ -1120,8 +1120,8 @@ function applySandboxToParts(
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  // extensions backing the whitelisted tools. A null allowlist keeps normal
+  // Pi discovery, including configured extensions and MCP servers.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     const tools = new Set(loadout.toolAllowlist.split(",").map(tool => tool.trim()).filter(Boolean));
@@ -1137,10 +1137,16 @@ function applySandboxToParts(
       parts.push("-e", shellEscape(extPath));
     }
   } else {
-    // Keep Pi's configured default selection while enabling codemode for this child.
-    parts.push("--tools", "+codemode");
+    // Add control tools without replacing Pi's configured tools/extensions/MCP.
+    const additions = ["codemode", ...SUBAGENT_CONTROL_TOOLS];
+    if (loadout.spawnable?.length) {
+      additions.push(...SPAWNING_TOOLS);
+      parts.push("-e", shellEscape(fileURLToPath(import.meta.url)));
+    }
+    parts.push("--tools", additions.map(tool => `+${tool}`).join(","));
   }
   parts.push("-e", "builtin:codemode");
+  if (loadout.excludedTools?.length) parts.push("--exclude-tools", shellEscape(loadout.excludedTools.join(",")));
   if (loadout.readOnly) {
     const scratch = createVerifyScratch(surfaceOwnerDirectory());
     parts.unshift("env", `${READONLY_ENV.scratch}=${shellEscape(scratch)}`);
@@ -1763,11 +1769,9 @@ async function launchSubagent(
         ? localAgentDir
         : process.env.PI_CODING_AGENT_DIR ?? null;
 
-    // Default-deny model: when an agent restricts its tools (or is granted the
-    // spawning toolset), we disable global extension discovery and re-enable only
-    // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-    // restriction keep their full default toolset and all global extensions.
-    const toolAllowlist = policy?.toolAllowlist ?? buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+    // Only explicit tool restrictions disable normal Pi discovery. A spawning
+    // grant controls child targets independently of inherited tools and MCP.
+    const toolAllowlist = policy ? policy.toolAllowlist : buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
     // Snapshot the fully-resolved sandbox beside the session file so a later
     // `subagent_message({ name })` resume can replay the exact same
@@ -1778,6 +1782,7 @@ async function launchSubagent(
       agent: params.agent ?? null,
       ...(policy?.readOnly ? { readOnly: true } : {}),
       toolAllowlist: withExtraTool(options?.extraExtensions, toolAllowlist),
+      ...(policy ? { excludedTools: ["workflow"] } : {}),
       model: effectiveModel ?? null,
       thinking: effectiveThinking ?? null,
       systemPromptMode: systemPromptMode ?? null,

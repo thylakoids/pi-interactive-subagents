@@ -88,6 +88,10 @@ Retain failures and report unsupported backends or unavailable model access
 explicitly. Confirmation must come from independent termination evidence;
 calling a cleanup helper that suppresses errors is insufficient.
 
+## Worker resource inheritance
+
+`node --test test/integration/worker-inheritance.test.ts` runs real Pi sessions with isolated configuration and tmux, a loopback scripted provider, a global extension and a local mock Computer Use MCP server. It checks fresh tool calls on worker launch and same-session resume with a new launch identity/process, restricted-child exclusion, and workflow worker inheritance with nested workflows excluded. No paid model or actual desktop control is used; this proves resource loading and invocation, not model judgment or desktop permissions.
+
 ## Reproduce coverage
 
 Run in each checkout with the same dependencies and environment:

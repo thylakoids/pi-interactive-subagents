@@ -84,9 +84,9 @@ export function seedSubagentSessionFile(params: {
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
- * back to pi's default (all global extensions + full toolset). Storing the
+ * same inherited or restricted tool mode, exclusions, model, identity, spawn
+ * whitelist, cwd, and config dir it originally ran with. A restricted session
+ * never silently falls back to full Pi discovery. Storing the
  * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
@@ -98,6 +98,8 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  /** Tools excluded from inherited defaults, replayed on resume (e.g. nested workflows). */
+  excludedTools?: string[];
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
