@@ -1088,6 +1088,8 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+      assert.equal(parts[toolsIdx + 1], "'read,write,safe_bash,codemode'");
+      assert.ok(parts.includes("builtin:codemode"));
       for (const mode of ["replace", "append", null] as const) {
         for (const identity of ["You are X.", null]) {
           const identityParts: string[] = [];
@@ -1099,14 +1101,32 @@ describe("subagent discovery", () => {
           const label = `mode=${mode ?? "unset"}, identity=${identity ?? "absent"}`;
           if (identity) {
             assert.equal(identityParts[0], mode === "replace" ? "--system-prompt" : "--append-system-prompt", label);
-            assert.equal(identityParts.length, 2, `only identity flag and path: ${label}`);
+            assert.deepEqual(identityParts.slice(2), ["--tools", "+codemode", "-e", "builtin:codemode"], label);
             const promptPath = identityParts[1].slice(1, -1);
             assert.equal(readFileSync(promptPath, "utf8"), identity, `persisted identity: ${label}`);
           } else {
-            assert.deepEqual(identityParts, [], `no prompt flag without identity: ${label}`);
+            assert.deepEqual(identityParts, ["--tools", "+codemode", "-e", "builtin:codemode"], `no prompt flag without identity: ${label}`);
           }
         }
       }
+    });
+  });
+
+  it("enables codemode once when replaying a restricted workflow loadout", () => {
+    withTempDir((d) => {
+      const loadout = {
+        agent: "worker", toolAllowlist: "read,structured_output,codemode", model: null,
+        thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+        autoExit: true, cwd: null, agentDir: null,
+      };
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, loadout, { artifactDir: d, name: "worker" });
+        assert.equal(parts[parts.indexOf("--tools") + 1], "'read,structured_output,codemode'");
+        assert.ok(parts.includes("--no-extensions"));
+        assert.ok(parts.includes("builtin:codemode"));
+      }
+      assert.equal(loadout.toolAllowlist, "read,structured_output,codemode");
     });
   });
 
@@ -1129,7 +1149,7 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, []);
+      assert.deepEqual(parts, ["--tools", "+codemode", "-e", "builtin:codemode"]);
     });
   });
 

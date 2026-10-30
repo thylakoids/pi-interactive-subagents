@@ -404,7 +404,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Pi agents with a non-empty `tools:` list or a spawning grant use `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the allowed tools are loaded explicitly. The allowlist includes the frontmatter tools, subagent control tools, and spawning tools when granted. Agents omitting both `tools:` and `subagent_agents` inherit pi’s default toolset and global extensions. Resume preserves this choice via the loadout snapshot. CLI-backed agents use the native CLI’s tool configuration.
+Pi subagents enable the built-in `codemode` tool by default and use the configured `codemode.mode`. Agents with a non-empty `tools:` list or a spawning grant use `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only codemode and the extensions backing the allowed tools are loaded explicitly. The allowlist includes the frontmatter tools, subagent control tools, and spawning tools when granted. Codemode can call those allowed tools, and read-only restrictions still apply. Agents omitting both `tools:` and `subagent_agents` inherit pi’s default toolset and global extensions. Resume preserves this choice via the loadout snapshot. CLI-backed agents use the native CLI’s tool configuration.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 

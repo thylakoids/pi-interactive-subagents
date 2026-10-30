@@ -1124,7 +1124,9 @@ function applySandboxToParts(
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
-    parts.push("--tools", shellEscape(loadout.toolAllowlist));
+    const tools = new Set(loadout.toolAllowlist.split(",").map(tool => tool.trim()).filter(Boolean));
+    tools.add("codemode");
+    parts.push("--tools", shellEscape([...tools].join(",")));
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
@@ -1134,7 +1136,11 @@ function applySandboxToParts(
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
     }
+  } else {
+    // Keep Pi's configured default selection while enabling codemode for this child.
+    parts.push("--tools", "+codemode");
   }
+  parts.push("-e", "builtin:codemode");
   if (loadout.readOnly) {
     const scratch = createVerifyScratch(surfaceOwnerDirectory());
     parts.unshift("env", `${READONLY_ENV.scratch}=${shellEscape(scratch)}`);

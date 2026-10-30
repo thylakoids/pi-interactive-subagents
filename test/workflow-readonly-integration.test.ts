@@ -78,7 +78,8 @@ it('saved readonly loadouts retain enforcement and get fresh scratch on Focus/Re
     // leave a newly allocated root behind when the first assertion fails.
     t.after(() => __test__.cleanupVerifyScratch(ownedScratch));
     const tools = parts[parts.indexOf('--tools') + 1];
-    assert.match(tools, /verify_command/);
+    assert.equal(tools, "'read,verify_command,ask_question,codemode'");
+    assert.ok(parts.includes('builtin:codemode'));
     assert.doesNotMatch(tools, /write|edit|bash|subagent|\*/);
     assert.ok(parts.includes('--no-extensions'));
     assert.ok(parts.some(part => part.includes('workflow/readonly.ts')));
