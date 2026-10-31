@@ -25,14 +25,12 @@ export default function fixture(pi: any) {
       const stream = createAssistantMessageEventStream();
       const round = ++requests;
       record('provider-request', {round, prematureExit: existsSync(process.env.PI_SUBAGENT_SESSION + '.exit')});
-      const deliveryProbe = process.env.PI_BOUNDARY_DELIVERY === '1';
-      const error = !deliveryProbe && round === 1;
       const message: any = {role:'assistant',api:model.api,provider:model.provider,model:model.id,
-        timestamp:Date.now(),content:round === 1 ? [] : [{type:'text',text:deliveryProbe ? 'RECOVERED_DELIVERY' : round === 2 ? 'BEFORE_CONTINUE' : 'FINAL_SETTLED'}],
-        stopReason:error ? 'error' : 'stop', ...(error ? {errorMessage:'529 overloaded'} : {}),
+        timestamp:Date.now(),content:round === 1 ? [] : [{type:'text',text:round === 2 ? 'BEFORE_CONTINUE' : 'FINAL_SETTLED'}],
+        stopReason:round === 1 ? 'error' : 'stop', ...(round === 1 ? {errorMessage:'529 overloaded'} : {}),
         usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}}};
       queueMicrotask(() => {
-        stream.push(error ? {type:'error',reason:'error',error:message} : {type:'done',reason:'stop',message});
+        stream.push(round === 1 ? {type:'error',reason:'error',error:message} : {type:'done',reason:'stop',message});
         stream.end();
       });
       return stream;
@@ -40,7 +38,7 @@ export default function fixture(pi: any) {
   });
   pi.on('agent_end', () => record('agent-end', {prematureExit:existsSync(process.env.PI_SUBAGENT_SESSION + '.exit')}));
   pi.on('agent_before_settle', () => {
-    if (process.env.PI_BOUNDARY_DELIVERY !== '1' && continuations++ === 0) return { entries:[{type:'custom_message',customType:'boundary-probe',content:'Continue with the final response.',display:false}], continue:true };
+    if (continuations++ === 0) return { entries:[{type:'custom_message',customType:'boundary-probe',content:'Continue with the final response.',display:false}], continue:true };
   });
   pi.on('agent_settled', (event: any) => record('settled', {aborted:event.aborted,exitWritten:existsSync(process.env.PI_SUBAGENT_SESSION + '.exit')}));
 }

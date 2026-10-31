@@ -397,7 +397,6 @@ Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
 - **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
-- **Empty delivery:** if a completed Pi run has no nonempty text or image in its final assistant message, the runtime requests a result in the requested format before settlement. It makes at most one such attempt per run and reports an error if the response is still empty. Schema-based workflow steps return through `structured_output` and are excluded.
 
 ### interactive
 

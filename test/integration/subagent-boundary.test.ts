@@ -11,7 +11,7 @@ import { cleanupSession } from './cleanup.ts';
 import { integrationRuntime } from './runtime.ts';
 import { createPiInbox, queuePiMessage } from '../../pi-extension/subagents/control.ts';
 
-function launch(t:any, autoExit:boolean, prompt='', deliveryProbe=false) {
+function launch(t:any, autoExit:boolean, prompt='') {
   const dir = mkdtempSync(join(tmpdir(),'pi-boundary-'));
   const session = `pi-boundary-${process.pid}-${Date.now()}`;
   t.after(() => cleanupSession(session,dir,{preserveArtifacts:true}));
@@ -23,7 +23,7 @@ function launch(t:any, autoExit:boolean, prompt='', deliveryProbe=false) {
   const pane = tmux('new-session','-d','-s',session,'-x','100','-y','30','-P','-F','#{pane_id}');
   const runtime = integrationRuntime();
   const fixture = resolve(import.meta.dirname,'fixtures/subagent-boundary.ts');
-  tmux('respawn-pane','-k','-t',pane,`cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_CODING_AGENT_DIR=${shellEscape(config)} PI_BOUNDARY_DIR=${shellEscape(dir)} PI_BOUNDARY_DELIVERY=${deliveryProbe?'1':'0'} PI_SUBAGENT_SESSION=${shellEscape(file)} PI_SUBAGENT_ID=boundary PI_SUBAGENT_AUTO_EXIT=${autoExit?'1':'0'} ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model boundary/probe -e ${shellEscape(fixture)} --session ${shellEscape(file)} ${prompt?shellEscape(prompt):''} 2>${shellEscape(join(dir,'stderr.log'))}; echo $? > ${shellEscape(join(dir,'exit'))}; sleep 30`);
+  tmux('respawn-pane','-k','-t',pane,`cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_CODING_AGENT_DIR=${shellEscape(config)} PI_BOUNDARY_DIR=${shellEscape(dir)} PI_SUBAGENT_SESSION=${shellEscape(file)} PI_SUBAGENT_ID=boundary PI_SUBAGENT_AUTO_EXIT=${autoExit?'1':'0'} ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model boundary/probe -e ${shellEscape(fixture)} --session ${shellEscape(file)} ${prompt?shellEscape(prompt):''} 2>${shellEscape(join(dir,'stderr.log'))}; echo $? > ${shellEscape(join(dir,'exit'))}; sleep 30`);
   const until=async(check:()=>boolean)=>{
     const deadline=Date.now()+30000;
     while(!check()&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,50));
@@ -45,17 +45,6 @@ it('official Pi retries an error and runs a boundary continuation before reporti
   assert.equal(JSON.parse(readFileSync(file+'.exit','utf8')).type,'done');
   assert.ok(readFileSync(file,'utf8').includes('FINAL_SETTLED'));
   t.diagnostic('Official Pi retry and continuation evidence: '+dir);
-});
-
-it('official Pi continues an empty delivery before publishing the recovered result', {timeout:45000}, async t => {
-  const {dir,file,tmux,pane,until} = launch(t,true,'Probe delivery',true);
-  await until(() => existsSync(join(dir,'exit')));
-  assert.equal(readFileSync(join(dir,'exit'),'utf8').trim(),'0',readFileSync(join(dir,'stderr.log'),'utf8'));
-  const events = readFileSync(join(dir,'events.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
-  assert.equal(events.filter(event=>event.event==='provider-request').length,2,JSON.stringify(events));
-  assert.ok(events.filter(event=>event.event==='provider-request'||event.event==='agent-end').every(event=>!event.prematureExit),JSON.stringify(events));
-  assert.equal(JSON.parse(readFileSync(file+'.exit','utf8')).type,'done');
-  assert.match(readFileSync(file,'utf8'),/RECOVERED_DELIVERY/);
 });
 
 it('official Pi child inbox survives actual reload and closes on quit', {timeout:45000},async t=>{

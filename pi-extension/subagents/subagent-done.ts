@@ -76,15 +76,6 @@ export function findLatestAssistantError(
   return null;
 }
 
-function missingFinalDelivery(messages: any[] | undefined): boolean {
-  const message = messages?.findLast(item => item?.role === "assistant");
-  if (!message || message.stopReason !== "stop") return false;
-  return !Array.isArray(message.content) || !message.content.some(
-    (block: any) => (block?.type === "text" && typeof block.text === "string" && block.text.trim()) ||
-      (block?.type === "image" && typeof block.data === "string" && block.data.trim()),
-  );
-}
-
 export function parseDeniedTools(rawValue: string | undefined): string[] {
   return (rawValue ?? "")
     .split(",")
@@ -173,7 +164,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   let lastMessages: any[] | undefined;
-  let deliveryReminderSent = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
   // open while it waits for the orchestrator's reply. Cleared when the reply
   // lands through `input`, including replies steered into the current run.
@@ -226,7 +216,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (_event, ctx) => {
     if (stopSession(ctx)) return;
-    deliveryReminderSent = false;
     recorder.beforeAgentStart();
   });
 
@@ -238,27 +227,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", event => { lastMessages = event.messages; });
-
-  pi.on("agent_before_settle", (event) => {
-    // Structured workflow steps return through a validated sidecar, not prose.
-    // Let existing queued work or another extension's continuation run first.
-    if (!autoExit || stopped() || awaitingAnswer || runningChildrenCount() > 0 ||
-        process.env.PI_SUBAGENT_SCHEMA_FILE || deliveryReminderSent ||
-        event.outcome !== "completed" || event.continue || event.context.pendingMessages.length > 0) return;
-    // canContinue can be false before this draft: Pi recalculates it after
-    // committing our custom message, which makes the continuation possible.
-    if (!missingFinalDelivery(lastMessages)) return;
-    deliveryReminderSent = true;
-    return {
-      entries: [...event.entries, {
-        type: "custom_message" as const,
-        customType: "subagent-delivery-reminder",
-        content: "Your final response had no visible content. Provide the result in the requested format; if blocked, report what remains unfinished.",
-        display: false,
-      }],
-      continue: true,
-    };
-  });
 
   pi.on("agent_settled", (event, ctx) => {
     if (stopped()) return;
@@ -284,7 +252,6 @@ export default function (pi: ExtensionAPI) {
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(lastMessages);
-      const missingDelivery = deliveryReminderSent && !process.env.PI_SUBAGENT_SCHEMA_FILE && missingFinalDelivery(lastMessages);
       if (sessionFile) {
         try {
           writeFileSync(
@@ -293,9 +260,6 @@ export default function (pi: ExtensionAPI) {
               type: "error",
               errorMessage: errorInfo.errorMessage,
               stopReason: errorInfo.stopReason,
-            } : missingDelivery ? {
-              type: "error",
-              errorMessage: "Subagent finished without a visible result after a delivery reminder.",
             } : { type: "done" }),
           );
         } catch {
