@@ -16,16 +16,16 @@ it('real children inspect without input, stop safely, and deliberately resume ac
 }, async t => {
   const model = integrationModel();
   const root = resolve(import.meta.dirname, '../..');
-  const dir = mkdtempSync(join(tmpdir(), 'pi-inspect-stop-live-'));
-  const session = `pi-inspect-stop-live-${process.pid}-${Date.now()}`;
+  const dir = mkdtempSync(join(tmpdir(), 'pi-inspect-interrupt-live-'));
+  const session = `pi-inspect-interrupt-live-${process.pid}-${Date.now()}`;
   t.after(() => cleanupSession(session, dir, { preserveArtifacts: true }));
   const tmux = (...args: string[]) => execFileSync('tmux', args, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
   const agents = join(dir, '.pi', 'agents');
   mkdirSync(agents, { recursive: true });
-  writeFileSync(join(agents, 'inspect-stop-probe.md'), [
-    '---', 'name: inspect-stop-probe', 'description: Live lifecycle probe',
+  writeFileSync(join(agents, 'inspect-interrupt-probe.md'), [
+    '---', 'name: inspect-interrupt-probe', 'description: Live lifecycle probe',
     'tools: bash, read, write', 'thinking: off', 'auto-exit: true', '---',
     'Follow the exact test task. Use actual tools; plain text does not execute them.',
     'Do not delegate, inspect parent artifacts, or add setup and cleanup commands.',
@@ -34,7 +34,7 @@ it('real children inspect without input, stop safely, and deliberately resume ac
   const pane = tmux('new-session', '-d', '-s', session, '-x', '140', '-y', '42', '-P', '-F', '#{pane_id}');
   const runtime = integrationRuntime();
   const launch = (phase: string) => {
-    const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_INSPECT_STOP_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_SUBAGENT_SHELL_READY_DELAY_MS=100 ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/subagent-inspect-stop-live.ts'))} --session ${shellEscape(parentFile)} 2>${shellEscape(join(dir, phase + '-stderr.log'))}; status=$?; echo $status >${shellEscape(join(dir, phase + '-exit'))}; sleep 120`;
+    const command = `cd ${shellEscape(dir)} && env PATH=${shellEscape(runtime.path)} PI_OFFLINE=1 PI_INSPECT_INTERRUPT_LIVE_DIR=${shellEscape(dir)} PI_TEST_MODEL=${shellEscape(model)} PI_SUBAGENT_SHELL_READY_DELAY_MS=100 ${shellEscape(runtime.executable)} -ne -ns -np -nc --no-mcp --approve --model ${shellEscape(model)} --thinking off -e ${shellEscape(join(root, 'test/integration/fixtures/subagent-inspect-interrupt-live.ts'))} --session ${shellEscape(parentFile)} 2>${shellEscape(join(dir, phase + '-stderr.log'))}; status=$?; echo $status >${shellEscape(join(dir, phase + '-exit'))}; sleep 120`;
     tmux('respawn-pane', '-k', '-t', pane, command);
   };
   const until = async (check: () => boolean, label: string, timeout = 360_000) => {
@@ -45,22 +45,22 @@ it('real children inspect without input, stop safely, and deliberately resume ac
   const generation = () => existsSync(join(dir, 'generation')) ? Number(readFileSync(join(dir, 'generation'), 'utf8')) : 0;
   launch('first');
   await until(() => generation() === 1, 'parent Pi starts', 30_000);
-  tmux('send-keys', '-t', pane, '/live-inspect-stop', 'Enter');
+  tmux('send-keys', '-t', pane, '/live-inspect-interrupt', 'Enter');
   await until(() => existsSync(join(dir, 'first-report.json')), 'live lifecycle probe finishes');
   const first = JSON.parse(readFileSync(join(dir, 'first-report.json'), 'utf8'));
   assert.equal(first.ok, true, first.error);
-  assert.deepEqual(first.checks, ['running-inspect', 'stale-id-refused', 'running-stop', 'double-stop',
-    'late-input-refused', 'deliberate-resume', 'waiting-inspect', 'waiting-stop', 'parent-sibling-preserved', 'automatic-result']);
+  assert.deepEqual(first.checks, ['running-inspect', 'stale-id-refused', 'running-interrupt', 'double-interrupt',
+    'late-input-refused', 'deliberate-resume', 'waiting-inspect', 'waiting-interrupt', 'parent-sibling-preserved', 'automatic-result']);
   tmux('send-keys', '-t', pane, '/quit', 'Enter');
   await until(() => existsSync(join(dir, 'first-exit')), 'original parent exits', 30_000);
   assert.equal(readFileSync(join(dir, 'first-exit'), 'utf8').trim(), '0');
   launch('restart');
   await until(() => generation() === 2, 'same parent session restarts', 30_000);
-  tmux('send-keys', '-t', pane, '/live-inspect-stop-restart', 'Enter');
+  tmux('send-keys', '-t', pane, '/live-inspect-interrupt-restart', 'Enter');
   await until(() => existsSync(join(dir, 'restart-report.json')), 'persisted inspection and explicit resume finish');
   const restarted = JSON.parse(readFileSync(join(dir, 'restart-report.json'), 'utf8'));
   assert.equal(restarted.ok, true, restarted.error);
-  assert.deepEqual(restarted.checks, ['persisted-inspect-readonly', 'persisted-double-stop', 'persisted-late-reply-refused', 'deliberate-waiter-resume']);
+  assert.deepEqual(restarted.checks, ['persisted-inspect-readonly', 'persisted-double-interrupt', 'persisted-late-reply-refused', 'deliberate-waiter-resume']);
   for (const child of first.children) {
     const rows = readFileSync(child.sessionFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     assert.ok(rows.some(row => row.message?.role === 'assistant' &&

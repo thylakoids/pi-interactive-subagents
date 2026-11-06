@@ -11,21 +11,21 @@ export function piInbox(sessionFile: string, id: string): string {
 }
 
 /** Launch-scoped intent survives inbox removal and later session resumes. */
-export function isPiLaunchStopped(sessionFile: string, id: string): boolean {
-  return existsSync(`${piInbox(sessionFile, id)}.stop`);
+export function isPiLaunchInterrupted(sessionFile: string, id: string): boolean {
+  return existsSync(`${piInbox(sessionFile, id)}.interrupt`) || existsSync(`${piInbox(sessionFile, id)}.stop`);
 }
 
-export function stopPiInbox(sessionFile: string, id: string): void {
-  writeFileSync(`${piInbox(sessionFile, id)}.stop`, String(Date.now()), { mode: 0o600 });
+export function interruptPiInbox(sessionFile: string, id: string): void {
+  writeFileSync(`${piInbox(sessionFile, id)}.interrupt`, String(Date.now()), { mode: 0o600 });
   closePiInbox(sessionFile, id);
 }
 
-function assertNotStopped(sessionFile: string, id: string): void {
-  if (isPiLaunchStopped(sessionFile, id)) throw new Error("Subagent launch was explicitly stopped; deliberate resume requires a new launch.");
+function assertNotInterrupted(sessionFile: string, id: string): void {
+  if (isPiLaunchInterrupted(sessionFile, id)) throw new Error("Subagent launch was explicitly interrupted; deliberate resume requires a new launch.");
 }
 
 export function createPiInbox(sessionFile: string, id: string): string {
-  assertNotStopped(sessionFile, id);
+  assertNotInterrupted(sessionFile, id);
   const root = piInbox(sessionFile, id);
   mkdirSync(join(root, "inbox"), { recursive: true, mode: 0o700 });
   return root;
@@ -33,14 +33,14 @@ export function createPiInbox(sessionFile: string, id: string): string {
 
 export function queuePiMessage(sessionFile: string, id: string, input: PiInput, signal?: AbortSignal): void {
   signal?.throwIfAborted();
-  assertNotStopped(sessionFile, id);
+  assertNotInterrupted(sessionFile, id);
   const root = piInbox(sessionFile, id);
   const name = `${process.hrtime.bigint().toString().padStart(24, "0")}-${randomUUID()}.json`;
   const temporary = join(root, name + ".tmp");
   try {
     writeFileSync(temporary, JSON.stringify(input), { mode: 0o600 });
     signal?.throwIfAborted();
-    assertNotStopped(sessionFile, id);
+    assertNotInterrupted(sessionFile, id);
     // Finalization renames the inbox directory before inspecting its contents.
     // A send either enters that batch, or fails explicitly after the gate closes.
     renameSync(temporary, join(root, "inbox", name));
@@ -48,7 +48,7 @@ export function queuePiMessage(sessionFile: string, id: string, input: PiInput, 
 }
 
 export function drainPiInbox(sessionFile: string, id: string, send: (input: PiInput) => void, closing = false): number {
-  if (isPiLaunchStopped(sessionFile, id)) return 0;
+  if (isPiLaunchInterrupted(sessionFile, id)) return 0;
   const root = piInbox(sessionFile, id);
   const directory = join(root, closing ? "closed" : "inbox");
   let files: string[];
@@ -60,7 +60,7 @@ export function drainPiInbox(sessionFile: string, id: string, send: (input: PiIn
     throw error;
   }
   for (const name of files) {
-    if (isPiLaunchStopped(sessionFile, id)) return 0;
+    if (isPiLaunchInterrupted(sessionFile, id)) return 0;
     const file = join(directory, name);
     const input = JSON.parse(readFileSync(file, "utf8")) as PiInput;
     send(input);

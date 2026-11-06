@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { readSubagentActivityFile, type SubagentActivityPhase } from "./activity.ts";
 import { getSessionId, resolveNameInRegistry } from "./session.ts";
 
-export type InspectedSubagentState = "running" | "starting" | "waiting" | "finished" | "stopped" | "stop_requested" | "unknown";
+export type InspectedSubagentState = "running" | "starting" | "waiting" | "finished" | "interrupted" | "interrupt_requested" | "unknown";
 
 export interface SubagentInspection {
   name: string;
@@ -27,7 +27,7 @@ export interface InspectableRunningSubagent {
   cli?: "codex" | "claude";
   activityFile?: string;
   startTime: number;
-  stopRequested?: boolean;
+  interruptRequested?: boolean;
 }
 
 /**
@@ -56,6 +56,8 @@ export function inspectNamedSubagent(
         !["pi", "codex", "claude"].includes(execution.backend) || !Number.isFinite(execution.startedAt) ||
         (execution.activityFile !== undefined && typeof execution.activityFile !== "string") ||
         (execution.finishedAt !== undefined && !Number.isFinite(execution.finishedAt)) ||
+        (execution.interrupt && (!Number.isFinite(execution.interrupt.requestedAt) ||
+          (execution.interrupt.settledAt !== undefined && !Number.isFinite(execution.interrupt.settledAt)))) ||
         (execution.stop && (!Number.isFinite(execution.stop.requestedAt) ||
           (execution.stop.confirmedAt !== undefined && !Number.isFinite(execution.stop.confirmedAt))))) {
       snapshot.reason = "Saved execution evidence is malformed; its state cannot be trusted.";
@@ -89,10 +91,21 @@ export function inspectNamedSubagent(
     snapshot.evidenceAt ??= running.startTime;
   }
 
+  if (execution?.interrupt) {
+    snapshot.source = "name registry interrupt evidence";
+    snapshot.evidenceAt = execution.interrupt.settledAt ?? execution.interrupt.requestedAt;
+    snapshot.state = execution.interrupt.settledAt !== undefined ? "interrupted" : "interrupt_requested";
+    snapshot.stale = false;
+    snapshot.reason = execution.interrupt.settledAt !== undefined
+      ? "The interrupted launch pane was closed; the session remains available for deliberate resume."
+      : "Interrupt requested; launch pane cleanup is pending.";
+    if (execution.interrupt.reason) snapshot.reason += ` ${execution.interrupt.reason}`;
+    return snapshot;
+  }
   if (execution?.stop) {
     snapshot.source = "name registry stop evidence";
     snapshot.evidenceAt = execution.stop.confirmedAt ?? execution.stop.requestedAt;
-    snapshot.state = execution.stop.confirmedAt !== undefined ? "stopped" : "stop_requested";
+    snapshot.state = execution.stop.confirmedAt !== undefined ? "interrupted" : "interrupt_requested";
     snapshot.stale = false;
     snapshot.reason = execution.stop.confirmedAt !== undefined
       ? "Owned-child termination was confirmed at the evidence time; the session remains available for deliberate resume."
@@ -100,12 +113,12 @@ export function inspectNamedSubagent(
     if (execution.stop.reason) snapshot.reason += ` ${execution.stop.reason}`;
     return snapshot;
   }
-  if (running?.stopRequested) {
+  if (running?.interruptRequested) {
     snapshot.source = "in-memory owned launch";
     snapshot.evidenceAt = null;
-    snapshot.state = "stop_requested";
+    snapshot.state = "interrupt_requested";
     snapshot.stale = false;
-    snapshot.reason = "The owned launch has a stop request; no persisted termination confirmation is available.";
+    snapshot.reason = "The owned launch has an interrupt request; pane cleanup is pending.";
     return snapshot;
   }
   if (execution?.finishedAt !== undefined) {

@@ -36,7 +36,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagent_inspect` | Read one snapshot of a named execution without changing it |
-| `subagent_stop` | Explicitly stop an owned Pi child, reporting request and termination evidence separately |
+| `subagent_interrupt` | Interrupt an owned Pi child via Escape, then close its launch pane while preserving history |
 | `subagents_list` | List available agent definitions |
 | `workflow` | Run a JavaScript program that orchestrates sub-agents deterministically (see [Dynamic workflows](#dynamic-workflows)) |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -81,8 +81,8 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 - **Running native CLI** — messages use the backend's multiline paste protocol.
   `followUp` is rejected; resume after completion to start another turn.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
-- **Explicitly stopped** — ordinary messages, including delayed question replies,
-  are refused. After termination is confirmed, use `resume: true` to deliberately
+- **Explicitly interrupted** — ordinary messages, including delayed question replies,
+  are refused. After the old launch pane closes, use `resume: true` to deliberately
   start a new launch in the preserved session:
 
 ```typescript
@@ -90,7 +90,7 @@ subagent_message({ name: "scout", message: "Continue with the revised scope", re
 ```
 
 Ordinary finished sessions continue to resume without this flag. Resume replays
-the original sandbox in either case; an unconfirmed stop cannot be resumed safely.
+the original sandbox in either case. Resume waits for actual pane cleanup, not a historical descendant-termination proof.
 
 Native CLI messaging failures include `delivery` and `retrySafe` in tool
 `details` (and in workflow service errors):
@@ -117,14 +117,14 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 
 **Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
 
-### Inspecting and stopping
+### Inspecting and interrupting
 
 Progress, questions and results arrive automatically. Use inspection once when
 reconciling an uncertain delivery or a saved reference; do not build a polling loop.
 
 ```typescript
 subagent_inspect({ name: "scout" });
-subagent_stop({ name: "scout", id: "<launch id returned by inspect>" });
+subagent_interrupt({ name: "scout", id: "<launch id returned by inspect>" });
 ```
 
 Inspection returns the exact name, launch `id`, backend, session reference,
@@ -135,24 +135,34 @@ or mismatched identity remains `unknown`. After a parent restart, historical
 activity alone is `unknown` with `stale: true`; it does not establish that a
 process is still running. Native CLI activity may also remain unknown.
 
-Stop records durable intent before cleanup. `requested: true` means the stop
-request was saved; `confirmed: true` separately means the owned pane tree and
-captured execution processes were verified terminated, or the recorded launch
-had already finished and been cleaned up. Process/surface cleanup errors and
-unavailable evidence leave termination unconfirmed. `controlCleaned` separately
-reports inbox/question cleanup when attempted. The optional `id` rejects a stop if the
-name now refers to a different launch. Repeated stops are safe, and delayed
-inbox messages and question replies cannot restart the stopped launch.
-If the pane no longer uses Pi's waiting shell wrapper, cleanup may remain
-unconfirmed.
+`subagent_interrupt` records an `interrupt_requested` acknowledgement, sends the
+normal Pi Escape key immediately (including during generation), and writes an
+`interrupted` exit sidecar. The existing watcher closes the execution pane and
+cleans inbox/question files. Its final result is `interrupted` with nonzero exit
+code, never successful completion; workflow calls therefore cannot reuse it as
+a completed result. The JSONL and sandbox snapshot remain available.
 
-Only children owned by the current parent process can be targeted. For a
-persisted reference without confirmed completion, stopping after restart saves
-the intent but cannot confirm termination or target a process from historical
-activity. Native CLI stop is explicitly
-unsupported and makes no termination request. Sessions remain recorded for
-deliberate resume after a confirmed stop; Focus is also an explicit resume action
-and requires confirmed termination.
+The optional `id` rejects a request if the name now refers to another launch.
+Only an owned Pi launch with matching pane identity receives Escape. Native CLI
+interrupt is unsupported because its Escape semantics have not been verified.
+Historical references alone never authorize terminal input. Repeated requests are
+safe; delayed messages cannot restart an interrupted launch. After its pane
+closes, use `subagent_message({name, message, resume:true})` to deliberately
+continue, or Focus to reopen the session without a prompt.
+
+Cleanup checks pane disappearance and retries transient errors. tmux conditionally
+closes each snapshot owner/pane PID/server PID, so a respawn during cleanup is
+preserved. A launch keeps its creation identity if registration cannot query it;
+without any reliable identity it only observes disappearance, never adopts a new
+process. Final result state is decided after cleanup, including interrupts accepted
+while normal completion was closing. This does not freeze process trees or claim
+proof that every historical detached descendant exited.
+An interrupted launch cannot keep the widget's old active/streaming state. Old
+`stop` records and `.stop` inbox markers remain readable, without a public stop
+alias or data rewrite. Legacy resume can use final launch activity when old
+records have no pane identity; missing closure evidence still requires inspection.
+Reload the parent after updating the tool API; existing children retain their
+loaded extension until they exit.
 
 ### ask_question
 
@@ -276,7 +286,7 @@ You are a specialized agent that does X...
 | `model` | string | Optional override; omit to inherit the main session's current model (Pi agents). A call's explicit `model` takes precedence |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child. Omit this field to inherit normal Pi tools, extensions and MCP |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_inspect`, `subagent_stop`, `subagents_list`) and restricts spawn targets to the list without restricting inherited Pi tools/extensions. Explicitly restricted agents without it are not granted spawning tools |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagent_inspect`, `subagent_interrupt`, `subagents_list`) and restricts spawn targets to the list without restricting inherited Pi tools/extensions. Explicitly restricted agents without it are not granted spawning tools |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
@@ -299,7 +309,7 @@ Set `cli: claude` or `cli: codex` to run the subagent as an external coding-agen
 Both backends run their **native interactive TUI** in a tmux pane. Use the same
 `subagent`, `subagent_message`, and `subagents_list` tools as for pi agents.
 `subagent_inspect` exposes recorded identity and any supported evidence;
-`subagent_stop` reports native CLI stop as unsupported:
+`subagent_interrupt` reports native CLI interrupt as unsupported:
 
 ```json
 { "agent": "codex-cli", "name": "implement", "task": "Implement and verify the change" }
@@ -386,8 +396,8 @@ a timeout is returned as a hook error rather than leaving the run stuck.
 `npm test` runs the regression and native hook tests without model requests.
 `npm run test:cli-integration` exercises the actual extension tools in an isolated
 tmux session with deterministic stand-in CLIs (no credentials or model calls).
-See [test maintenance](docs/test-maintenance.md#inspect-and-stop-validation) for
-the separate inspect/stop process and real-model suites.
+See [test maintenance](docs/test-maintenance.md#inspect-and-interrupt-validation) for
+the separate inspect/interrupt process and real-model suites.
 
 ### auto-exit
 

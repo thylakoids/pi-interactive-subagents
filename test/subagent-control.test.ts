@@ -1,9 +1,9 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closePiInbox, createPiInbox, drainPiInbox, piInbox, queuePiMessage, stopPiInbox, type PiInput } from '../pi-extension/subagents/control.ts';
+import { closePiInbox, createPiInbox, drainPiInbox, piInbox, queuePiMessage, interruptPiInbox, type PiInput } from '../pi-extension/subagents/control.ts';
 import child from '../pi-extension/subagents/subagent-done.ts';
 import { __test__ } from '../pi-extension/subagents/index.ts';
 
@@ -115,7 +115,7 @@ it('reloading a child keeps its launch inbox available; quitting closes it', t =
   assert.throws(()=>queuePiMessage(file,'reload',{message:'after quit',deliverAs:'steer'}),/ENOENT/);
 });
 
-it('durable stop blocks queued continuations before provider access and never reopens its launch inbox', t => {
+it('durable interrupt blocks queued continuations before provider access and never reopens its launch inbox', t => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-inbox-stopped-'));
   const file = join(dir, 'session.jsonl');
   const keys = ['PI_SUBAGENT_SESSION', 'PI_SUBAGENT_ID'];
@@ -134,16 +134,19 @@ it('durable stop blocks queued continuations before provider access and never re
   const queued: PiInput[] = [];
   drainPiInbox(file, 'stopped', input => queued.push(input));
   assert.equal(queued.length, 1, 'simulate a continuation already inside the SDK queue');
-  stopPiInbox(file, 'stopped');
+  interruptPiInbox(file, 'stopped');
   let aborts = 0, shutdowns = 0;
   const ctx = { abort() { aborts++; }, shutdown() { shutdowns++; } };
   for (const name of ['before_agent_start', 'agent_start']) handlers.get(name)!.forEach(fn => fn({}, ctx));
   assert.throws(() => handlers.get('before_provider_request')!.forEach(fn => fn({}, ctx)), /no provider request/);
   assert.equal(aborts, 3);
-  assert.equal(shutdowns, 0, 'the child parks until its owner captures and closes the process tree');
+  assert.equal(shutdowns, 0, 'the watcher owns pane cleanup until settlement');
+  handlers.get('agent_settled')!.forEach(fn => fn({aborted:true}, ctx));
+  assert.equal(shutdowns, 1);
+  assert.equal(JSON.parse(readFileSync(file+'.exit','utf8')).type, 'interrupted');
   assert.deepEqual(handlers.get('input')![0]({ text: 'late reply' }, ctx), { action: 'handled' });
   assert.equal(drainPiInbox(file, 'stopped', () => assert.fail('stopped inbox cannot deliver')), 0);
-  assert.throws(() => createPiInbox(file, 'stopped'), /explicitly stopped/);
+  assert.throws(() => createPiInbox(file, 'stopped'), /explicitly interrupted/);
   createPiInbox(file, 'new-launch');
   queuePiMessage(file, 'new-launch', { message: 'deliberate new task', deliverAs: 'steer' });
   assert.equal(drainPiInbox(file, 'new-launch', () => {}), 1);

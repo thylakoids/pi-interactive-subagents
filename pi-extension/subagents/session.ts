@@ -140,6 +140,12 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object") return null;
+    // Replay historical control permission under its current tool name.
+    // This changes no stored data and does not create a public stop alias.
+    if (typeof parsed.toolAllowlist === "string") parsed.toolAllowlist = parsed.toolAllowlist
+      .split(",").map((tool: string) => tool.trim() === "subagent_stop" ? "subagent_interrupt" : tool).join(",");
+    if (Array.isArray(parsed.excludedTools)) parsed.excludedTools = parsed.excludedTools
+      .map((tool: string) => tool === "subagent_stop" ? "subagent_interrupt" : tool);
     return parsed as SubagentLoadout;
   } catch {
     return null;
@@ -167,6 +173,10 @@ export interface NameRegistryEntry {
     startedAt: number;
     activityFile?: string;
     finishedAt?: number;
+    surface?: string;
+    surfaceOwnership?: { owner: string; panePid: number; serverPid: number };
+    interrupt?: { requestedAt: number; settledAt?: number; reason?: string };
+    /** Read-only compatibility with historical stop snapshots. */
     stop?: { requestedAt: number; confirmedAt?: number; reason?: string };
   };
 }
@@ -222,7 +232,7 @@ function writeNameRegistry(artifactDir: string, registry: NameRegistry): void {
   renameSync(tmp, p);
 }
 
-/** A stop intent must persist successfully, and must target this incarnation. */
+/** An interrupt intent must persist successfully, and must target this incarnation. */
 export function updateRegisteredExecution(
   artifactDir: string, name: string, sessionFile: string, id: string,
   update: (execution: NonNullable<NameRegistryEntry["execution"]>) => void,

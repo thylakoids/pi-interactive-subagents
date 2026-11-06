@@ -17,7 +17,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
-import { closePiInbox, drainPiInbox, isPiLaunchStopped } from "./control.ts";
+import { closePiInbox, drainPiInbox, isPiLaunchInterrupted } from "./control.ts";
 
 /**
  * Number of child subagents this session itself still has in flight.
@@ -95,12 +95,11 @@ export default function (pi: ExtensionAPI) {
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const sessionFile = process.env.PI_SUBAGENT_SESSION;
   const launchId = process.env.PI_SUBAGENT_ID;
-  const stopped = () => Boolean(sessionFile && launchId && isPiLaunchStopped(sessionFile, launchId));
+  const stopped = () => Boolean(sessionFile && launchId && isPiLaunchInterrupted(sessionFile, launchId));
   const stopSession = (ctx: { abort(): void }): boolean => {
     if (!stopped()) return false;
     ctx.abort();
-    // Keep the process parked until the owner captures and closes its process
-    // tree. Self-exit here could orphan a tool before termination is verified.
+    // The parent watcher closes the pane after Escape; JSONL stays resumable.
     return true;
   };
   let inboxTimer: ReturnType<typeof setInterval> | undefined;
@@ -229,7 +228,12 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", event => { lastMessages = event.messages; });
 
   pi.on("agent_settled", (event, ctx) => {
-    if (stopped()) return;
+    if (stopped()) {
+      if (sessionFile) writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "interrupted", launchId }));
+      recorder.agentSettled(true);
+      ctx.shutdown();
+      return;
+    }
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
@@ -285,7 +289,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
-    if (stopSession(ctx)) throw new Error("This launch was explicitly stopped; no provider request may start.");
+    if (stopSession(ctx)) throw new Error("This launch was explicitly interrupted; no provider request may start.");
     recorder.beforeProviderRequest();
   });
 
@@ -302,7 +306,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", (event) => {
-    if (stopped()) return { block: true, reason: "This launch was explicitly stopped. No further tools may execute." };
+    if (stopped()) return { block: true, reason: "This launch was explicitly interrupted. No further tools may execute." };
     if (awaitingAnswer) {
       blockedWhileWaiting.add(event.toolName);
       return { block: true, reason: `${event.toolName} was NOT executed or queued. No background task was started and no result is pending for this attempt. ` +
@@ -376,7 +380,7 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      if (stopped()) throw new Error("This launch was explicitly stopped.");
+      if (stopped()) throw new Error("This launch was explicitly interrupted.");
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(

@@ -331,7 +331,7 @@ Workflows
 - **Abort workflow**：仅运行中 run 提供。确认后中止脚本及运行中的 agents，保留完成记录。终态遵循先到先得：已发生的失败不被迟到的 Abort 覆盖，已确认的 Abort 也不被迟到的预算错误覆盖；终态立即写入 snapshot。
 - **Resume workflow**：仅 failed/aborted/interrupted run 提供。确认后重放脚本，复用 completed 调用，其余调用重新执行；不是让原进程从停止的指令继续。
 
-Skip、Abort、Resume 使用同一框内的确认页，默认选中 `Cancel`。确认期间目标已结束时拒绝过期动作并显示原因。message/stop 操作不放入面板，用户可在真实 pane 中交互。日志、完整用量和返回值仍可通过 status、journal 与 output 文件查看。
+Skip、Abort、Resume 使用同一框内的确认页，默认选中 `Cancel`。确认期间目标已结束时拒绝过期动作并显示原因。message/interrupt 操作不放入面板，用户可在真实 pane 中交互。日志、完整用量和返回值仍可通过 status、journal 与 output 文件查看。
 
 `/workflow <runId>` 打开的面板只显示这个 run；该 runId 不在本会话、磁盘上也找不到时给出提示，而不是一个空面板。进程重启之前的 run 也能这样打开——面板会从 artifacts 目录读回来，和 `workflow({ action: 'status' })` 看到的一致。
 

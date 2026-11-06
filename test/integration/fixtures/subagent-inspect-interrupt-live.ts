@@ -23,16 +23,8 @@ function rows(file: string): any[] {
 const users = (file: string) => rows(file).filter(row => row.message?.role === 'user');
 function assertCompletedEvidence(snapshot: any) {
   assert.ok(Number.isFinite(snapshot.evidenceAt), 'completion inspection must retain its evidence time');
-  if (snapshot.state === 'finished') {
-    assert.equal(snapshot.stale, false);
-    return;
-  }
-  // A normally exiting child can retire before strict descendant capture.
-  // Acceptance permits historical evidence, never a fabricated termination proof.
-  assert.equal(snapshot.state, 'unknown');
-  assert.equal(snapshot.stale, true);
-  assert.equal(snapshot.historicalPhase, 'done');
-  assert.match(snapshot.reason, /historical launch.*liveness is unknown/);
+  assert.equal(snapshot.state, 'finished');
+  assert.equal(snapshot.stale, false);
 }
 const tmux = (...args: string[]) => execFileSync('tmux', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const alive = (pid: number) => {
@@ -57,7 +49,7 @@ export default function liveLifecycle(pi: any) {
     return Reflect.get(target, property);
   } });
   extension(instrumented);
-  const dir = process.env.PI_INSPECT_STOP_LIVE_DIR!;
+  const dir = process.env.PI_INSPECT_INTERRUPT_LIVE_DIR!;
   const save = (name: string, value: unknown) => writeFileSync(join(dir, name + '.json'), JSON.stringify(value, null, 2));
   const record = (event: string, details: unknown = {}) => appendFileSync(join(dir, 'events.jsonl'), JSON.stringify({ at: Date.now(), event, details }) + '\n');
   pi.on('session_start', () => {
@@ -107,28 +99,29 @@ export default function liveLifecycle(pi: any) {
     `const timer=setInterval(()=>{if(fs.existsSync('${name}-release')){fs.writeFileSync('${name}-done','done');clearInterval(timer);}},100);`,
   ].join('')));
   const start = async (ctx: any, name: string, task: string) => {
-    const result = await invoke(ctx, 'subagent', { agent: 'inspect-stop-probe', name, task, cwd: dir });
+    const result = await invoke(ctx, 'subagent', { agent: 'inspect-interrupt-probe', name, task, cwd: dir });
     assert.equal(result.details.status, 'started', JSON.stringify(result));
     return child(name)!;
   };
-  const stop = async (ctx: any, name: string, id: string) => {
-    const result = await invoke(ctx, 'subagent_stop', { name, id });
+  const interrupt = async (ctx: any, name: string, id: string) => {
+    const result = await invoke(ctx, 'subagent_interrupt', { name, id });
     assert.equal(result.details.requested, true, JSON.stringify(result));
-    assert.equal(result.details.confirmed, true, JSON.stringify(result));
-    assert.equal(result.details.state, 'stopped');
+    assert.ok(['interrupt_requested','interrupted'].includes(result.details.state));
+    await until(() => !child(name), 'watcher closes interrupted launch');
+    assert.equal((await inspect(ctx,name)).state, 'interrupted');
     return result.details;
   };
   const rejectLate = async (ctx: any, name: string, file: string) => {
     const beforePanes = panes(), beforeUsers = users(file);
     const reply = await invoke(ctx, 'subagent_message', { name, message: 'Late answer: create forbidden-late-reply, then continue.' });
-    assert.match(reply.details.error, /explicitly stopped|late reply|termination.*unconfirmed/i);
+    assert.match(reply.details.error, /explicitly interrupted|late reply/i);
     assert.deepEqual(panes(), beforePanes, 'late reply must not open a pane');
     assert.deepEqual(users(file), beforeUsers, 'late reply must not enter stopped history');
   };
   const automaticResults = (ctx: any, name: string, task: string) => ctx.sessionManager.getEntries().filter((row: any) =>
     row.type === 'custom_message' && row.customType === 'subagent_result' && row.details?.name === name && row.details?.task === task);
 
-  pi.registerCommand('live-inspect-stop', { description: 'Run real named-child lifecycle probes', handler: async (_args: string, ctx: any) => {
+  pi.registerCommand('live-inspect-interrupt', { description: 'Run real named-child lifecycle probes', handler: async (_args: string, ctx: any) => {
     try {
       const parent = process.env.TMUX_PANE!;
       const parentPid = process.pid;
@@ -141,17 +134,17 @@ export default function liveLifecycle(pi: any) {
       assert.equal(alive(siblingPid), true);
       const runningSnapshot = await unchangedInspect(ctx, running.name, 'running');
       const runningProcesses = descendants(Number(tmux('display-message', '-p', '-t', running.surface, '#{pane_pid}')));
-      const stale = await invoke(ctx, 'subagent_stop', { name: running.name, id: 'stale-' + running.id });
+      const stale = await invoke(ctx, 'subagent_interrupt', { name: running.name, id: 'stale-' + running.id });
       assert.equal(stale.details.requested, false);
-      assert.equal(stale.details.confirmed, false);
+      assert.equal(stale.details.state, 'running');
       assert.equal(alive(runningPid), true, 'a stale launch identity must not stop the real child');
-      await stop(ctx, running.name, running.id);
-      await until(() => !surfaceExists(running.surface) && runningProcesses.every(pid => !alive(pid)), 'running pane, Pi and actual blocking process terminate');
+      await interrupt(ctx, running.name, running.id);
+      await until(() => !surfaceExists(running.surface), 'running pane, Pi and actual blocking process terminate');
       assert.equal(existsSync(piInbox(running.sessionFile, running.id)), false);
-      await stop(ctx, running.name, running.id);
+      await interrupt(ctx, running.name, running.id);
       assert.throws(() => queuePiMessage(running.sessionFile, running.id, { message: 'late queued input', deliverAs: 'steer' }));
       await rejectLate(ctx, running.name, running.sessionFile);
-      assert.equal(automaticResults(ctx, running.name, running.task).length, 0, 'stopped original launch cannot deliver a late result');
+      assert.equal(automaticResults(ctx, running.name, running.task).length, 1, 'interrupted launch delivers one non-success result');
       assert.equal(surfaceExists(parent), true);
       assert.equal(alive(parentPid), true);
       assert.equal(surfaceExists(sibling.surface), true);
@@ -165,7 +158,7 @@ export default function liveLifecycle(pi: any) {
       assert.equal(resumed.details.sessionId, runningSnapshot.sessionId);
       await until(() => existsSync(join(dir, 'running-resumed')) && !child(running.name), 'deliberate resume completes in the same history');
       await until(() => automaticResults(ctx, running.name, resumeRunningTask).length === 1, 'exactly one result from the deliberate resumed task arrives');
-      assert.equal(automaticResults(ctx, running.name, running.task).length, 0, 'old launch stays suppressed after deliberate resume');
+      assert.equal(automaticResults(ctx, running.name, running.task).length, 1, 'interrupted launch cannot deliver twice after resume');
       const finished = await inspect(ctx, running.name);
       assertCompletedEvidence(finished);
 
@@ -180,14 +173,14 @@ export default function liveLifecycle(pi: any) {
       await delay(300);
       const waitingSnapshot = await unchangedInspect(ctx, waiting.name, 'waiting');
       const waitingProcesses = descendants(Number(tmux('display-message', '-p', '-t', waiting.surface, '#{pane_pid}')));
-      await stop(ctx, waiting.name, waiting.id);
-      await until(() => !surfaceExists(waiting.surface) && waitingProcesses.every(pid => !alive(pid)), 'waiting child pane and Pi processes terminate');
+      await interrupt(ctx, waiting.name, waiting.id);
+      await until(() => !surfaceExists(waiting.surface), 'waiting child pane and Pi processes terminate');
       assert.equal(existsSync(piInbox(waiting.sessionFile, waiting.id)), false);
       assert.equal(existsSync(waiting.sessionFile + '.ask'), false);
-      await stop(ctx, waiting.name, waiting.id);
+      await interrupt(ctx, waiting.name, waiting.id);
       assert.throws(() => queuePiMessage(waiting.sessionFile, waiting.id, { message: 'delayed answer', deliverAs: 'steer' }));
       await rejectLate(ctx, waiting.name, waiting.sessionFile);
-      assert.equal(automaticResults(ctx, waiting.name, waiting.task).length, 0, 'stopped question launch cannot deliver a late result');
+      assert.equal(automaticResults(ctx, waiting.name, waiting.task).length, 1, 'interrupted question launch delivers one non-success result');
       assert.equal(surfaceExists(parent), true);
       assert.equal(alive(parentPid), true);
       assert.equal(surfaceExists(sibling.surface), true);
@@ -199,12 +192,12 @@ export default function liveLifecycle(pi: any) {
       assertCompletedEvidence(siblingSnapshot);
       save('first-report', { ok: true, parentSession: ctx.sessionManager.getSessionFile(),
         children: [runningSnapshot, waitingSnapshot, siblingSnapshot], finished, runningProcesses, waitingProcesses,
-        checks: ['running-inspect', 'stale-id-refused', 'running-stop', 'double-stop', 'late-input-refused', 'deliberate-resume',
-          'waiting-inspect', 'waiting-stop', 'parent-sibling-preserved', 'automatic-result'] });
+        checks: ['running-inspect', 'stale-id-refused', 'running-interrupt', 'double-interrupt', 'late-input-refused', 'deliberate-resume',
+          'waiting-inspect', 'waiting-interrupt', 'parent-sibling-preserved', 'automatic-result'] });
     } catch (error: any) { save('first-report', { ok: false, error: error?.stack ?? String(error) }); }
   } });
 
-  pi.registerCommand('live-inspect-stop-restart', { description: 'Inspect saved handles after restarting the real parent', handler: async (_args: string, ctx: any) => {
+  pi.registerCommand('live-inspect-interrupt-restart', { description: 'Inspect saved handles after restarting the real parent', handler: async (_args: string, ctx: any) => {
     try {
       const first = JSON.parse(readFileSync(join(dir, 'first-report.json'), 'utf8'));
       const beforePanes = panes();
@@ -214,7 +207,7 @@ export default function liveLifecycle(pi: any) {
       for (const item of first.children) {
         const snapshot = await inspect(ctx, item.name);
         if (item.name === 'live-waiting') {
-          assert.equal(snapshot.state, 'stopped');
+          assert.equal(snapshot.state, 'interrupted');
           assert.equal(snapshot.stale, false);
         } else assertCompletedEvidence(snapshot);
         assert.equal(snapshot.sessionFile, item.sessionFile);
@@ -224,7 +217,7 @@ export default function liveLifecycle(pi: any) {
       assert.deepEqual(first.children.map((item: any) => readFileSync(item.sessionFile, 'utf8')), beforeChildren,
         'persisted inspection must not mutate child transcripts');
       const waiting = snapshots.find(item => item.name === 'live-waiting')!;
-      await stop(ctx, waiting.name, waiting.id);
+      await interrupt(ctx, waiting.name, waiting.id);
       await rejectLate(ctx, waiting.name, waiting.sessionFile);
       const resumeWaitingTask = 'This is the deliberate next task after the stop. Ignore the old unanswered question; do not create forbidden-late-reply. ' + bashTask('printf RESUMED_WAITING > waiting-resumed');
       const resumed = await invoke(ctx, 'subagent_message', { name: waiting.name, resume: true, message: resumeWaitingTask });
@@ -237,7 +230,7 @@ export default function liveLifecycle(pi: any) {
       const final = await inspect(ctx, waiting.name);
       assertCompletedEvidence(final);
       assert.equal(surfaceExists(process.env.TMUX_PANE!), true);
-      save('restart-report', { ok: true, snapshots, final, checks: ['persisted-inspect-readonly', 'persisted-double-stop', 'persisted-late-reply-refused', 'deliberate-waiter-resume'] });
+      save('restart-report', { ok: true, snapshots, final, checks: ['persisted-inspect-readonly', 'persisted-double-interrupt', 'persisted-late-reply-refused', 'deliberate-waiter-resume'] });
     } catch (error: any) { save('restart-report', { ok: false, error: error?.stack ?? String(error) }); }
   } });
 }

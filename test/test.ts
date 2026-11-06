@@ -284,6 +284,11 @@ describe("session.ts", () => {
       assert.equal(loadoutSidecarPath(sf), sf + ".loadout.json");
       assert.ok(existsSync(sf + ".loadout.json"));
       assert.deepEqual(readSubagentLoadout(sf), sample, "all loadout fields round-trip");
+      writeSubagentLoadout(sf, { ...sample, toolAllowlist: "read,subagent_stop", excludedTools: ["subagent_stop"] });
+      const before = readFileSync(loadoutSidecarPath(sf), "utf8");
+      assert.equal(readSubagentLoadout(sf)?.toolAllowlist, "read,subagent_interrupt");
+      assert.deepEqual(readSubagentLoadout(sf)?.excludedTools, ["subagent_interrupt"]);
+      assert.equal(readFileSync(loadoutSidecarPath(sf), "utf8"), before, "legacy replay must not rewrite stored permissions");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null, "corrupt sidecar has no loadout");
     });
@@ -997,7 +1002,7 @@ describe("subagent discovery", () => {
         }, { artifactDir: d, name: "worker" });
         assert.ok(!parts.includes("--no-extensions"));
         const additions = parts[parts.indexOf("--tools") + 1].split(",");
-        for (const tool of ["codemode", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_stop"]) {
+        for (const tool of ["codemode", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_interrupt"]) {
           assert.ok(additions.includes(`+${tool}`), tool);
         }
         assert.ok(parts.some(part => part.endsWith("subagents/index.ts'")), "explicitly load delegation even if parent used -e");
@@ -1070,7 +1075,7 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }), null);
     assert.equal(testApi.buildSubagentToolAllowlist("", { grantSpawning: true }), null);
     const restricted = testApi.buildSubagentToolAllowlist("read", { grantSpawning: true })!.split(",");
-    for (const tool of ["read", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_stop"]) assert.ok(restricted.includes(tool));
+    for (const tool of ["read", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_interrupt"]) assert.ok(restricted.includes(tool));
     assert.ok(!restricted.includes("bash"));
   });
 
@@ -1899,12 +1904,13 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_message and not the old interrupt/resume tools", () => {
+  it("registers message and interrupt without public stop/resume aliases", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
+    assert.equal(names.includes("subagent_stop"), false);
     assert.equal(names.includes("subagent_resume"), false);
   });
 

@@ -55,7 +55,7 @@ it(exit + ' removes delegated descendants but preserves siblings and its parent'
     const running = { id: 'exited-owner', name: 'child', task: '', surface: child, verifyScratchDir: scratch,
       startTime: Date.now(), sessionFile: join(dir, 'child.jsonl'),
       statusState: createStatusState({ source: 'pi', startTimeMs: Date.now() }) };
-    __test__.runningSubagents.set(running.id, running);
+    __test__.trackRunningSubagent(running, dir);
     t.after(() => __test__.runningSubagents.delete(running.id));
     if (exit === 'owner-exit') {
       tmux('kill-pane', '-t', child);

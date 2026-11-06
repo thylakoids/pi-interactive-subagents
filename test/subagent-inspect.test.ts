@@ -72,12 +72,14 @@ it("restart inspection preserves historical phases and never claims a persisted 
   }
 });
 
-it("saved completion and stop evidence distinguish finished, requested and confirmed termination", t => {
+it("saved completion, interrupts and legacy stops remain readable", t => {
   const f = fixture(t);
   for (const [extra, state, evidenceAt, reason] of [
     [{ finishedAt: 180 }, "finished", 180, /did not resume/],
-    [{ stop: { requestedAt: 170 } }, "stop_requested", 170, /not been confirmed/],
-    [{ finishedAt: 175, stop: { requestedAt: 170, confirmedAt: 190, reason: "Owned pane and processes absent." } }, "stopped", 190, /Owned pane and processes absent/],
+    [{ interrupt: { requestedAt: 170 } }, "interrupt_requested", 170, /cleanup is pending/],
+    [{ interrupt: { requestedAt: 170, settledAt: 190 } }, "interrupted", 190, /pane was closed/],
+    [{ stop: { requestedAt: 170 } }, "interrupt_requested", 170, /not been confirmed/],
+    [{ finishedAt: 175, stop: { requestedAt: 170, confirmedAt: 190, reason: "Owned pane and processes absent." } }, "interrupted", 190, /Owned pane and processes absent/],
   ] as const) {
     f.save({ ...f.entry, execution: { ...f.execution, ...extra } });
     const result = inspectNamedSubagent(f.dir, "worker", undefined, 200);
@@ -87,10 +89,10 @@ it("saved completion and stop evidence distinguish finished, requested and confi
     assert.match(result.reason, reason);
   }
   f.save();
-  const requested = inspectNamedSubagent(f.dir, "worker", { ...f.running, stopRequested: true }, 200);
-  assert.equal(requested.state, "stop_requested");
+  const requested = inspectNamedSubagent(f.dir, "worker", { ...f.running, interruptRequested: true }, 200);
+  assert.equal(requested.state, "interrupt_requested");
   assert.equal(requested.evidenceAt, null, "a boolean intent has no independently recorded request time");
-  assert.match(requested.reason, /no persisted termination confirmation/);
+  assert.match(requested.reason, /pane cleanup is pending/);
 });
 
 it("missing, malformed and wrong-launch activity remain explicit unknown evidence", t => {

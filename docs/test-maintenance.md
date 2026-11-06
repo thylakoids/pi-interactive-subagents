@@ -48,45 +48,33 @@ The delayed Claude Stop test waits for an observed failed lock acquisition befor
 releasing the lock. A transcript-read notification alone can race acquisition and
 leave the synchronous wait path untested.
 
-## Inspect and stop validation
+## Inspect and interrupt validation
 
-Keep evidence readers, owned-process cleanup, and model-driven behavior separate
-so a passing fixture does not stand in for a live acceptance run:
-
-- `test/subagent-inspect.test.ts` checks read-only snapshots, session and launch
-  identities, historical activity after restart, and requested versus confirmed
-  stop evidence. Reads must leave session, activity, question and inbox files
-  unchanged.
-- `test/integration/owned-surface-stop.test.ts` runs isolated tmux panes and real
-  processes. It checks detached tool and delegated pane cleanup, stale ownership
-  rejection, unavailable query evidence, and parent/sibling preservation.
-- `test/integration/subagent-inspect-stop.test.ts` exercises lifecycle controls
-  with real isolated processes and durable files, without a provider. This is
-  process integration evidence, not real-model end-to-end acceptance.
-- `test/integration/subagent-inspect-stop-live.test.ts` requires actual Pi model
-  access and explicit opt-in. It covers production tools with running and
-  `ask_question` children, stopping and delayed replies, and deliberate resume.
-  A skipped live suite does not establish acceptance for those cases.
-
-Run the targeted process checks with tmux available on `PATH`:
+- `test/subagent-inspect.test.ts` checks read-only snapshots, session/launch
+  identities, historical activity, interrupt states and legacy stop records.
+- `test/integration/subagent-interrupt.test.ts` runs official Pi in an isolated
+  tmux server with a local scripted provider. It holds generation open until
+  Escape, independently observes provider abort, then checks watcher retirement,
+  interrupted results, unrelated panes, delayed input rejection and name-based
+  resume in the original JSONL. Real tmux command barriers also cover respawn
+  after a request and during the final close await, and an interrupt accepted
+  while normal completion is closing. Startup-query regressions check a preserved
+  creation identity, refusal to adopt a replacement, and retirement after an
+  unverified pane disappears. Legacy unconfirmed stop records with final activity
+  and native-backend rejection are covered without a network model.
+- `test/integration/subagent-inspect-interrupt-live.test.ts` is an optional real
+  model suite covering blocking tools, parked questions, result delivery and
+  resume across parent restart. A skipped live suite is not model-judgment evidence.
 
 ```sh
-node --test --test-concurrency=1 \
-  test/integration/owned-surface-stop.test.ts \
-  test/integration/subagent-inspect-stop.test.ts
+node --test test/integration/subagent-interrupt.test.ts
+PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model   node --test test/integration/subagent-inspect-interrupt-live.test.ts
 ```
 
-Run the billed suite only with an existing authorized provider and an explicit
-model; do not set up credentials or change global model defaults for a test:
-
-```sh
-PI_WORKFLOW_LIVE=1 PI_TEST_MODEL=provider/model \
-  node --test test/integration/subagent-inspect-stop-live.test.ts
-```
-
-Retain failures and report unsupported backends or unavailable model access
-explicitly. Confirmation must come from independent termination evidence;
-calling a cleanup helper that suppresses errors is insufficient.
+Use existing authorized model access for the optional suite; do not change
+credentials or global defaults. Report actual pane cleanup separately from a
+request acknowledgement. Historical descendant termination proof is intentionally
+outside the interrupt contract. Tests must never target the user's tmux server.
 
 ## Worker resource inheritance
 
