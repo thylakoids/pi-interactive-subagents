@@ -3,13 +3,13 @@ export const meta = {
   description: 'Scope a question, search and fetch sources, verify claims adversarially, then synthesize',
   whenToUse: 'When a research answer needs traceable sources, independent claim checks and an explicit evidence-gap report',
   phases: ['Scope', 'Search', 'Fetch', 'Verify', 'Synthesize'],
-  agent: 'researcher',
+  agent: 'worker',
 }
 
 const question = typeof args.question === 'string' ? args.question.trim() : ''
 const context = typeof args.context === 'string' ? args.context.trim() : ''
 const maxCalls = Number.isInteger(args.maxCalls) ? Math.max(8, Math.min(60, args.maxCalls)) : 10
-const researchAgent = typeof args.researchAgent === 'string' ? args.researchAgent : 'researcher'
+const researchAgent = typeof args.researchAgent === 'string' ? args.researchAgent : 'worker'
 const VOTES = 3
 
 if (!question) return { error: 'args.question is required' }

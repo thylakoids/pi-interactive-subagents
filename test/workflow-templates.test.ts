@@ -45,10 +45,11 @@ it('migrate-files never verifies failed plans/applies, routes risky files and pr
     assert.match(request.task, new RegExp('step-for-' + file));
     if (request.task.startsWith('按给定')) return file === 'apply-fail' ? { error: 'apply failed' } : { text: 'applied' };
     assert.ok(!['plan-fail', 'empty-plan', 'apply-fail'].includes(file), 'Never verify an unapplied file');
-    assert.equal(request.agentType, file === 'risky' ? 'worker' : 'scout');
+    assert.equal(request.agentType, 'worker');
     if (file === 'verify-fail') return { error: 'verification unavailable' };
     return { value: { ok: file !== 'issues', issues: file === 'issues' ? ['missed step'] : [] } };
   });
+  f.service.allowedAgents = () => ({ allowed: ['worker'], unknown: name => name !== 'worker' });
   const files = ['safe', 'risky', 'issues', 'plan-fail', 'empty-plan', 'apply-fail', 'verify-fail'];
   const view = await (await f.manager.start({ source: source('migrate-files'), args: { task: 'migration-task', files } })).execute();
   assert.equal(view.status, 'completed', view.error);

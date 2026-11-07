@@ -69,13 +69,13 @@ it('workflow policy restores questions and declared delegation without granting 
   const worker = __test__.loadAgentDefaults('worker')!;
   const inherited = workflowExecution(worker);
   assert.equal(inherited.toolAllowlist, null, 'ordinary workflow workers inherit Pi capabilities');
-  assert.deepEqual(inherited.spawnable, ['scout', 'researcher']);
-  const policy = workflowExecution({ ...worker, tools: 'read,bash,workflow,*' });
+  assert.equal(inherited.spawnable, null, 'default worker does not prescribe delegation');
+  const policy = workflowExecution({ ...worker, subagentAgents: ['custom-helper'], tools: 'read,bash,workflow,*' });
   for (const restored of ['subagent', 'subagents_list', 'subagent_message', 'ask_question']) {
     assert.ok(policy.toolAllowlist!.split(',').includes(restored), restored);
   }
   for (const blocked of ['workflow', '*']) assert.ok(!policy.toolAllowlist!.split(',').includes(blocked));
-  assert.deepEqual(policy.spawnable, ['scout', 'researcher']);
+  assert.deepEqual(policy.spawnable, ['custom-helper']);
   assert.ok(policy.identity.endsWith(WORKFLOW_EXECUTION_CONTRACT));
   assert.equal(policy.interactive, false);
   assert.equal(policy.autoExit, true);

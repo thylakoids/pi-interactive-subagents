@@ -973,53 +973,46 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous, auto-exit)`,
-      );
-    }
-  });
-
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
-    const worker = testApi.loadAgentDefaults("worker");
-    assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
-
-    assert.equal(worker.tools, undefined, "worker inherits Pi's configured tools and extensions");
-    assert.equal(testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true }), null);
-    withTempDir((d) => {
-      for (const excludedTools of [undefined, ["workflow"]]) {
-        const parts: string[] = [];
-        testApi.applySandboxToParts(parts, {
-          agent: "worker", toolAllowlist: null, spawnable: worker.subagentAgents,
-          model: null, thinking: null, identity: null, systemPromptMode: null,
-          autoExit: true, cwd: null, agentDir: null, excludedTools,
-        }, { artifactDir: d, name: "worker" });
-        assert.ok(!parts.includes("--no-extensions"));
-        const additions = parts[parts.indexOf("--tools") + 1].split(",");
-        for (const tool of ["codemode", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_interrupt"]) {
-          assert.ok(additions.includes(`+${tool}`), tool);
-        }
-        assert.ok(parts.some(part => part.endsWith("subagents/index.ts'")), "explicitly load delegation even if parent used -e");
-        assert.equal(parts.includes("--exclude-tools"), !!excludedTools);
-        if (excludedTools) assert.equal(parts[parts.indexOf("--exclude-tools") + 1], "'workflow'");
-      }
+  it("lists only a general-purpose autonomous worker with inherited capabilities by default", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const { api, registeredTools } = createMockExtensionApi();
+      subagentsModule.default(api);
+      const result = await registeredTools.find(tool => tool.name === "subagents_list").execute();
+      assert.deepEqual(result.details.agents.map((agent: any) => agent.name), ["worker"]);
+      const worker = result.details.agents[0];
+      assert.equal(worker.tools, undefined, "inherit normal Pi tools and extensions");
+      assert.equal(worker.model, undefined, "inherit the parent model");
+      assert.equal(worker.thinking, undefined, "inherit the parent thinking level");
+      assert.equal(worker.subagentAgents, undefined, "default worker does not prescribe delegation");
+      assert.equal(testApi.resolveEffectiveInteractive({ name: "worker", task: "" }, worker), false);
     });
   });
 
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
-      assert.ok(defs.tools, `${name} retains an explicit tool restriction`);
-      assert.ok(testApi.buildSubagentToolAllowlist(defs.tools));
-    }
+  it("custom agents retain explicitly declared delegation without restricting normal Pi resources", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "custom-parent", "subagent_agents: custom-helper");
+      const custom = testApi.loadAgentDefaults("custom-parent")!;
+      assert.deepEqual(custom.subagentAgents, ["custom-helper"]);
+      assert.equal(testApi.buildSubagentToolAllowlist(custom.tools, { grantSpawning: true }), null);
+      withTempDir((d) => {
+        for (const excludedTools of [undefined, ["workflow"]]) {
+          const parts: string[] = [];
+          testApi.applySandboxToParts(parts, {
+            agent: "custom-parent", toolAllowlist: null, spawnable: custom.subagentAgents,
+            model: null, thinking: null, identity: null, systemPromptMode: null,
+            autoExit: true, cwd: null, agentDir: null, excludedTools,
+          }, { artifactDir: d, name: "custom-parent" });
+          assert.ok(!parts.includes("--no-extensions"));
+          const additions = parts[parts.indexOf("--tools") + 1].split(",");
+          for (const tool of ["codemode", "ask_question", "subagent", "subagent_message", "subagents_list", "subagent_inspect", "subagent_interrupt"]) {
+            assert.ok(additions.includes(`+${tool}`), tool);
+          }
+          assert.ok(parts.some(part => part.endsWith("subagents/index.ts'")));
+          assert.equal(parts.includes("--exclude-tools"), !!excludedTools);
+          if (excludedTools) assert.equal(parts[parts.indexOf("--exclude-tools") + 1], "'workflow'");
+        }
+      });
+    });
   });
 
   it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
@@ -1591,12 +1584,12 @@ describe("commands", () => {
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
 
-    subagent.handler("scout map the auth code", {
+    subagent.handler("worker map the auth code", {
       ui: { notify() {} },
     });
 
     assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /agent: "scout"/);
+    assert.match(sentUserMessages[0], /agent: "worker"/);
     assert.match(sentUserMessages[0], /map the auth code/);
   });
 

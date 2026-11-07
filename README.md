@@ -10,8 +10,8 @@ Async subagents for [pi](https://github.com/earendil-works/pi), running in tmux 
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
+│ 00:23  worker     active · bash 7m                 │
+│ 00:45  worker-2   waiting 2m                       │
 ╰────────────────────────────────────────────────────╯
 ```
 
@@ -52,7 +52,7 @@ or was cancelled; its recorded history remains available.
 ### Spawning
 
 ```typescript
-subagent({ agent: "scout", task: "Analyze the auth module" });
+subagent({ agent: "worker", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
 ```
 
@@ -60,7 +60,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`worker`, `worker-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
@@ -69,7 +69,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 `subagent_message` is addressed **by name only**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
 
 ```typescript
-subagent_message({ name: "scout", message: "Also check the auth middleware" });
+subagent_message({ name: "worker", message: "Also check the auth middleware" });
 ```
 
 - **Running Pi child** — an atomic inbox delivers the original text through Pi's
@@ -86,7 +86,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
   start a new launch in the preserved session:
 
 ```typescript
-subagent_message({ name: "scout", message: "Continue with the revised scope", resume: true });
+subagent_message({ name: "worker", message: "Continue with the revised scope", resume: true });
 ```
 
 Ordinary finished sessions continue to resume without this flag. Resume replays
@@ -123,8 +123,8 @@ Progress, questions and results arrive automatically. Use inspection once when
 reconciling an uncertain delivery or a saved reference; do not build a polling loop.
 
 ```typescript
-subagent_inspect({ name: "scout" });
-subagent_interrupt({ name: "scout", id: "<launch id returned by inspect>" });
+subagent_inspect({ name: "worker" });
+subagent_interrupt({ name: "worker", id: "<launch id returned by inspect>" });
 ```
 
 Inspection returns the exact name, launch `id`, backend, session reference,
@@ -174,11 +174,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | *(inherits session)* | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | *(inherits session)* | `web_search`, `fetch_content`, `source_check`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | *(inherits session)* | Configured Pi tools, extensions, skills and MCP + spawning | General-purpose independent Pi; may spawn `scout` and `researcher` |
+| **worker** | *(inherits parent model and thinking)* | Configured Pi tools, extensions, skills and MCP | General-purpose independent Pi |
 
-All of them are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). Worker uses normal Pi resource discovery and its own configured MCP connections, including Computer Use when enabled and available. It has a separate conversation; it does not copy the parent's live connections or extensions loaded only through CLI arguments. Scout and researcher keep explicit tool restrictions.
+The bundled worker is autonomous (`auto-exit: true`) and carries its identity in the system prompt (`system-prompt: append`). It uses normal Pi resource discovery and its own configured MCP connections, including Computer Use when enabled and available. It has a separate conversation; it does not copy the parent's live connections or extensions loaded only through CLI arguments. It inherits normally configured tools and extensions, including subagent and workflow tools when available. Custom agent definitions and their allowlists remain supported.
 
 Workflows default to the same `worker` definition. The runtime enforces single-step
 execution: no conversation fork, automatic termination after completion, and direct
@@ -256,8 +254,7 @@ from extracted evidence.
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
 
-Bundled Pi agents (`worker`, `scout`, `researcher`) do not pin a
-model: new children inherit the main session's current model, including after a
+The bundled `worker` does not pin a model or thinking level: it inherits the parent’s thinking level, and new children inherit the main session's current model, including after a
 model switch. A call's explicit `model` overrides the agent definition's optional
 `model`, which overrides inheritance. To follow the main session, omit `model`
 from your definition. Existing user definitions are not rewritten. Native CLI
@@ -318,9 +315,7 @@ Both backends run their **native interactive TUI** in a tmux pane. Use the same
 Send `subagent_message({ name: "implement", message: "Also handle empty input" })`
 to paste one message into the running TUI, or resume its native conversation when
 it has finished. Names and native session IDs persist across parent restarts.
-The bundled `claude-cli` profile works the same way and uses Claude's default model.
-Neither native CLI profile pins a model: Codex and Claude use their own configuration
-unless a profile or call explicitly overrides it; they never inherit Pi provider IDs.
+Define `codex-cli` or `claude-cli` as a custom agent before using it. Codex and Claude use their own configuration unless a profile or call explicitly overrides it; they never inherit Pi provider IDs.
 
 | | `cli: claude` | `cli: codex` |
 | --- | --- | --- |
@@ -357,8 +352,8 @@ launch script, hook settings, submitted prompts, notification events and structu
 
 CLI profiles use the CLI's own credentials and native tools. Claude reads its
 normal settings, including cc-switch's `env` (base URL, authentication, and
-Opus/Sonnet/Haiku model aliases). The bundled `claude-cli` profile does not set
-`model`, so cc-switch remains in control; an explicit profile `model` is passed
+Opus/Sonnet/Haiku model aliases). When a custom `claude-cli` profile omits
+`model`, cc-switch remains in control; an explicit profile `model` is passed
 to Claude as an intentional override. The bridge never substitutes Anthropic
 credentials or routes the request through pi's model provider. The same unrestricted
 execution flags as the previous integration are used. Pi-specific tool allowlists,
@@ -406,7 +401,7 @@ With `auto-exit: true`, the session shuts down when the agent's turn ends — th
 Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
-- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
+- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a custom agent can stop after dispatching children and stays open until the last result returns).
 
 ### interactive
 
