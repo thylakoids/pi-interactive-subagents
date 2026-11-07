@@ -87,7 +87,7 @@ opt-in 的判定条件写得很具体：用户提示里出现 `ultracode`、会�
 
 失败语义分两类：**子代理死掉/失败**只是该次调用落为 `null`（`parallel`/`pipeline` 如此，裸 `await agent()` 也如此，与 CC 一致），同时记为 `failed`、面板显示错误、日志写一行、落定消息按名字列出；**参数写错**（未知 agent、拼错的选项、不满足的 schema、超限、预算用尽、cli 型 agent 要 schema）抛错并让 run 失败。被跳过的调用同样返回 `null`。
 
-默认子代理是普通 `agents/worker.md`。workflow 执行约束由运行时强制并保存进 loadout：保留向主模型提问及定义允许的委派、完成后自动退出、lineage-only、返回原始步骤结果。提问后等待真实输入，委派结果不视为回答；等待时可 Abort，清理派生窗格并拒绝迟到回复。旧 `workflow-subagent` 名称及 journal 缓存键保持兼容，不再提供独立定义。刻意不走“允许列表里的第一个”：`agents/` 里还有 `cli:` 型定义，那是外部 coding CLI，带自己的工具集和模型，不该被当成匿名调用的默认值。
+默认子代理是普通 `agents/worker.md`。workflow 执行约束由运行时强制并保存进 loadout：保留向主模型提问及定义允许的委派、完成后自动退出、lineage-only、返回原始步骤结果。提问后等待真实输入，委派结果不视为回答；等待时可 Abort，清理派生窗格并拒绝迟到回复。旧 `workflow-subagent` 名称及 journal 缓存键保持兼容，不再提供独立定义。刻意不走“允许列表里的第一个”：用户可定义 `cli:` 型 agent，那是外部 coding CLI，带自己的工具集和模型，不该被当成匿名调用的默认值。
 
 每个 agent 的显示名唯一，并注册进插件既有名册，之后可用 `subagent_message` 找到它。
 
@@ -149,7 +149,7 @@ run 落定（completed/failed/aborted）时 `onSettled` 调 `pi.sendMessage({ cu
 - **预算强制但单位自定**：`PI_WORKFLOW_TOKEN_BUDGET` 超限会让 run 失败。单位是子代理的**未缓存输入 + 输出** token，cacheRead/cacheWrite 单列，不等于货币费用，不是 CC 的输出 token——CC 的预算是「+500k」指令分出来的输出 token 池，本实现没有那个池可共享，于是选了更保守的口径。差异是刻意的，已写进 `docs/workflow.md`。
 - **resume 语义与 CC 不同**：本实现按键全局回放，脚本若有文本之外的副作用（写文件、外部状态），回放的等价性与 CC 的“前缀”模型不同。这是刻意的取舍（按键回放才能跨进程 resume），已文档化；键里现在包含 model/effort 与出现次序。
 - **无用量限额暂停**：CC 在 rate limit 时暂停工作流、限额恢复后重跑等待中的 agent；本实现下这是一次普通失败（子代理内部的自动重试不受影响）。**在 pi 里做不到**：`WorkflowSubagentCompletion` 只暴露 exitCode/summary/error/usage，没有限额信号，得先把信号从子会话里传出来。
-- **内置模板与运行前审批**：CC 有特殊内置 `deep-research` 和展示阶段/权限的运行前对话框；本实现有六个普通、可覆盖的随包脚本，没有独立的内置执行特权或启动前审批。模板使用既有 agent allowlist 与子代理权限模型，`deep-research` 还要求可用的 `researcher` 类 agent。
+- **内置模板与运行前审批**：CC 有特殊内置 `deep-research` 和展示阶段/权限的运行前对话框；本实现有六个普通、可覆盖的随包脚本，没有独立的内置执行特权或启动前审批。模板使用既有 agent allowlist 与子代理权限模型，`deep-research` 还要求所选 agent 具备搜索和抓取能力。
 - **worktree 保留而非自动整合**：`isolation:'worktree'` 从 committed HEAD 创建 detached worktree；不复制主工作区未提交状态。取消/恢复保留修改与提交，不自动 merge/reset/clean，不是敌对代码安全容器。
 - **指导仍是启发式而非固定场景表**：六种形状、默认 pipeline、schema 条件和规模建议降低选择空间，但模型仍可能在明确不适用的任务上误用 workflow；opt-in 门槛、实际输入约束和测试中的模板契约用于限制这一点。
 

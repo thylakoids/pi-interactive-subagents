@@ -50,7 +50,7 @@ workflow({ action: 'validate', script: '...脚本源码...' })                  
 
 ### 后端能力边界
 
-`agent: 'claude-cli'` 和 `agent: 'codex-cli'` 使用原生交互 CLI，只返回最终文本；并发、pipeline、重试、Skip 和 Abort 仍由 workflow 管理。它们不提供 Pi 的 `ask_question` 等待/回复协议、`structured_output`、只读验证或受控委派。不要把 CLI 自带的子代理当作 Pi 管理的子代理。
+用户自行定义的 `cli: claude` 和 `cli: codex` agent 使用原生交互 CLI，只返回最终文本；并发、pipeline、重试、Skip 和 Abort 仍由 workflow 管理。它们不提供 Pi 的 `ask_question` 等待/回复协议、`structured_output`、只读验证或受控委派。不要把 CLI 自带的子代理当作 Pi 管理的子代理。
 
 CLI 调用的 `schema`、`readOnly: true` 和带 token budget 的运行会在启动前拒绝；CLI 定义中的 Pi `tools`、`skills`、`subagent_agents` 及额外 Pi extensions 也会拒绝，不会静默忽略。原生 CLI 使用自己的工具配置，并绕过权限确认；这不是 Pi 工具白名单或只读沙箱。没有完整 token/费用和工具活动/提问等待遥测，预算计算不支持 CLI。
 
@@ -181,7 +181,7 @@ const report = await pipeline(
     if (!mig || !mig.changed) return null
     return agent(
       `独立验证 ${file} 的迁移是否完整、等价。不要相信迁移者的总结，重新读代码核对。`,
-      { label: `verify-${file}`, phase: 'Verify', agent: 'scout', schema: verdictSchema },
+      { label: `verify-${file}`, phase: 'Verify', agent: 'worker', readOnly: true, schema: verdictSchema },
     )
   },
 )
@@ -197,7 +197,7 @@ return report
 workflow({ name: 'migrate-imports', args: { files: ['src/a.ts', 'src/b.ts'] } })
 ```
 
-每个文件由 `worker` 迁移完成后立刻开始验证，不必等别的文件；验证交给只读的 `scout`，不要相信迁移者自己的总结。两阶段的结果都在 `report` 里，脚本 `return` 的 `report` 就是这次 run 的结果（失败的项是 `null`）。
+每个文件由 `worker` 迁移完成后立刻开始验证，不必等别的文件；验证交给启用 `readOnly` 的独立 `worker`，不要相信迁移者自己的总结。两阶段的结果都在 `report` 里，脚本 `return` 的 `report` 就是这次 run 的结果（失败的项是 `null`）。
 
 ## 示例工作流
 
@@ -222,13 +222,13 @@ workflow({ action: 'list' })
 - `maxDimensions`（可选）：审查的维度数上限，默认 8、最大 16；超出的维度不审查，名字进 `droppedDimensions`
 - `maxFindings`（可选）：每个维度送往验证的发现数上限，默认 20、最大 25；按严重性从高到低取前 N 条，裁掉的数量进 `droppedFindings`
 
-默认维度不绑定 agent——维度要求写在提示词里，审查者就是普通的 workflow 子代理。想指定某个定义（比如一个只读的 reviewer）就在维度里写 `agent`：
+默认维度不绑定 agent——维度要求写在提示词里，审查者就是普通的 workflow 子代理。想指定某个定义（比如用户自行定义的 reviewer）就在维度里写 `agent`：
 
 ```js
 workflow({ action: 'start', name: 'review-changes', args: {
   target: 'PR #12 相对 main 的改动',
   dimensions: [
-    { name: 'correctness', focus: '并发与错误路径', agent: 'scout' },
+    { name: 'correctness', focus: '并发与错误路径', agent: 'reviewer' },
     { name: 'api', focus: '对外 API 兼容性' },
   ],
 } })
@@ -240,7 +240,7 @@ workflow({ action: 'start', name: 'review-changes', args: {
 
 - `task`（必填）：迁移任务描述
 - `files`（必填）：文件路径列表
-- 可选覆盖：`planAgent`（默认 `scout`）、`applyAgent`（默认 `worker`）、`verifierAgent`（默认 `worker`）、`quickVerifierAgent`（默认 `scout`）
+- 可选覆盖：`planAgent`（默认 `worker`）、`applyAgent`（默认 `worker`）、`verifierAgent`（默认 `worker`）、`quickVerifierAgent`（默认 `worker`）
 
 `applyReport` 是执行者自述原文，**未经核验**：它只作为线索传给验证者，并原样附在走完验证的文件条目上（只有 `verified` 与 `needsAttention` 是对象条目，`unfinished` 里是文件路径字符串）。文件归类完全由验证者的 `ok` 决定；`issues` 随条目一起返回、但不参与分组。执行者自述某步没做不会改变归类，要读出这一点得人去看 `applyReport`。
 
@@ -261,7 +261,7 @@ workflow({ action: 'start', name: 'migrate-files', args: {
 
 ### deep-research
 
-Scope → 每查询 Search → Fetch → 对高优先级 claim 做三票 Verify → Synthesize。`args`：`question`（必填）、可选 `context`、`maxCalls`（默认 10）、`researchAgent`（默认 `researcher`）。模板会显式报告失败分支、未核验 claim、因预算省略的 claim 与查询（`omittedClaims`、`omittedQueries`），以及 fetch 明确报出的证据缺口（`evidenceGaps`）。`status` 只有在成功生成了综合答复（`answer` 非空）、没有任何省略与缺口、每条被纳入的查询都拿到证据、且每条被核验的 claim 都是 supported 或 refuted 时才是 `complete`，否则为 `incomplete`。`researcher` 必须可用并具备搜索/抓取能力；也可指定其他等价 agent。
+Scope → 每查询 Search → Fetch → 对高优先级 claim 做三票 Verify → Synthesize。`args`：`question`（必填）、可选 `context`、`maxCalls`（默认 10）、`researchAgent`（默认 `worker`）。模板会显式报告失败分支、未核验 claim、因预算省略的 claim 与查询（`omittedClaims`、`omittedQueries`），以及 fetch 明确报出的证据缺口（`evidenceGaps`）。`status` 只有在成功生成了综合答复（`answer` 非空）、没有任何省略与缺口、每条被纳入的查询都拿到证据、且每条被核验的 claim 都是 supported 或 refuted 时才是 `complete`，否则为 `incomplete`。默认 worker 需要配置搜索/抓取工具；也可通过 `researchAgent` 指定具备相应能力的自定义 agent。
 
 ### iterative-refinement
 
@@ -295,7 +295,7 @@ workflow({ action: 'resume', runId: 'wf-1a2b3c4d5e6f' })
 - 命令 `/workflow`：TUI 下打开覆盖面板；非 TUI 会话打印文本报告，`/workflow <runId>` 查看指定 run。
 - 快捷键 **Ctrl+Alt+W**（默认绑定，见 `/hotkeys`）：切换面板的打开/关闭。确认页中也可直接关闭，关闭不会执行尚未确认的动作；再次打开保留树的位置与展开状态。
 
-主界面保留 `Subagents` 状态框，仍然展示运行中的所有子代理。历史定义名 `(workflow-subagent)` 不再重复显示；当前定义如 `(worker)`、`(scout)` 正常显示。框底附上运行中 workflow 的名字、简单进度条、`settled/issued` 计数、running 数、累计 tokens、费用以及打开面板的快捷键。进度只反映脚本已发出的调用；脚本产生新调用时分母会增加，不代表预先知道整个脚本的任务总数。脚本仍在运行但没有活跃 agent 时，摘要继续保留。
+主界面保留 `Subagents` 状态框，仍然展示运行中的所有子代理。历史定义名 `(workflow-subagent)` 不再重复显示；当前定义如 `(worker)` 和自定义 agent 名称正常显示。框底附上运行中 workflow 的名字、简单进度条、`settled/issued` 计数、running 数、累计 tokens、费用以及打开面板的快捷键。进度只反映脚本已发出的调用；脚本产生新调用时分母会增加，不代表预先知道整个脚本的任务总数。脚本仍在运行但没有活跃 agent 时，摘要继续保留。
 
 详情是一个居中、有完整边框的 overlay，四周留出背景，框内完整覆盖；宽度适配窗格并设置上限，高度在打开期间随终端尺寸保持稳定。里面不再重复进度条和用量，也没有底部快捷键提示。使用 Pi 列表的 `❯` 光标、状态符号和主题颜色。
 

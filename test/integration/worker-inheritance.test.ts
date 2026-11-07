@@ -16,7 +16,7 @@ it('bundled worker inherits extension and MCP through Codemode on launch and res
   const fixture = resolve(import.meta.dirname, 'fixtures/worker-inheritance-global.ts');
   const mcp = resolve(import.meta.dirname, 'fixtures/worker-inheritance-mcp.mjs');
   const extension = resolve(import.meta.dirname, '../../pi-extension/subagents/index.ts');
-  writeFileSync(join(config, 'settings.json'), JSON.stringify({ extensions: [fixture], defaultProvider: 'local', defaultModel: 'probe', defaultThinkingLevel: 'off' }));
+  writeFileSync(join(config, 'settings.json'), JSON.stringify({ extensions: [fixture, extension], defaultProvider: 'local', defaultModel: 'probe', defaultThinkingLevel: 'off' }));
   writeFileSync(join(config, 'mcp.json'), JSON.stringify({ mcpServers: { computer_use: { command: process.execPath, args: [mcp] } } }));
   writeFileSync(join(dir, '.pi', 'agents', 'restricted.md'), '---\nname: restricted\ndescription: restricted test\ntools: read\nauto-exit: true\n---\nTest agent.\n');
   const requests: any[] = [];
@@ -97,7 +97,8 @@ it('bundled worker inherits extension and MCP through Codemode on launch and res
   assert.doesNotMatch(output, /GLOBAL_EXTENSION_OK|MOCK_COMPUTER_USE_OK/);
   const workerRequest = childRequests().find(r => r.messages.some((m: any) => JSON.stringify(m.content).includes('CHILD_PROBE')));
   const names = workerRequest.tools.map((tool: any) => tool.function.name);
-  for (const name of ['codemode', 'subagent', 'subagent_message', 'subagents_list']) assert.ok(names.includes(name), `${name} missing from worker tools`);
+  for (const name of ['codemode', 'ask_question', 'workflow', 'subagent', 'subagent_message', 'subagents_list']) assert.ok(names.includes(name), `${name} missing from worker tools`);
+  assert.ok(childRequests().some(r => r.messages.some((m: any) => m.role === 'tool' && JSON.stringify(m.content).includes('WORKFLOW_PRESENT=true'))), 'ordinary worker keeps configured workflow access through Codemode');
   assert.ok(requests.some(r => r.messages.some((m: any) => m.role === 'tool' && JSON.stringify(m.content).includes('resumed'))), 'same-name message must resume the completed worker');
   await until(() => parentIdleAfter('restricted-child'), 'restricted child exited and parent handled its result');
   assert.equal(calls('extension').length, 2);

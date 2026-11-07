@@ -34,11 +34,11 @@ if (!task || files.length === 0) {
   return { skipped: true, reason: 'args.task 与 args.files 都是必填' }
 }
 
-// 三个角色用不同 agent（各自独立会话）：执行者看不到规划者的推理，只能照计划做
-const planAgent = typeof args.planAgent === 'string' ? args.planAgent : 'scout'
+// 三个角色使用独立会话，可按需覆盖 agent 定义；执行者看不到规划者的推理，只能照计划做
+const planAgent = typeof args.planAgent === 'string' ? args.planAgent : 'worker'
 const applyAgent = typeof args.applyAgent === 'string' ? args.applyAgent : 'worker'
 const fullVerifierAgent = typeof args.verifierAgent === 'string' ? args.verifierAgent : 'worker'
-const quickVerifierAgent = typeof args.quickVerifierAgent === 'string' ? args.quickVerifierAgent : 'scout'
+const quickVerifierAgent = typeof args.quickVerifierAgent === 'string' ? args.quickVerifierAgent : 'worker'
 
 const baseName = (path) => {
   const parts = String(path).split(/[\\/]/)

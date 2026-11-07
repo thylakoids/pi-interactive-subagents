@@ -60,7 +60,7 @@ function launchArgs(model: string | undefined) {
 
 it('all bundled Pi definitions omit model and produce parent-model launch flags', () => {
   parent();
-  for (const name of ['worker', 'scout', 'researcher']) {
+  for (const name of ['worker']) {
     const definition = __test__.loadAgentDefaults(name)!;
     assert.ok(definition, name);
     assert.equal(definition.model, undefined, name + ' must not pin a bundled model');
@@ -127,6 +127,13 @@ it('native CLI defaults never receive an incompatible Pi provider model', () => 
   assert.equal(__test__.resolveAgentModel('native-call', 'native-model', false), 'native-call');
 });
 
-it('bundled native CLI profiles leave model selection to native configuration', () => {
-  for (const name of ['codex-cli', 'claude-cli']) assert.equal(__test__.loadAgentDefaults(name)!.model, undefined);
+it('user-defined native CLI profiles leave model selection to native configuration', t => {
+  for (const cli of ['codex', 'claude']) {
+    const file = join(dir, 'config', 'agents', `${cli}-cli.md`);
+    t.after(() => rmSync(file, { force: true }));
+    writeFileSync(file, `---\nname: ${cli}-cli\ncli: ${cli}\n---\nComplete the assigned task.\n`);
+    const definition = __test__.loadAgentDefaults(`${cli}-cli`)!;
+    assert.equal(definition.cli, cli);
+    assert.equal(definition.model, undefined);
+  }
 });
